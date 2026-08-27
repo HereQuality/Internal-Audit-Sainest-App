@@ -21,7 +21,7 @@ import 'nc_details_sheet.dart';
 /// One leaf checkpoint — mirrors the web app's ParameterScoreCard.jsx:
 ///  - interactive (assigned auditor, audit still active): 4 finding
 ///    buttons (Strong Compliance / Compliance / OFI / NC), an OFI-only
-///    score field, a mandatory remark, and optional photo evidence.
+///    score field, an optional remark, and optional photo evidence.
 ///    Autosaves — no separate Save button to remember to tap: a finding
 ///    pick or finishing the NC-details popup saves right away, remark/
 ///    score typing saves itself a short pause after the last keystroke
@@ -29,11 +29,15 @@ import 'nc_details_sheet.dart';
 ///    immediately on its own, independent of whether a finding/remark has
 ///    even been filled in yet (see _pickPhotos/_uploadPhotos, mirroring
 ///    AuditsProvider.uploadCheckpointEvidence). The finding/remark/score
-///    autosave only actually fires once findingType + a non-empty remark
-///    (+ a numeric score if OFI, + NC details for a fresh NC) are all
-///    present — see _maybeAutoSave/_isComplete — so nothing incomplete
-///    ever reaches the server. _statusRow shows what's still missing, that
-///    it's saving, a brief "Saved" confirmation, or — the one manual
+///    autosave fires once findingType alone is present (+ a numeric score
+///    if OFI, + NC details for a fresh NC) — see _maybeAutoSave/
+///    _isComplete — so a score typed on its own, or a remark typed/
+///    edited/cleared on its own, each save right away instead of waiting
+///    on the other field. Remark is NOT required to save from the phone
+///    (only web's ParameterScoreCard.jsx still requires it — see
+///    audit.controller.js#scoreParameter's isMobileRequest check).
+///    _statusRow shows what's still missing, that it's saving, a brief
+///    "Saved" confirmation, or — the one manual
 ///    action left — a Retry if an autosave attempt actually failed; a
 ///    failed photo upload gets its own, separate Retry right by the photo
 ///    strip instead, since the two save paths are now fully independent.
@@ -294,13 +298,16 @@ class _CheckpointCardState extends State<CheckpointCard> {
   bool get _needsNcDetails => _findingType == 'NC' && widget.node.ncId == null;
 
   // What's still needed before this checkpoint can save at all — mirrors
-  // audit.controller.js#scoreParameter's own validation (findingType +
-  // non-empty remark always; a numeric score additionally for OFI; an
+  // audit.controller.js#scoreParameter's own validation for a mobile
+  // caller (findingType always; a numeric score additionally for OFI; an
   // auditee pick + due date for a fresh NC) so the hint text here never
-  // promises a save the server would actually reject.
+  // promises a save the server would actually reject. Remark is
+  // deliberately NOT required here — the server only makes it mandatory
+  // for web callers; on the phone a finding pick, a score, or a remark
+  // typed on its own should each save right away instead of waiting on
+  // whichever of the three hasn't been filled in yet.
   String? get _missingFieldHint {
     if (_findingType == null) return null; // nothing picked yet — no nag before they've started
-    if (_remarkController.text.trim().isEmpty) return 'Add a remark to save';
     if (_findingType == 'OFI' && double.tryParse(_scoreController.text.trim()) == null) return 'Enter a score to save';
     if (_needsAuditeePick && _auditeeEmployeeId == null) return 'Pick who this NC is against';
     if (_needsNcDetails && _targetDate == null) return 'Set a due date for this NC';

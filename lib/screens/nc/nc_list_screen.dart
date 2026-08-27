@@ -11,6 +11,7 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/scope_toggle.dart';
 import '../../widgets/status_badge.dart';
+import '../../widgets/status_filter_chip_row.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
 
@@ -174,7 +175,8 @@ class _NcListScreenState extends State<NcListScreen>
 }
 
 // Shared by both lists below — a horizontal row of status chips above the
-// list itself, same visual pattern as MyAuditsScreen's own filter row.
+// list itself, same visual pattern as MyAuditsScreen's own filter row (now
+// literally the same widget — see widgets/status_filter_chip_row.dart).
 class _StatusFilterRow extends StatelessWidget {
   final String selected;
   final ValueChanged<String> onSelect;
@@ -183,26 +185,10 @@ class _StatusFilterRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: 44,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        itemCount: _ncStatusFilters.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (_, i) {
-          final label = _ncStatusFilters[i];
-          // See MyAuditsScreen's identical fix — a horizontal ListView
-          // top-aligns each child instead of centering it in the row.
-          return Center(
-            child: ChoiceChip(
-              label: Text(label),
-              selected: selected == label,
-              onSelected: (_) => onSelect(label),
-            ),
-          );
-        },
-      ),
+    return StatusFilterChipRow(
+      options: _ncStatusFilters,
+      selected: selected,
+      onSelected: onSelect,
     );
   }
 }

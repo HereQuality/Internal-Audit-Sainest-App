@@ -10,6 +10,7 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/scope_toggle.dart';
 import '../../widgets/status_badge.dart';
+import '../../widgets/status_filter_chip_row.dart';
 import 'audit_detail_screen.dart';
 
 // "All" plus every status getMyAudits can actually return (Skipped is
@@ -128,29 +129,10 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
           ),
         ),
         if (!showLoading && !showError && !showEmptyState)
-          SizedBox(
-            height: 44,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-              itemCount: _statusFilters.length,
-              separatorBuilder: (_, _) => const SizedBox(width: 8),
-              itemBuilder: (_, i) {
-                final label = _statusFilters[i];
-                final selected = _statusFilter == label;
-                // A horizontal ListView top-aligns each child within the
-                // row's fixed height rather than centering it — the chip
-                // (shorter than the 44px row) sat flush against the top,
-                // leaving its label looking vertically off-center.
-                return Center(
-                  child: ChoiceChip(
-                    label: Text(label),
-                    selected: selected,
-                    onSelected: (_) => setState(() => _statusFilter = label),
-                  ),
-                );
-              },
-            ),
+          StatusFilterChipRow(
+            options: _statusFilters,
+            selected: _statusFilter,
+            onSelected: (v) => setState(() => _statusFilter = v),
           ),
         Expanded(
           child: RefreshIndicator(

@@ -92,6 +92,26 @@ class AppTheme {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       ),
       dividerTheme: DividerThemeData(color: scheme.outlineVariant.withValues(alpha: 0.5)),
+      // Every status/location ChoiceChip in the app (status_filter_chip_
+      // row.dart plus checkpoint_card.dart's finding-type picker) shares
+      // this look. The other half of the fix — shrink-wrapping the hidden
+      // 48px-minimum Material tap target that was the real cause of a
+      // chip's label reading as off-center inside a fixed-height row —
+      // is set per-widget (materialTapTargetSize/visualDensity aren't
+      // ChipThemeData fields) in status_filter_chip_row.dart.
+      chipTheme: ChipThemeData(
+        backgroundColor: scheme.surface,
+        selectedColor: scheme.primaryContainer,
+        labelStyle: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: scheme.onSurfaceVariant),
+        secondaryLabelStyle: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: scheme.onPrimaryContainer),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        labelPadding: const EdgeInsets.symmetric(horizontal: 2),
+        shape: StadiumBorder(side: BorderSide(color: scheme.outlineVariant)),
+        side: BorderSide(color: scheme.outlineVariant),
+        checkmarkColor: scheme.onPrimaryContainer,
+        elevation: 0,
+        pressElevation: 0,
+      ),
     );
   }
 }

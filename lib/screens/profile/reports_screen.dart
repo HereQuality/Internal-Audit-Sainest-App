@@ -15,6 +15,7 @@ import '../../utils/report_sections.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/status_badge.dart';
+import '../../widgets/status_filter_chip_row.dart';
 import '../audits/audit_detail_screen.dart';
 
 /// Profile -> Reports (titled "Final Report" to match the web app) — every
@@ -309,25 +310,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 ],
               ),
             ),
-            SizedBox(
-              height: 44,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-                itemCount: _statusFilters.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 8),
-                itemBuilder: (_, i) {
-                  final label = _statusFilters[i];
-                  final selected = _statusFilter == label;
-                  return Center(
-                    child: ChoiceChip(
-                      label: Text(label),
-                      selected: selected,
-                      onSelected: (_) => setState(() => _statusFilter = label),
-                    ),
-                  );
-                },
-              ),
+            StatusFilterChipRow(
+              options: _statusFilters,
+              selected: _statusFilter,
+              onSelected: (v) => setState(() => _statusFilter = v),
             ),
           ],
           Expanded(
