@@ -38,6 +38,24 @@ final _findingColor = {
   'NC': const PdfColor.fromInt(0xFFEF4444),
 };
 
+// A pw.Container's BoxDecoration fill doesn't alpha-composite a
+// translucent PdfColor against the page the way CSS/a browser would — it
+// paints the raw RGB opaquely, so a "light tint" background built as
+// `PdfColor(c.red, c.green, c.blue, 0.1)` (same hue as the text, meant to
+// read as a faint wash behind it) instead came out as a SOLID block in
+// that exact hue — with same-colored text drawn on top of it, completely
+// unreadable (confirmed by rendering an actual sample PDF: the finding
+// pills and stat tiles were opaque colored boxes with invisible text).
+// Pre-blending against white here — the same math as painting a
+// translucent color over a white page, just computed once and painted
+// fully opaque — gives the light tint that was actually intended,
+// independent of how BoxDecoration handles alpha.
+PdfColor _lightTint(PdfColor c, double amount) => PdfColor(
+      1 - (1 - c.red) * amount,
+      1 - (1 - c.green) * amount,
+      1 - (1 - c.blue) * amount,
+    );
+
 // Same short labels as the web's own FINDING_META_PDF
 // (exportAuditReportToPdf.js) — "Raise NC" (not just "NC") matches what
 // the web PDF's stat tile/pill actually says.
@@ -288,7 +306,7 @@ pw.Widget _buildStatTiles(int? overallPct, List<ParameterNode> scoredLeaves) {
           (t) => pw.Container(
             padding: const pw.EdgeInsets.symmetric(horizontal: 10, vertical: 6),
             decoration: pw.BoxDecoration(
-              color: PdfColor(t.value.red, t.value.green, t.value.blue, 0.10),
+              color: _lightTint(t.value, 0.10),
               border: pw.Border.all(color: t.value, width: 0.6),
               borderRadius: pw.BorderRadius.circular(6),
             ),
@@ -453,7 +471,7 @@ pw.Widget _findingPill(String findingType) {
   return pw.Container(
     padding: const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 2),
     decoration: pw.BoxDecoration(
-      color: PdfColor(color.red, color.green, color.blue, 0.14),
+      color: _lightTint(color, 0.14),
       borderRadius: pw.BorderRadius.circular(4),
     ),
     child: pw.Text(label, style: pw.TextStyle(fontSize: 7, fontWeight: pw.FontWeight.bold, color: color)),
