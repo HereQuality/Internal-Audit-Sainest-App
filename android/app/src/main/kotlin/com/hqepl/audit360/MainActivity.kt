@@ -1,4 +1,4 @@
-package com.example.internal_audit_app
+package com.hqepl.audit360
 
 import io.flutter.embedding.android.FlutterActivity
 
