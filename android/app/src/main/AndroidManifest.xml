@@ -18,12 +18,13 @@
          declare a type; DATA_SYNC matches the periodic-poll nature of the
          overdue-NC watcher (see background_entrypoints.dart). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
-    <!-- Only needed if you actually adopt the lock-screen alarm-style
-         full-screen notification described in NOTIFICATIONS.md — Android 14
-         (API 34) downgraded this from install-time-granted to something the
-         user must explicitly allow (Settings > Apps > Alarms & reminders),
-         see NotificationManager.canUseFullScreenIntent() in that doc. -->
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <!-- USE_FULL_SCREEN_INTENT removed — showFullScreenAlarm() in
+         local_notifications.dart is wired up but deliberately unused (see
+         NOTIFICATIONS.md's "Full-screen, lock-screen alarm-style
+         notification" section); declaring the permission with no live
+         caller only invites Play Store review scrutiny for nothing. Re-add
+         it alongside actually wiring that method up, if a genuine
+         hard-deadline alert feature ships later. -->
 
     <application
         android:label="Q Audit360"
