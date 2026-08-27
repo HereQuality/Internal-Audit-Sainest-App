@@ -42,7 +42,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
         context.read<AuditsProvider>().setSelfEmployeeId(selfId);
       }
       context.read<DashboardProvider>().fetchStats();
-      context.read<DashboardProvider>().fetchAtsSummary();
       // Same list My Audits/Calendar already fetch (AuditsProvider.audits)
       // — reused here just to answer "what's on today" without a second,
       // dashboard-only endpoint.
@@ -59,7 +58,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return RefreshIndicator(
       onRefresh: () => Future.wait([
         context.read<DashboardProvider>().fetchStats(),
-        context.read<DashboardProvider>().fetchAtsSummary(),
         context.read<AuditsProvider>().fetchMyAudits(),
       ]),
       child: CustomScrollView(
@@ -118,20 +116,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
             // Headline ATS/OTC scorecard — the most visually dominant
             // thing on this dashboard (feeds straight into appraisal /
-            // increment review), fetched/tracked separately from the
-            // stats grid below (see fetchAtsSummary) so it only appears
-            // once loaded and never blocks or errors out that grid.
-            if (!dashboard.isLoadingAts &&
-                dashboard.atsErrorMessage == null &&
-                (dashboard.atsSummary.score != null ||
-                    dashboard.atsSummary.atsScore != null ||
-                    dashboard.atsSummary.otcScore != null))
+            // increment review). This auditor's own audit-based ATS/OTC
+            // (Start/Due/Completed dates), same fields the web app's
+            // AuditorDashboard.jsx Performance Scorecard reads off this
+            // identical GET /audits/auditor-stats response — NOT the
+            // NC-closure-based score (that one's AuditeeStats, the
+            // auditee's own dashboard below).
+            if (!dashboard.isLoading &&
+                dashboard.errorMessage == null &&
+                (dashboard.stats.auditAtsScore != null ||
+                    dashboard.stats.auditOtcScore != null))
               SliverPadding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 sliver: SliverToBoxAdapter(
                   child: ScoreRow(
-                    atsScore: dashboard.atsSummary.atsScore,
-                    otcScore: dashboard.atsSummary.otcScore,
+                    atsScore: dashboard.stats.auditAtsScore,
+                    otcScore: dashboard.stats.auditOtcScore,
                   ),
                 ),
               ),

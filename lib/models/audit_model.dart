@@ -142,12 +142,23 @@ class AuditorStats {
   final int inProgress;
   final int ncPending;
   final int completed;
+  // This auditor's own ATS/OTC — based on THEIR audits' Start/Due/Completed
+  // dates (server/controllers/audit.controller.js#getAuditorStats ->
+  // computeAuditAtsScore/computeAuditOtcRate), same fields the web app's
+  // AuditorDashboard.jsx reads off this identical endpoint for its
+  // Performance Scorecard. NOT the NC-closure-based ATS/OTC (that's
+  // AuditeeStats, a different GET /ncs/ats-summary metric for how well
+  // someone responds to NCs raised against them).
+  final double? auditAtsScore;
+  final double? auditOtcScore;
 
   const AuditorStats({
     this.assignedAudits = 0,
     this.inProgress = 0,
     this.ncPending = 0,
     this.completed = 0,
+    this.auditAtsScore,
+    this.auditOtcScore,
   });
 
   factory AuditorStats.fromJson(Map<String, dynamic> json) {
@@ -157,6 +168,8 @@ class AuditorStats {
       inProgress: asInt(json['inProgress']),
       ncPending: asInt(json['ncPending']),
       completed: asInt(json['completed']),
+      auditAtsScore: (json['auditAtsScore'] as num?)?.toDouble(),
+      auditOtcScore: (json['auditOtcScore'] as num?)?.toDouble(),
     );
   }
 }

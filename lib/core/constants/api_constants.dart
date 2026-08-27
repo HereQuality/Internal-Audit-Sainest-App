@@ -40,6 +40,13 @@ class ApiConstants {
   static String evidenceUploadStatus(String jobId) =>
       '/audits/uploads/status/$jobId';
   static String completeAudit(String id) => '/audits/$id/complete';
+  // Every zone of a multi-document Schedule/Frequency batch, side by side —
+  // unlike GET /audits/:id (auditById above), this is deliberately
+  // unscoped to the caller's own assigned zone(s): anyone who's an auditor
+  // on at least one zone (or planned the batch) gets every OTHER zone's
+  // score/status too, same as the web app's AuditFullReport.jsx "All
+  // Locations (Combined)" view (audit.controller.js#getBatchReport).
+  static String auditBatchReport(String batchId) => '/audits/batch/$batchId/report';
   // Mobile's mandatory "pick one representative auditee" step, asked once
   // before scoring begins — see audit.controller.js#setAuditRepresentative.
   static String auditRepresentative(String id) => '/audits/$id/representative';

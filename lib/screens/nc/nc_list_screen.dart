@@ -110,11 +110,16 @@ class _NcListScreenState extends State<NcListScreen>
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final provider = context.read<NcProvider>();
-      if (_showRaised) {
-        final selfId = context.read<AuthProvider>().user?.id;
-        if (selfId != null) provider.setSelfEmployeeId(selfId);
-        provider.fetchRaisedByMe();
-      }
+      // Must be set before either fetch below — see DashboardProvider/
+      // AuditsProvider's identical _scopeParams pattern: "Me" resolves to an
+      // explicit employeeIds=<selfId>, which needs this known first. Used to
+      // only run when _showRaised (auditor mode) — an auditee-only session
+      // (widget.mode == auditeeOnly) never hit this at all, on this screen
+      // or on AuditeeDashboardScreen, so fetchAgainstMe's own "Me" scope
+      // below silently ran unscoped instead.
+      final selfId = context.read<AuthProvider>().user?.id;
+      if (selfId != null) provider.setSelfEmployeeId(selfId);
+      if (_showRaised) provider.fetchRaisedByMe();
       if (_showAgainst) provider.fetchAgainstMe();
     });
   }
@@ -320,75 +325,92 @@ class _AgainstMeListState extends State<_AgainstMeList> {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<NcProvider>();
-    if (provider.isLoadingMine && provider.raisedAgainstMe.isEmpty) {
-      return const AppLoading();
-    }
-    if (provider.mineError != null && provider.raisedAgainstMe.isEmpty) {
-      return ErrorState(
-        message: provider.mineError!,
-        onRetry: widget.onRefresh,
-      );
-    }
-    if (provider.raisedAgainstMe.isEmpty) {
-      return const EmptyState(
-        icon: Icons.thumb_up_outlined,
-        title: 'No NCs against you — great work!',
-      );
-    }
+    final showLoading = provider.isLoadingMine && provider.raisedAgainstMe.isEmpty;
+    final showError = provider.mineError != null && provider.raisedAgainstMe.isEmpty;
+    final showEmpty = !showLoading && !showError && provider.raisedAgainstMe.isEmpty;
     final filtered = provider.raisedAgainstMe
         .where((n) => _matchesFilter(n, _statusFilter))
         .toList();
     return Column(
       children: [
-        _StatusFilterRow(
-          selected: _statusFilter,
-          onSelect: (v) => setState(() => _statusFilter = v),
-        ),
-        Expanded(
-          child: RefreshIndicator(
-            onRefresh: widget.onRefresh,
-            child: filtered.isEmpty
-                ? ListView(
-                    physics: const AlwaysScrollableScrollPhysics(),
-                    children: [
-                      SizedBox(
-                        height: MediaQuery.of(context).size.height * 0.5,
-                        child: EmptyState(
-                          icon: Icons.filter_alt_off_outlined,
-                          title: 'No $_statusFilter NCs',
-                        ),
-                      ),
-                    ],
-                  )
-                : ListView.separated(
-                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                    itemCount: filtered.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 10),
-                    itemBuilder: (_, i) {
-                      final nc = filtered[i];
-                      return _NcCard(
-                        nc: nc,
-                        subtitle: 'Raised by ${nc.raisedBy.name}',
-                        actionLabel: nc.status == 'Raised' ? 'Respond' : null,
-                        onTap: () {
-                          if (nc.status == 'Raised') {
-                            Navigator.of(context).push(
-                              MaterialPageRoute(
-                                builder: (_) => NcResponseScreen(nc: nc),
-                              ),
-                            );
-                          } else {
-                            Navigator.of(context).push(
-                              MaterialPageRoute(
-                                builder: (_) => NcReviewScreen(nc: nc),
-                              ),
-                            );
-                          }
-                        },
-                      );
-                    },
-                  ),
+        // Kept visible through loading/error/empty too — same reasoning as
+        // _RaisedByMeList's identical toggle: an empty "Me" list (nobody's
+        // raised anything against your own scope) is exactly when switching
+        // to "Team" to check your downstream reports' NCs matters most. Same
+        // Me/Team scope as the web app's Auditee.jsx TeamFilterPanel.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: ScopeToggle(
+              isTeam: provider.isTeamScope,
+              onChanged: (isTeam) =>
+                  context.read<NcProvider>().setTeamScope(isTeam),
+            ),
           ),
+        ),
+        if (!showLoading && !showError && !showEmpty)
+          _StatusFilterRow(
+            selected: _statusFilter,
+            onSelect: (v) => setState(() => _statusFilter = v),
+          ),
+        Expanded(
+          child: showLoading
+              ? const AppLoading()
+              : showError
+              ? ErrorState(
+                  message: provider.mineError!,
+                  onRetry: widget.onRefresh,
+                )
+              : showEmpty
+              ? const EmptyState(
+                  icon: Icons.thumb_up_outlined,
+                  title: 'No NCs against you — great work!',
+                )
+              : RefreshIndicator(
+                  onRefresh: widget.onRefresh,
+                  child: filtered.isEmpty
+                      ? ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: [
+                            SizedBox(
+                              height: MediaQuery.of(context).size.height * 0.5,
+                              child: EmptyState(
+                                icon: Icons.filter_alt_off_outlined,
+                                title: 'No $_statusFilter NCs',
+                              ),
+                            ),
+                          ],
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                          itemCount: filtered.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 10),
+                          itemBuilder: (_, i) {
+                            final nc = filtered[i];
+                            return _NcCard(
+                              nc: nc,
+                              subtitle: 'Raised by ${nc.raisedBy.name}',
+                              actionLabel: nc.status == 'Raised' ? 'Respond' : null,
+                              onTap: () {
+                                if (nc.status == 'Raised') {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => NcResponseScreen(nc: nc),
+                                    ),
+                                  );
+                                } else {
+                                  Navigator.of(context).push(
+                                    MaterialPageRoute(
+                                      builder: (_) => NcReviewScreen(nc: nc),
+                                    ),
+                                  );
+                                }
+                              },
+                            );
+                          },
+                        ),
+                ),
         ),
       ],
     );

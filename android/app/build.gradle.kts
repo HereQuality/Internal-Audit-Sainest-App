@@ -39,6 +39,19 @@ android {
     }
 }
 
+// Renames the built APK from Flutter's default app-<buildType>.apk to
+// Q_Audit360-<buildType>.apk (e.g. Q_Audit360-release.apk). outputFileName
+// is only exposed on the internal VariantOutputImpl, not the public
+// VariantOutput interface, hence the cast.
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            (output as com.android.build.api.variant.impl.VariantOutputImpl)
+                .outputFileName.set("Q_Audit360-${variant.buildType}.apk")
+        }
+    }
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17

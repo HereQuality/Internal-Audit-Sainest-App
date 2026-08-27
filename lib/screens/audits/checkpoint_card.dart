@@ -747,14 +747,16 @@ class _CheckpointCardState extends State<CheckpointCard> {
               // characters a bare TextInputType.number keyboard can still
               // let through on some IMEs.
               inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: InputDecoration(labelText: 'Score (max ${widget.maxScore.toStringAsFixed(0)})'),
-              // Hard-clamp to this checkpoint's own max as they type — the
-              // server clamps this too, but letting the field visibly show
-              // an impossible number first is confusing.
+              decoration: InputDecoration(labelText: 'Score (max ${(widget.maxScore - 1).toStringAsFixed(0)})'),
+              // Hard-clamp to strictly BELOW this checkpoint's own max as they
+              // type — an OFI is by definition a partial score (full marks
+              // belong to Strong Compliance/Compliance instead), same rule the
+              // server enforces, but letting the field visibly show the
+              // impossible max first is confusing.
               onChanged: (value) {
                 final n = double.tryParse(value);
-                if (n != null && n > widget.maxScore) {
-                  final clamped = widget.maxScore.toStringAsFixed(0);
+                if (n != null && n >= widget.maxScore) {
+                  final clamped = (widget.maxScore - 1).toStringAsFixed(0);
                   _scoreController.value = TextEditingValue(text: clamped, selection: TextSelection.collapsed(offset: clamped.length));
                 }
               },

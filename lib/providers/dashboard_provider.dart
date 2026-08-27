@@ -11,13 +11,17 @@ class DashboardProvider extends ChangeNotifier {
   final Dio _dio = DioClient.instance.dio;
 
   // "Me" vs "Team" scope for the auditor stat tallies + ATS/OTC score below
-  // (see widgets/scope_toggle.dart) — Me by default, i.e. an explicit
-  // employeeIds=<selfId> query param; Team omits the param entirely so the
-  // server falls back to its own default (self + downstream hierarchy, see
-  // resolveScopedEmployeeIds). Remembered here (not just passed per-call)
-  // so a live-refresh/pull-to-refresh triggered from elsewhere reuses
-  // whatever the user last picked instead of silently reverting to Me.
-  bool isTeamScope = false;
+  // (see widgets/scope_toggle.dart) — Team by default, i.e. no employeeIds
+  // param at all so the server falls back to its own default (self +
+  // downstream hierarchy, see resolveScopedEmployeeIds); "Me" sends an
+  // explicit employeeIds=<selfId> to narrow down to just the caller. Team
+  // is the default to match the web app's TeamFilterPanel, whose own
+  // default is "All" — same reason a not-yet-toggled ATS/OTC score used to
+  // read differently between web and mobile for the same account. Remembered
+  // here (not just passed per-call) so a live-refresh/pull-to-refresh
+  // triggered from elsewhere reuses whatever the user last picked instead
+  // of silently reverting to the default.
+  bool isTeamScope = true;
   String? _selfEmployeeId;
   Map<String, dynamic>? get _scopeParams => isTeamScope
       ? null
@@ -29,29 +33,28 @@ class DashboardProvider extends ChangeNotifier {
     _selfEmployeeId = id;
   }
 
-  /// Flips the Me/Team toggle and refetches everything this scope affects.
+  /// Flips the Me/Team toggle and refetches everything this scope affects —
+  /// both dashboards share this one flag (only one is ever mounted at a
+  /// time per AppMode), so refetch whichever of stats/auditeeStats this
+  /// scope actually feeds rather than guessing which screen called this.
   Future<void> setTeamScope(bool isTeam) {
     isTeamScope = isTeam;
     notifyListeners();
-    return Future.wait([fetchStats(), fetchAtsSummary()]);
+    return Future.wait([fetchStats(), fetchAuditeeStats()]);
   }
 
   bool isLoading = false;
   String? errorMessage;
+  // Also carries this auditor's own ATS/OTC (auditAtsScore/auditOtcScore) —
+  // same GET /audits/auditor-stats response the web app's
+  // AuditorDashboard.jsx#loadStats reads for its Performance Scorecard, so
+  // that scorecard and this one stay driven by the same source instead of
+  // drifting apart under separate loading/error state.
   AuditorStats stats = const AuditorStats();
 
   bool isLoadingAuditee = false;
   String? auditeeErrorMessage;
   AuditeeStats auditeeStats = const AuditeeStats();
-
-  bool isLoadingAts = false;
-  String? atsErrorMessage;
-  // Reuses AuditeeStats — same GET /ncs/ats-summary response shape (score/
-  // atsScore/otcScore + buckets), just scoped to the auditor's own team
-  // (self + downstream hierarchy, resolveScopedEmployeeIds' default with no
-  // employeeIds param — same "all" scope TeamFilterPanel defaults to on the
-  // web app's AuditorDashboard.jsx) instead of the auditee themself.
-  AuditeeStats atsSummary = const AuditeeStats();
 
   bool _listening = false;
   // Stored so stopListening removes exactly this closure — Notifications-
@@ -62,15 +65,15 @@ class DashboardProvider extends ChangeNotifier {
 
   /// Wires a socket listener once, after login — mirrors AuditsProvider/
   /// NcProvider.startListening(). Unlike those, this screen previously had
-  /// NO live-refresh path at all: fetchStats/fetchAuditeeStats/
-  /// fetchAtsSummary only ever ran once on first visit (DashboardScreen's
-  /// initState) or on a manual pull-to-refresh, so the stat tiles (Assigned/
-  /// In Progress/NC Pending/Completed, ATS/OTC score, auditee tallies) sat
-  /// stale until the app was reloaded — even though the underlying data had
-  /// changed. Any `audit_*`/`nc_*` notification means one of these tallies
-  /// may have moved, so just refetch all three; each is a cheap GET and
-  /// mode-agnostic (same "always listen regardless of current AppMode" the
-  /// other providers already do) rather than trying to guess which of the
+  /// NO live-refresh path at all: fetchStats/fetchAuditeeStats only ever ran
+  /// once on first visit (DashboardScreen's initState) or on a manual
+  /// pull-to-refresh, so the stat tiles (Assigned/In Progress/NC Pending/
+  /// Completed, ATS/OTC score, auditee tallies) sat stale until the app was
+  /// reloaded — even though the underlying data had changed. Any
+  /// `audit_*`/`nc_*` notification means one of these tallies may have
+  /// moved, so just refetch both; each is a cheap GET and mode-agnostic
+  /// (same "always listen regardless of current AppMode" the other
+  /// providers already do) rather than trying to guess which of the
   /// auditor/auditee tiles is currently on screen.
   void startListening() {
     if (_listening) return;
@@ -104,7 +107,7 @@ class DashboardProvider extends ChangeNotifier {
   /// DioException and records it on its own error field, so this never
   /// throws.
   Future<void> refreshAll() =>
-      Future.wait([fetchStats(), fetchAuditeeStats(), fetchAtsSummary()]);
+      Future.wait([fetchStats(), fetchAuditeeStats()]);
 
   Future<void> fetchStats() async {
     isLoading = true;
@@ -138,7 +141,10 @@ class DashboardProvider extends ChangeNotifier {
     auditeeErrorMessage = null;
     notifyListeners();
     try {
-      final res = await _dio.get(ApiConstants.ncsAtsSummary);
+      final res = await _dio.get(
+        ApiConstants.ncsAtsSummary,
+        queryParameters: _scopeParams,
+      );
       auditeeStats = AuditeeStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
@@ -149,33 +155,6 @@ class DashboardProvider extends ChangeNotifier {
       );
     } finally {
       isLoadingAuditee = false;
-      notifyListeners();
-    }
-  }
-
-  /// Auditor-side ATS/OTC score row (mirrors web's AuditorDashboard.jsx
-  /// #loadStats -> getAtsSummary(scope)) — a secondary metric alongside the
-  /// audit tallies from fetchStats above, so its own error is tracked
-  /// separately and never blocks the main stats grid from rendering.
-  Future<void> fetchAtsSummary() async {
-    isLoadingAts = true;
-    atsErrorMessage = null;
-    notifyListeners();
-    try {
-      final res = await _dio.get(
-        ApiConstants.ncsAtsSummary,
-        queryParameters: _scopeParams,
-      );
-      atsSummary = AuditeeStats.fromJson(
-        Map<String, dynamic>.from(res.data['data']),
-      );
-    } on DioException catch (e) {
-      atsErrorMessage = extractErrorMessage(
-        e,
-        fallback: 'Could not load ATS/OTC score.',
-      );
-    } finally {
-      isLoadingAts = false;
       notifyListeners();
     }
   }

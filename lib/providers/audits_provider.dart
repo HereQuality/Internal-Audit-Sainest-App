@@ -21,7 +21,9 @@ class AuditsProvider extends ChangeNotifier {
   // (both read this same `audits` field), so toggling on either screen
   // keeps the other in sync instead of the two drifting apart. See
   // widgets/scope_toggle.dart / DashboardProvider's identical pattern.
-  bool isTeamScope = false;
+  // Defaults true (Team) — matches the web app's TeamFilterPanel, whose own
+  // default is "All", not just-yourself.
+  bool isTeamScope = true;
   String? _selfEmployeeId;
   Map<String, dynamic>? get _scopeParams => isTeamScope
       ? null
@@ -385,6 +387,25 @@ class AuditsProvider extends ChangeNotifier {
     detailError = null;
   }
 
+  /// Same clear as above, plus flags a fresh load in flight — call from a
+  /// NEW AuditDetailScreen's initState (not dispose, which already uses
+  /// clearActiveAudit alone) so that screen's very first build already
+  /// shows the loading spinner, never the previous audit it's replacing
+  /// (activeAudit is a singleton field here, shared across every visit —
+  /// Navigator.pop()'s transition keeps the outgoing screen, and so its
+  /// own dispose()/clear, mounted until the pop animation finishes, which
+  /// a fast-enough next tap can race) or a misleading "Audit not found"
+  /// (isLoadingDetail would otherwise still read false on that very first
+  /// frame, before fetchAuditDetail's own request even starts). Not
+  /// folded into fetchAuditDetail itself — that's also how the CURRENTLY
+  /// open audit refetches after every save, where flashing back to
+  /// "loading" on every checkpoint autosave would be its own regression.
+  void beginActiveAuditReload() {
+    activeAudit = null;
+    detailError = null;
+    isLoadingDetail = true;
+  }
+
   // ── Reports (Profile → Reports) ───────────────────────────────────────
   // Same GET /audits/mine list fetchMyAudits already uses — always this
   // employee's own audits regardless of the My Audits team-scope toggle,
@@ -470,6 +491,27 @@ class AuditsProvider extends ChangeNotifier {
     return AuditDetailModel.fromJson(
       Map<String, dynamic>.from(res.data['data']),
     );
+  }
+
+  /// Every zone of a multi-document batch, side by side — the mobile
+  /// counterpart to fetchAuditReportDetail above for a "combined" report,
+  /// which that one alone can't produce for a batch: it only ever fetches
+  /// zones this employee is personally an auditor on (this screen's own
+  /// list is scoped to GET /audits/mine), so looping it per zone silently
+  /// dropped every OTHER auditor's zone from a "combined" PDF — same gap
+  /// the web app closed with a dedicated GET /audits/batch/:batchId/report
+  /// (audit.controller.js#getBatchReport: unscoped once authorized for at
+  /// least one zone, on purpose — "the whole point of a whole-batch report
+  /// is every zone side by side"). Each zone in the response is shaped
+  /// exactly like GET /audits/:id's own `data`, so AuditDetailModel.fromJson
+  /// parses it unchanged.
+  Future<List<AuditDetailModel>> fetchBatchReport(String batchId) async {
+    final res = await _dio.get(ApiConstants.auditBatchReport(batchId));
+    final zones = (res.data['data']?['zones'] as List? ?? [])
+        .whereType<Map>()
+        .map((z) => AuditDetailModel.fromJson(Map<String, dynamic>.from(z)))
+        .toList();
+    return zones;
   }
 
   /// Uploads evidence photos for one checkpoint right away — independent

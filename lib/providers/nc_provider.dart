@@ -14,11 +14,14 @@ import '../models/nc_model.dart';
 class NcProvider extends ChangeNotifier {
   final Dio _dio = DioClient.instance.dio;
 
-  // "Me" vs "Team" scope for fetchRaisedByMe below — see widgets/
-  // scope_toggle.dart / AuditsProvider/DashboardProvider's identical
-  // pattern. Independent of those two: raisedByMe isn't shared with any
-  // other screen, so this doesn't need to live anywhere but here.
-  bool isTeamScope = false;
+  // "Me" vs "Team" scope for fetchRaisedByMe/fetchAgainstMe below — see
+  // widgets/scope_toggle.dart / AuditsProvider/DashboardProvider's identical
+  // pattern. Independent of those: neither list is shared with any other
+  // screen, so this doesn't need to live anywhere but here. One toggle
+  // covers both lists (not a separate one per side) since a single person
+  // can appear in both. Defaults true (Team) — matches the web app's
+  // TeamFilterPanel, whose own default is "All", not just-yourself.
+  bool isTeamScope = true;
   String? _selfEmployeeId;
   Map<String, dynamic>? get _scopeParams => isTeamScope
       ? null
@@ -31,7 +34,7 @@ class NcProvider extends ChangeNotifier {
   Future<void> setTeamScope(bool isTeam) {
     isTeamScope = isTeam;
     notifyListeners();
-    return fetchRaisedByMe();
+    return Future.wait([fetchRaisedByMe(), fetchAgainstMe()]);
   }
 
   bool isLoadingRaised = false;
@@ -105,7 +108,10 @@ class NcProvider extends ChangeNotifier {
     mineError = null;
     notifyListeners();
     try {
-      final res = await _dio.get(ApiConstants.ncsMine);
+      final res = await _dio.get(
+        ApiConstants.ncsMine,
+        queryParameters: _scopeParams,
+      );
       raisedAgainstMe = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => NcModel.fromJson(Map<String, dynamic>.from(e)))

@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
 import 'package:provider/provider.dart';
@@ -176,23 +177,37 @@ class _ReportsScreenState extends State<ReportsScreen> {
     }
   }
 
-  // Fetches every member's own full report detail (already-authorized —
-  // same GET /audits/:id?report=true each one's own PDF button already
-  // uses, just called once per zone) and combines them into one PDF. See
-  // buildCombinedReportPdf's own doc comment for why this doesn't call the
-  // server's combined /audits/batch/:batchId/report instead.
+  // Every zone in the batch, not just the ones `members` lists (this
+  // employee's own — see _groupByBatch above, sourced from GET
+  // /audits/mine) — AuditsProvider#fetchBatchReport's own header comment
+  // has the full story: looping fetchAuditReportDetail per member here
+  // used to silently drop every OTHER auditor's zone from a "combined"
+  // report, the mobile side of the "only his own coming, not the full
+  // one" gap against the web app's Final Report page. That endpoint's own
+  // access rule (audit.controller.js#getBatchReport) is a per-ROLE menu
+  // grant ("Final Report"/"Schedule Audit" read), which varies by company
+  // setup and isn't something this screen can know ahead of time — a role
+  // without it falls back to the old per-member loop below (still every
+  // zone THIS employee is personally on, same as before) rather than the
+  // combined download just failing outright.
   Future<void> _downloadCombined(
     String batchId,
     List<AuditModel> members,
     String title,
   ) async {
     setState(() => _downloadingBatchId = batchId);
+    final provider = context.read<AuditsProvider>();
     try {
-      final provider = context.read<AuditsProvider>();
-      final zones = <AuditDetailModel>[];
-      for (final m in members) {
-        final detail = await provider.fetchAuditReportDetail(m.id);
-        if (detail != null) zones.add(detail);
+      List<AuditDetailModel> zones;
+      try {
+        zones = await provider.fetchBatchReport(batchId);
+      } on DioException catch (e) {
+        if (e.response?.statusCode != 403) rethrow;
+        zones = [];
+        for (final m in members) {
+          final detail = await provider.fetchAuditReportDetail(m.id);
+          if (detail != null) zones.add(detail);
+        }
       }
       if (zones.isEmpty) throw Exception('Could not load this report.');
       final bytes = await buildCombinedReportPdf(zones);

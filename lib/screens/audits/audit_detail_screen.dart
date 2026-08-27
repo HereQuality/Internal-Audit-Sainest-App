@@ -107,6 +107,12 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   @override
   void initState() {
     super.initState();
+    // See AuditsProvider#beginActiveAuditReload's own header comment — this
+    // screen's very first build must never read a previous audit's
+    // leftover activeAudit (a real Navigator.pop()-timing race, not just
+    // theoretical) or a false "not found" before _load()'s fetch (deferred
+    // to addPostFrameCallback below) has even started.
+    context.read<AuditsProvider>().beginActiveAuditReload();
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
   }
 

@@ -69,15 +69,13 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
 /// then-divide across the whole group, never an average of each zone's own
 /// %, same rule every other multi-audit rollup in this app uses.
 ///
-/// Deliberately built from zones already fetched one at a time via the
-/// normal GET /audits/:id?report=true (AuditsProvider.fetchAuditReportDetail
-/// — the same call the single-report PDF above uses) rather than the
-/// server's own combined GET /audits/batch/:batchId/report: that endpoint
-/// is gated to planner/admin menu access (see server/routes/audit.routes.js
-/// LIST_MENU_URLS: requireMenuPermission(["/schedule-audit", "/final-report"])),
-/// so a field auditor personally assigned to every zone here still
-/// wouldn't be authorized to call it, even though they can already see
-/// each zone's own full detail individually.
+/// Takes whatever zones the caller hands it — reports_screen.dart's own
+/// _downloadCombined prefers AuditsProvider.fetchBatchReport (the server's
+/// combined GET /audits/batch/:batchId/report, every zone in the batch —
+/// not just this employee's own) and only falls back to fetching one zone
+/// at a time via fetchAuditReportDetail (this employee's own zones only)
+/// if that 403s — a per-role "Final Report"/"Schedule Audit" menu grant
+/// that varies by company setup (see audit.routes.js's LIST_MENU_URLS).
 Future<Uint8List> buildCombinedReportPdf(List<AuditDetailModel> zones) async {
   final doc = pw.Document(theme: await loadReportPdfTheme());
   if (zones.isEmpty) return doc.save();

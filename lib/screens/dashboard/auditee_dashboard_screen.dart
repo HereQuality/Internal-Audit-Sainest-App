@@ -9,6 +9,7 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/expandable_section.dart';
 import '../../widgets/score_row.dart';
+import '../../widgets/scope_toggle.dart';
 import '../../widgets/stat_card.dart';
 import '../../widgets/today_ncs_section.dart';
 
@@ -34,6 +35,15 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Must be set before the first fetch below — see DashboardProvider/
+      // NcProvider's own _scopeParams (Me defaults to explicit
+      // employeeIds=<selfId>, which needs this to actually be known).
+      // Mirrors the auditor DashboardScreen's identical initState.
+      final selfId = context.read<AuthProvider>().user?.id;
+      if (selfId != null) {
+        context.read<DashboardProvider>().setSelfEmployeeId(selfId);
+        context.read<NcProvider>().setSelfEmployeeId(selfId);
+      }
       context.read<DashboardProvider>().fetchAuditeeStats();
       // Same list the NCs tab's "Against me" view fetches (NcProvider.
       // raisedAgainstMe) — reused here just to answer "what do I need to
@@ -77,6 +87,27 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
                           ?.copyWith(fontWeight: FontWeight.w800),
                     ),
                 ],
+              ),
+            ),
+          ),
+          // Me (default) vs Team (self + downstream hierarchy) — scopes the
+          // ATS/OTC score and the tally grid below, same toggle/scoping the
+          // auditor DashboardScreen already offers and the web app's
+          // Auditee.jsx TeamFilterPanel. A manager reviewing this as an
+          // auditee still wants their own reports' NCs counted in, not just
+          // their personal ones.
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+            sliver: SliverToBoxAdapter(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: ScopeToggle(
+                  isTeam: dashboard.isTeamScope,
+                  onChanged: (isTeam) {
+                    context.read<DashboardProvider>().setTeamScope(isTeam);
+                    context.read<NcProvider>().setTeamScope(isTeam);
+                  },
+                ),
               ),
             ),
           ),
