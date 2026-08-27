@@ -9,8 +9,7 @@ import '../../providers/dashboard_provider.dart';
 import '../../providers/nc_provider.dart';
 import '../../providers/notifications_provider.dart';
 import '../audits/my_audits_screen.dart';
-import '../calendar/auditee_calendar_screen.dart';
-import '../calendar/auditor_calendar_screen.dart';
+import '../calendar/calendar_screen.dart';
 import '../dashboard/auditee_dashboard_screen.dart';
 import '../dashboard/dashboard_screen.dart';
 import '../nc/nc_list_screen.dart';
@@ -197,11 +196,7 @@ class _AppShellState extends State<AppShell> {
             IconButton(
               tooltip: 'Calendar',
               onPressed: () => Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => isAuditor
-                      ? const AuditorCalendarScreen()
-                      : const AuditeeCalendarScreen(),
-                ),
+                MaterialPageRoute(builder: (_) => const CalendarScreen()),
               ),
               icon: const Icon(Icons.calendar_month_outlined),
             ),

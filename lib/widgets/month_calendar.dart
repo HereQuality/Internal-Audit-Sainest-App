@@ -42,11 +42,18 @@ class MonthCalendar extends StatefulWidget {
   final List<CalendarEvent> events;
   final Widget Function(BuildContext context, List<CalendarEvent> dayEvents)
   emptyDayBuilder;
+  // Optional dot+label legend rendered between the month-nav row and the
+  // weekday header — same placement as the web calendar's own legend row
+  // (Calendar.jsx), above the grid. Null keeps this widget usable by any
+  // future caller that doesn't have a fixed color scheme worth spelling
+  // out (e.g. a single-category list with no ambiguity to label).
+  final Widget? legend;
 
   const MonthCalendar({
     super.key,
     required this.events,
     required this.emptyDayBuilder,
+    this.legend,
   });
 
   @override
@@ -127,6 +134,7 @@ class _MonthCalendarState extends State<MonthCalendar> {
             ],
           ),
         ),
+        if (widget.legend != null) widget.legend!,
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: Row(

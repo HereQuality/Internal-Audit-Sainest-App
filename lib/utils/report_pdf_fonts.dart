@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 
@@ -14,18 +16,38 @@ import 'package:printing/printing.dart';
 /// builds from, so this isn't a new offline requirement.
 ///
 /// Cached in one Future so every report generated in an app session
-/// reuses the same fetch instead of re-downloading per PDF.
-Future<pw.ThemeData>? _themeFuture;
+/// reuses the same fetch instead of re-downloading per PDF. Each of the
+/// four font fetches is capped at [_perFontTimeout] — fonts.gstatic.com
+/// being slow or unreachable (flaky mobile data, a corporate firewall)
+/// used to hang this Future forever with no timeout at all, which is
+/// exactly what read as "the report just never finishes downloading".
+/// A timeout or any other failure now falls back to the package's own
+/// base-14 fonts (Latin-only, but a PDF that actually generates) instead
+/// of failing the whole export. The failed attempt is NOT cached as
+/// `_themeFuture` — only a genuinely successful (fonts loaded) or
+/// deliberately-fallback theme is, via [_resultFuture] below — so a
+/// transient failure (e.g. one bad network blip) doesn't lock every
+/// later report in this same app session into the Latin-only fallback;
+/// the next download attempt gets a fresh try at the real fonts.
+Future<pw.ThemeData>? _resultFuture;
+
+const _perFontTimeout = Duration(seconds: 12);
 
 Future<pw.ThemeData> loadReportPdfTheme() {
-  return _themeFuture ??= _load();
+  return _resultFuture ??= _load().catchError((Object _, StackTrace _) {
+    // Don't let a failed attempt sit cached — clear it so the NEXT report
+    // generated this session gets a fresh shot at the real fonts instead
+    // of being stuck on the fallback for the rest of the app's lifetime.
+    _resultFuture = null;
+    return pw.ThemeData();
+  });
 }
 
 Future<pw.ThemeData> _load() async {
-  final base = await PdfGoogleFonts.notoSansRegular();
-  final bold = await PdfGoogleFonts.notoSansBold();
-  final devanagari = await PdfGoogleFonts.notoSansDevanagariRegular();
-  final devanagariBold = await PdfGoogleFonts.notoSansDevanagariBold();
+  final base = await PdfGoogleFonts.notoSansRegular().timeout(_perFontTimeout);
+  final bold = await PdfGoogleFonts.notoSansBold().timeout(_perFontTimeout);
+  final devanagari = await PdfGoogleFonts.notoSansDevanagariRegular().timeout(_perFontTimeout);
+  final devanagariBold = await PdfGoogleFonts.notoSansDevanagariBold().timeout(_perFontTimeout);
   return pw.ThemeData.withFont(
     base: base,
     bold: bold,

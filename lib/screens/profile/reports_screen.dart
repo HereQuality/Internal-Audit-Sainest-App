@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/network/dio_client.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/snackbar.dart';
@@ -170,7 +171,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
       if (!mounted) return;
       showErrorSnackBar(
         context,
-        'Could not generate this report. Please try again.',
+        e is DioException
+            ? extractErrorMessage(e, fallback: 'Could not generate this report. Please try again.')
+            : 'Could not generate this report. Please try again.',
       );
     } finally {
       if (mounted) setState(() => _downloadingAuditId = null);
@@ -201,8 +204,18 @@ class _ReportsScreenState extends State<ReportsScreen> {
       List<AuditDetailModel> zones;
       try {
         zones = await provider.fetchBatchReport(batchId);
-      } on DioException catch (e) {
-        if (e.response?.statusCode != 403) rethrow;
+      } on DioException {
+        // Used to only fall back here on a 403 (no "Final Report"/"Schedule
+        // Audit" menu grant) and rethrow anything else — but a combined
+        // batch report is the single heaviest request this screen makes
+        // (every zone's full parameter tree + NCs in one response), so on a
+        // slow connection it's also the one most likely to hit a plain
+        // receiveTimeout. That used to fail the whole download outright
+        // ("the merged/combined audit's report just isn't there") even
+        // though this employee's own zone(s) were perfectly reachable one
+        // at a time. Any DioException now falls back the same way a 403
+        // already did — best-effort, this employee's own zones only —
+        // rather than only a permission gap degrading gracefully.
         zones = [];
         for (final m in members) {
           final detail = await provider.fetchAuditReportDetail(m.id);
@@ -219,7 +232,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
       if (!mounted) return;
       showErrorSnackBar(
         context,
-        'Could not generate this report. Please try again.',
+        e is DioException
+            ? extractErrorMessage(e, fallback: 'Could not generate this report. Please try again.')
+            : 'Could not generate this report. Please try again.',
       );
     } finally {
       if (mounted) setState(() => _downloadingBatchId = null);

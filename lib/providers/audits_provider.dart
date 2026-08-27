@@ -449,11 +449,11 @@ class AuditsProvider extends ChangeNotifier {
     }
   }
 
-  // ── "Audits at my location" (Auditee Calendar) ─────────────────────────
+  // ── "Audits at my location" (Calendar) ──────────────────────────────────
   // Every audit scheduled at one of this employee's own locations, whether
   // or not they're personally the assigned auditor/auditee — what powers
-  // the Auditee Calendar's blue "someone's coming to audit your location"
-  // markers (auditee_calendar_screen.dart). Kept as its own list rather
+  // the Calendar's blue "someone's coming to audit your location" markers
+  // (screens/calendar/calendar_screen.dart). Kept as its own list rather
   // than folded into `audits`/`reportAudits` above since those two are
   // both "assigned to me" views and this one deliberately is not.
   bool isLoadingAtMyLocation = false;

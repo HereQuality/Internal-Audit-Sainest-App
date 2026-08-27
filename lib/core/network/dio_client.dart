@@ -20,7 +20,16 @@ class DioClient {
       BaseOptions(
         baseUrl: ApiConstants.baseUrl,
         connectTimeout: const Duration(seconds: 20),
-        receiveTimeout: const Duration(seconds: 30),
+        // Was 30s — a combined "whole batch" report (getBatchReport) returns
+        // every zone's full parameter tree + NCs in one response, and a
+        // single audit's own report can carry a deep checklist too; on a
+        // slow mobile connection either could legitimately take longer than
+        // 30s to fully arrive, which surfaced as "the report just fails to
+        // download" (a receiveTimeout DioException) rather than a real
+        // server error. 60s gives slow connections real headroom without
+        // hanging forever — actual failures (bad connection entirely) still
+        // hit connectTimeout well before this.
+        receiveTimeout: const Duration(seconds: 60),
         // Multi-photo evidence uploads (up to 5 files) can legitimately
         // take a while to SEND on a slow mobile connection — there was no
         // ceiling on that phase at all before (only receiveTimeout, which
