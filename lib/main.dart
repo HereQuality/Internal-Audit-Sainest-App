@@ -5,6 +5,7 @@ import 'core/notifications/local_notifications.dart';
 import 'core/notifications/notification_bootstrap.dart';
 import 'core/notifications/notification_navigation.dart';
 import 'core/theme/app_theme.dart';
+import 'providers/announcement_provider.dart';
 import 'providers/app_mode_provider.dart';
 import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
@@ -63,6 +64,7 @@ class InternalAuditApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AppModeProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => ThemeProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => MaintenanceProvider()..bootstrap()),
+        ChangeNotifierProvider(create: (_) => AnnouncementProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => DashboardProvider()),
         ChangeNotifierProvider(create: (_) => AuditsProvider()),
         ChangeNotifierProvider(create: (_) => NcProvider()),

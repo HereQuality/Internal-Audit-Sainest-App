@@ -94,6 +94,10 @@ class ApiConstants {
   // maintenance.routes.js). MaintenanceProvider polls this.
   static const maintenanceStatus = '/maintenance/status';
 
+  // Announcement mode — public, no auth required (see server/routes/
+  // announcement.routes.js). AnnouncementProvider polls this.
+  static const announcementStatus = '/announcement/status';
+
   // Tickets
   static const tickets = '/tickets';
   static const ticketsUnreadCount = '/tickets/unread-count';

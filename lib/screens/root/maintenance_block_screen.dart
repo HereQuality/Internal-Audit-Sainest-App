@@ -5,7 +5,6 @@ import 'package:provider/provider.dart';
 import '../../core/theme/app_colors.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/maintenance_provider.dart';
-import '../../widgets/maintenance/maintenance_runner_game.dart';
 
 /// Full-screen, unavoidable block shown in place of the ENTIRE app (see
 /// main.dart's _RootGate) whenever maintenance mode is active and the
@@ -23,7 +22,6 @@ class MaintenanceBlockScreen extends StatefulWidget {
 
 class _MaintenanceBlockScreenState extends State<MaintenanceBlockScreen> {
   bool _checking = false;
-  bool _showGame = false;
 
   Future<void> _checkAgain() async {
     setState(() => _checking = true);
@@ -111,35 +109,17 @@ class _MaintenanceBlockScreenState extends State<MaintenanceBlockScreen> {
                       ),
                     ],
                     const SizedBox(height: 24),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ElevatedButton.icon(
-                            onPressed: _checking ? null : _checkAgain,
-                            icon: _checking
-                                ? const SizedBox(
-                                    height: 16,
-                                    width: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                                  )
-                                : const Icon(Icons.refresh, size: 18),
-                            label: const Text('Check again'),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => setState(() => _showGame = !_showGame),
-                            icon: const Icon(Icons.sports_esports_outlined, size: 18),
-                            label: Text(_showGame ? 'Hide game' : 'Play'),
-                          ),
-                        ),
-                      ],
+                    ElevatedButton.icon(
+                      onPressed: _checking ? null : _checkAgain,
+                      icon: _checking
+                          ? const SizedBox(
+                              height: 16,
+                              width: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.refresh, size: 18),
+                      label: const Text('Check again'),
                     ),
-                    if (_showGame) ...[
-                      const SizedBox(height: 18),
-                      const MaintenanceRunnerGame(),
-                    ],
                     const SizedBox(height: 20),
                     Center(
                       child: TextButton.icon(
