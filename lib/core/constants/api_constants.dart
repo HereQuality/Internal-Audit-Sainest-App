@@ -90,6 +90,10 @@ class ApiConstants {
   static const notificationsReadAll = '/notifications/read-all';
   static String notificationRead(String id) => '/notifications/$id/read';
 
+  // Maintenance mode — public, no auth required (see server/routes/
+  // maintenance.routes.js). MaintenanceProvider polls this.
+  static const maintenanceStatus = '/maintenance/status';
+
   // Tickets
   static const tickets = '/tickets';
   static const ticketsUnreadCount = '/tickets/unread-count';

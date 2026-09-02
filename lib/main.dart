@@ -9,6 +9,7 @@ import 'providers/app_mode_provider.dart';
 import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/dashboard_provider.dart';
+import 'providers/maintenance_provider.dart';
 import 'providers/nc_provider.dart';
 import 'providers/notifications_provider.dart';
 import 'providers/profile_provider.dart';
@@ -16,8 +17,10 @@ import 'providers/theme_provider.dart';
 import 'providers/tickets_provider.dart';
 import 'screens/auth/login_screen.dart';
 import 'screens/root/app_shell.dart';
+import 'screens/root/maintenance_block_screen.dart';
 import 'screens/root/role_picker_screen.dart';
 import 'widgets/app_loading.dart';
+import 'widgets/maintenance/maintenance_announcement_host.dart';
 
 // Set once, before runApp, if the app process was NOT already running and
 // got launched BY tapping a notification (cold start) — see
@@ -59,6 +62,7 @@ class InternalAuditApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => AppModeProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => ThemeProvider()..bootstrap()),
+        ChangeNotifierProvider(create: (_) => MaintenanceProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => DashboardProvider()),
         ChangeNotifierProvider(create: (_) => AuditsProvider()),
         ChangeNotifierProvider(create: (_) => NcProvider()),
@@ -96,6 +100,10 @@ class _RootGateState extends State<_RootGate> {
   // anything else (theme change, a later logout/login) must not re-fire
   // the same cold-start navigation a second time.
   bool _consumedLaunchPayload = false;
+  // Tracks whether the LAST build was in the maintenance-blocked state, so
+  // the forced pop-to-root below (see isBlocked handling) only fires on
+  // the actual on-transition edge, not every rebuild while already blocked.
+  bool _wasBlocked = false;
 
   @override
   Widget build(BuildContext context) {
@@ -106,16 +114,42 @@ class _RootGateState extends State<_RootGate> {
       case AuthStatus.unknown:
         return const Scaffold(body: AppLoading());
       case AuthStatus.unauthenticated:
+        _wasBlocked = false;
         return const LoginScreen();
       case AuthStatus.authenticated:
         if (!appMode.loaded) return const Scaffold(body: AppLoading());
-        // Only now — logged in, app shell about to actually mount — is it
-        // safe to act on a cold-start-from-notification-tap: the target
-        // screens (AuditDetailScreen, NcResponseScreen/NcReviewScreen)
-        // assume an authenticated provider tree above them, which doesn't
-        // exist a moment earlier. Pushed on TOP of AppShell (not replacing
-        // it) so the back button still lands somewhere real, same as
-        // tapping the equivalent in-app notification row would.
+
+        // Maintenance gate — checked before anything else past this point,
+        // same spirit as the web app's App.jsx. SuperAdmin always bypasses
+        // (server-side enforcement mirrors this — see
+        // server/middlewares/maintenance.middleware.js).
+        final maintenance = context.watch<MaintenanceProvider>();
+        final isSuperAdmin = auth.user?.roleType == 'SuperAdmin';
+        final isBlocked = maintenance.status.isActive && !isSuperAdmin;
+
+        if (isBlocked && !_wasBlocked) {
+          // Maintenance just kicked in while the user may be several
+          // screens deep (Navigator.push — an audit detail, an NC
+          // response — not just this root widget). Rebuilding _RootGate
+          // alone only changes what's under those pushed routes; it does
+          // NOT pop them away, so without this a blocked user could stay
+          // fully interactive on whatever screen they already had open.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
+          });
+        }
+        _wasBlocked = isBlocked;
+
+        if (isBlocked) return const MaintenanceBlockScreen();
+
+        // Only now — logged in, not blocked, app shell about to actually
+        // mount — is it safe to act on a cold-start-from-notification-tap:
+        // the target screens (AuditDetailScreen, NcResponseScreen/
+        // NcReviewScreen) assume an authenticated provider tree above
+        // them, which doesn't exist a moment earlier. Pushed on TOP of
+        // AppShell (not replacing it) so the back button still lands
+        // somewhere real, same as tapping the equivalent in-app
+        // notification row would.
         if (!_consumedLaunchPayload && _pendingLaunchPayload != null) {
           _consumedLaunchPayload = true;
           final payload = _pendingLaunchPayload;
@@ -124,9 +158,12 @@ class _RootGateState extends State<_RootGate> {
             handleLocalNotificationTap(payload);
           });
         }
-        return appMode.mode == null
-            ? const RolePickerScreen()
-            : const AppShell();
+
+        final content = appMode.mode == null ? const RolePickerScreen() : const AppShell();
+        // The once-a-day scheduled-maintenance popup only makes sense for
+        // people who'd actually be blocked by it later — skip it for
+        // SuperAdmin, who set the schedule themselves.
+        return isSuperAdmin ? content : MaintenanceAnnouncementHost(child: content);
     }
   }
 }
