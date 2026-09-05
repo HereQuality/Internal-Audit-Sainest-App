@@ -235,6 +235,30 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     }
   }
 
+  // The onChanged AgendaPastRegion is built with below (NOT the plain
+  // _onExpansionChanged every forward section uses) — every toggle that
+  // happens ONCE ALREADY INSIDE the (now-open) past region: a past
+  // month's own header, or a recurring series inside one of those months.
+  // Same reverse-growth problem as _togglePast fixes for the region's own
+  // "Past audits" row, one level deeper: AgendaMonthSection/
+  // AgendaSeriesGroup mutate `_expansion` for whichever key was tapped
+  // and then just call whatever `onChanged` they were handed — they have
+  // no way to tell this screen "I just grew upward, follow me" beyond
+  // that one call, and no reason to (every OTHER place they're used, in
+  // the forward-growing part of the agenda, genuinely doesn't need
+  // following). Re-scrolling to the top of the past region on every one
+  // of these — not just the ones that expanded — is what actually covers
+  // it without threading an expand/collapse signal through two more
+  // widgets that have no other reason to carry one: collapsing a past
+  // month settles the scroll position at the top of a now-shorter past
+  // region instead of wherever the user happened to be, which is a small
+  // harmless move next to leaving a just-expanded month sitting off-
+  // screen above the fold every time.
+  void _onPastRegionChanged() {
+    setState(() {});
+    _scrollToPastTop();
+  }
+
   Future<void> _refresh() => context.read<AuditsProvider>().fetchMyAudits();
 
   // Pushes a sheet result to every provider this filter state is shared
@@ -281,6 +305,12 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     // "Past audits · 12" row standing over three visible cards.
     final bool showAgenda =
         !showLoading && !showError && !showEmptyState && filtered.isNotEmpty;
+    // Computed here, not inside _buildAgenda, so AgendaPastBar (pinned
+    // above the scroll view, see its own doc) can read agenda.pastMonths/
+    // pastCount too — the same DateTime.now() read feeds both it and the
+    // scrollable agenda below, so the two can't disagree about what counts
+    // as "past" if a build happens to straddle midnight.
+    final agenda = showAgenda ? buildAuditAgenda(filtered, DateTime.now()) : null;
 
     return Column(
       children: [
@@ -305,6 +335,12 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
             selected: _statusFilter,
             onSelected: (v) => setState(() => _statusFilter = v),
           ),
+        if (agenda != null)
+          AgendaPastBar(
+            agenda: agenda,
+            expanded: _expansion.pastExpanded,
+            onTap: _togglePast,
+          ),
         Expanded(
           child: RefreshIndicator(
             onRefresh: _refresh,
@@ -319,7 +355,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
             // it. `anywhere` accepts a drag starting from any position.
             triggerMode: RefreshIndicatorTriggerMode.anywhere,
             child: showAgenda
-                ? _buildAgenda(filtered)
+                ? _buildAgenda(agenda!)
                 : _buildPlaceholder(
                     showLoading: showLoading,
                     showError: showError,
@@ -421,12 +457,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
   /// It also makes expanding the past region free: because that sliver is
   /// anchored by its bottom edge, growing it pushes content up into more
   /// negative offsets and Today does not move at all.
-  Widget _buildAgenda(List<AuditModel> filtered) {
-    // DateTime.now() is read once per build and threaded through every
-    // bucket and every card, so a list rendered across midnight can't
-    // label one section against one day and compute overdue stripes
-    // against another.
-    final agenda = buildAuditAgenda(filtered, DateTime.now());
+  Widget _buildAgenda(AuditAgenda agenda) {
     const horizontal = EdgeInsets.symmetric(horizontal: 16);
 
     return Stack(
@@ -436,15 +467,26 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
           center: _todayKey,
           physics: const AlwaysScrollableScrollPhysics(),
           slivers: [
-            // 1. Past — the reverse region, above the anchor.
+            // 1. Past — the reverse region, above the anchor. Its own
+            // toggle row is AgendaPastBar, pinned above this whole scroll
+            // view in build() — this sliver only ever holds the actual
+            // past month sections, once expanded.
+            //
+            // onChanged: _onPastRegionChanged, NOT the plain
+            // _onExpansionChanged every forward section below uses — see
+            // that method's own doc. AgendaPastRegion forwards whichever
+            // onChanged it's given straight down to every nested
+            // AgendaMonthSection/AgendaSeriesGroup it renders, so this one
+            // swap is what makes a month or series toggled ONCE ALREADY
+            // inside the past region also re-scroll to keep up with it,
+            // without AgendaPastRegion itself needing to know why.
             SliverToBoxAdapter(
               child: Padding(
                 padding: horizontal,
                 child: AgendaPastRegion(
                   agenda: agenda,
                   expansion: _expansion,
-                  onChanged: _onExpansionChanged,
-                  onTogglePast: _togglePast,
+                  onChanged: _onPastRegionChanged,
                 ),
               ),
             ),

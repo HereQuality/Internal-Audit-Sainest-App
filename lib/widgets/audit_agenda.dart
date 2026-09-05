@@ -1134,51 +1134,35 @@ class AgendaAuditCard extends StatelessWidget {
   }
 }
 
-/// Everything before today, living in the sliver ABOVE the centre key —
-/// i.e. off the top of the viewport on first paint, reached by scrolling
-/// up.
+/// "Past audits · N" — the toggle for everything before today. ALWAYS
+/// visible, pinned above the scrollable agenda entirely (a sibling of the
+/// CustomScrollView in my_audits_screen.dart's own Column, not one of its
+/// slivers) rather than living inside the reverse-growth region it
+/// controls.
 ///
-/// COLLAPSED BY DEFAULT, to one summary row sitting directly above Today,
-/// for two reasons that are easy to undo by accident:
-///
-///  1. The user asked for Today to be the top of the screen. A past
-///     region that opens expanded is still off-screen, but it puts a
-///     hundred rows between the top of the scroll view and Today, which
-///     turns "flick up to see what I missed" into a long drag.
-///  2. RefreshIndicator only fires at the scroll view's TRUE leading
-///     edge, which with a centre sliver is the top of this region, not
-///     Today. One short row above Today keeps pull-to-refresh one flick
-///     away instead of a hundred rows away.
-///
-/// The month groups render ABOVE the summary row (it is the last child of
-/// this Column) so the row itself stays pinned directly above Today
-/// whether or not it is expanded. Because a reverse-region sliver is
-/// anchored by its BOTTOM edge, expanding it grows upward into negative
-/// scroll offsets and Today does not move at all.
-class AgendaPastRegion extends StatelessWidget {
+/// It used to be the LAST child of that region's own Column, sitting
+/// directly above Today at scroll offset ~0 — which sounds identical to
+/// "pinned above the agenda" but is not: with `center: _todayKey` (see
+/// AgendaPastRegion's own doc below), the CustomScrollView's resting
+/// scroll position on first paint is offset 0, i.e. the TOP of Today's own
+/// box — and the past region, sitting in the sliver BEFORE that centre,
+/// lays out at NEGATIVE offsets. Its own summary row was therefore already
+/// scrolled just off the top of the viewport on first paint, same as
+/// everything else in that region — nothing told a user who had not
+/// already scrolled up once that six overdue audits were sitting one flick
+/// away. A row that is not part of the scroll view at all can't have this
+/// problem: it is simply always there, first thing under the status chips,
+/// before the user has done anything.
+class AgendaPastBar extends StatelessWidget {
   final AuditAgenda agenda;
-  final AgendaExpansion expansion;
+  final bool expanded;
+  final VoidCallback onTap;
 
-  /// Still used for the NESTED past-month sections below (each one's own
-  /// ordinary expand/collapse) — unrelated to this region's own toggle row.
-  final VoidCallback onChanged;
-
-  /// This row's own tap — distinct from [onChanged] because expanding
-  /// pushes new content into negative scroll offsets that the screen has
-  /// to explicitly scroll up to reveal (see this class's own doc above);
-  /// a plain state-mutate-and-rebuild, which is all [onChanged] does,
-  /// leaves that new content sitting off-screen above the fold with
-  /// nothing telling the user it is there. The screen owns the
-  /// ScrollController this needs, so it owns the decision of when to
-  /// follow the expansion, not this StatelessWidget.
-  final VoidCallback onTogglePast;
-
-  const AgendaPastRegion({
+  const AgendaPastBar({
     super.key,
     required this.agenda,
-    required this.expansion,
-    required this.onChanged,
-    required this.onTogglePast,
+    required this.expanded,
+    required this.onTap,
   });
 
   @override
@@ -1187,71 +1171,105 @@ class AgendaPastRegion extends StatelessWidget {
       return const SizedBox.shrink();
     }
     final scheme = Theme.of(context).colorScheme;
-    final expanded = expansion.pastExpanded;
     final overdue = agenda.pastOverdueCount;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                expanded
+                    ? Icons.keyboard_arrow_down_rounded
+                    : Icons.keyboard_arrow_up_rounded,
+                size: 18,
+                color: scheme.outline,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Past audits · ${agenda.pastCount}',
+                  style: Theme.of(context)
+                      .textTheme
+                      .titleSmall
+                      ?.copyWith(fontWeight: FontWeight.w700),
+                ),
+              ),
+              if (overdue > 0)
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: AppColors.red.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    '$overdue overdue',
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.red,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Everything before today, living in the sliver ABOVE the centre key —
+/// i.e. at negative scroll offsets, reached by scrolling up (or, now,
+/// jumped to directly — see my_audits_screen.dart's _togglePast, which
+/// AgendaPastBar's own tap runs through instead of touching
+/// AgendaExpansion directly).
+///
+/// Renders NOTHING while collapsed — the toggle row that used to double as
+/// this region's always-shown collapsed state moved out to AgendaPastBar
+/// above, so this class only ever has one job left: the actual past month
+/// sections, and only once AgendaExpansion says to show them. Because a
+/// reverse-region sliver is anchored by its BOTTOM edge, this still grows
+/// upward into more negative scroll offsets as it appears — Today does not
+/// move — which is exactly why _togglePast scrolls up to meet it rather
+/// than leaving that to be discovered.
+class AgendaPastRegion extends StatelessWidget {
+  final AuditAgenda agenda;
+  final AgendaExpansion expansion;
+  final VoidCallback onChanged;
+
+  const AgendaPastRegion({
+    super.key,
+    required this.agenda,
+    required this.expansion,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!expansion.pastExpanded || agenda.pastMonths.isEmpty) {
+      return const SizedBox.shrink();
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        if (expanded)
-          for (final month in agenda.pastMonths)
-            AgendaMonthSection(
-              label: agendaMonthLabel(month.month),
-              groupKey: agendaMonthKey(month.month),
-              audits: month.audits,
-              today: agenda.today,
-              expansion: expansion,
-              onChanged: onChanged,
-            ),
-        InkWell(
-          onTap: onTogglePast,
-          borderRadius: BorderRadius.circular(10),
-          child: Container(
-            margin: const EdgeInsets.only(bottom: 10),
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  expanded
-                      ? Icons.keyboard_arrow_down_rounded
-                      : Icons.keyboard_arrow_up_rounded,
-                  size: 18,
-                  color: scheme.outline,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'Past audits · ${agenda.pastCount}',
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w700),
-                  ),
-                ),
-                if (overdue > 0)
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: AppColors.red.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Text(
-                      '$overdue overdue',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: AppColors.red,
-                      ),
-                    ),
-                  ),
-              ],
-            ),
+        for (final month in agenda.pastMonths)
+          AgendaMonthSection(
+            label: agendaMonthLabel(month.month),
+            groupKey: agendaMonthKey(month.month),
+            audits: month.audits,
+            today: agenda.today,
+            expansion: expansion,
+            onChanged: onChanged,
           ),
-        ),
       ],
     );
   }
