@@ -72,18 +72,22 @@ typedef DeleteEvidencePhoto = Future<String?> Function(String url);
 
 /// Auditor: fix a mistake on an already-raised NC (see AuditsProvider#
 /// updateNc) — reassign who it's against, its severity/flag, or its due
-/// date. Only ever called with all three set together (the edit form
-/// below collects them as one unit, same as the raise-time NC-details
-/// popup does). Returns an error message on failure, null on success.
+/// date. Only ever called with all three set together, because the edit
+/// mode of the NC-details sheet (nc_details_sheet.dart, opened by
+/// _openNcEditSheet below) collects them as one unit — the very same
+/// sheet, and the very same three fields, the raise-time flow already
+/// goes through. Returns an error message on failure, null on success.
 typedef UpdateNc = Future<String?> Function({
   String? auditeeEmployeeId,
   String? severity,
   DateTime? targetDate,
 });
 
-// Same restriction as nc_details_sheet.dart's own _ncSeverities — no
-// "Observation" here either, editing an NC's flag offers the same two
-// choices raising one does.
+// Mirrors nc_details_sheet.dart's own _ncSeverities exactly — no
+// "Observation" there either. Kept here purely to normalise an existing
+// NC's stored severity into a value that sheet's dropdown actually has an
+// item for before seeding it (see _openNcEditSheet); a
+// DropdownButtonFormField whose value matches none of its items throws.
 const _ncEditSeverities = ['Major', 'Minor'];
 
 const _findingLabels = {
@@ -226,18 +230,14 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // autosave immediately instead, no debounce needed.
   Timer? _debounce;
 
-  // Editing an ALREADY-raised NC's auditee/severity/due-date — separate
-  // from _openNcDetailsPopup above, which only ever runs once, before
-  // widget.node.ncId exists. This is the "fix a mistake after the fact"
-  // path (see AuditsProvider#updateNc/_canEditNc below): its own save is
-  // explicit (Save/Cancel), not autosaved, since it's a deliberate
-  // correction the auditor opts into rather than routine scoring.
-  bool _ncEditOpen = false;
-  String? _ncEditAuditeeId;
-  DateTime? _ncEditTargetDate;
-  String _ncEditSeverity = 'Minor';
+  // An update to an ALREADY-raised NC is in flight (see _saveNcEdit) —
+  // all that's left on the card of what used to be a whole inline edit
+  // form's worth of state (open flag, auditee, severity, date, error),
+  // now that the form itself is just the NC-details sheet in edit mode.
+  // Deliberately outside the autosave machinery below: this is a
+  // deliberate correction the auditor opts into and confirms once in the
+  // sheet, not something debounced typing ever fires.
   bool _ncEditSaving = false;
-  String? _ncEditError;
 
   @override
   void initState() {
@@ -331,58 +331,76 @@ class _CheckpointCardState extends State<CheckpointCard> {
       _isNcRaiser &&
       widget.linkedNc!.status == 'Raised';
 
-  void _openNcEditForm() {
+  // Opens the NC-details sheet in EDIT mode (nc_details_sheet.dart),
+  // seeded with what this NC currently carries, and pushes whatever comes
+  // back straight at updateNc. This was an inline form that unfolded
+  // inside the card itself — two dropdowns, a date row and a Save/Cancel
+  // pair grown in place, which shoved every checkpoint below it down the
+  // scroll the moment it opened, gave a long employee list a cramped
+  // in-card dropdown to live in, and duplicated (in a worse form) the
+  // exact three fields the raise-time sheet already collects properly.
+  // One sheet serves both directions now.
+  Future<void> _openNcEditSheet() async {
     final nc = widget.linkedNc;
-    if (nc == null) return;
-    setState(() {
-      _ncEditAuditeeId = nc.auditee.id.isNotEmpty ? nc.auditee.id : null;
-      _ncEditSeverity = _ncEditSeverities.contains(nc.severity)
-          ? nc.severity
-          : 'Minor';
-      _ncEditTargetDate = nc.targetDate;
-      _ncEditError = null;
-      _ncEditOpen = true;
-    });
-  }
-
-  Future<void> _pickNcEditDate() async {
-    final now = DateTime.now();
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: _ncEditTargetDate ?? now.add(const Duration(days: 7)),
-      firstDate: now,
-      lastDate: now.add(const Duration(days: 365)),
+    if (nc == null || widget.onUpdateNc == null) {
+      return;
+    }
+    final result = await showNcDetailsSheet(
+      context,
+      mode: NcSheetMode.edit,
+      employees: widget.employees,
+      isSelfAudit: widget.isSelfAudit,
+      // A populated auditee always has an id; the empty-string fallback in
+      // NcPersonRef.fromJson (models/nc_model.dart) is what a missing or
+      // unpopulated ref decodes to, and handing that over would just match
+      // no dropdown item — null leaves the picker genuinely blank and its
+      // own validator to insist on a real pick.
+      initialAuditeeId: nc.auditee.id.isNotEmpty ? nc.auditee.id : null,
+      // See showNcDetailsSheet's own doc on this param — lets the sheet
+      // keep showing (and re-submitting) the NC's real auditee even when
+      // that person has fallen out of `widget.employees` since the NC was
+      // raised (a per-location audit whose active zone tab has since
+      // changed — audit_detail_screen.dart#_employeesForNc narrows that
+      // list to the CURRENTLY active location only).
+      initialAuditeeName: nc.auditee.name,
+      initialTargetDate: nc.targetDate,
+      // Passed through untouched and handed straight back (see
+      // NcDetailsResult.remark) — edit mode doesn't render the Remark
+      // field at all, since nc.controller.js#updateNC only ever accepts
+      // auditee/severity/targetDate and the checkpoint's own remark field
+      // right behind this sheet stays where that gets changed.
+      initialRemark: _remarkController.text,
+      // A legacy NC can still carry "Observation", which that sheet's
+      // dropdown has no item for — falls back to the same 'Minor' default
+      // the server itself uses (server/models/NonConformance.js).
+      initialSeverity: _ncEditSeverities.contains(nc.severity) ? nc.severity : 'Minor',
     );
-    if (picked != null) setState(() => _ncEditTargetDate = picked);
+    if (result == null || !mounted) {
+      return;
+    }
+    await _saveNcEdit(result);
   }
 
-  Future<void> _saveNcEdit() async {
-    if (!widget.isSelfAudit && _ncEditAuditeeId == null) {
-      setState(() => _ncEditError = 'Pick who this NC is against');
-      return;
-    }
-    if (_ncEditTargetDate == null) {
-      setState(() => _ncEditError = 'Set a due date');
-      return;
-    }
-    setState(() {
-      _ncEditSaving = true;
-      _ncEditError = null;
-    });
+  // The sheet has already popped by the time this runs, so a failure has
+  // nowhere inline left to land — it goes to the app's snackbar helper
+  // (core/utils/snackbar.dart) instead of the old in-form error line. The
+  // panel keeps showing the NC's pre-edit values either way: new ones only
+  // ever reach this card once updateNc's own fetchAuditDetail refetch
+  // pushes a fresh linkedNc down from the parent screen.
+  Future<void> _saveNcEdit(NcDetailsResult details) async {
+    setState(() => _ncEditSaving = true);
     final error = await widget.onUpdateNc!(
-      auditeeEmployeeId: widget.isSelfAudit ? null : _ncEditAuditeeId,
-      severity: _ncEditSeverity,
-      targetDate: _ncEditTargetDate,
+      auditeeEmployeeId: widget.isSelfAudit ? null : details.auditeeEmployeeId,
+      severity: details.severity,
+      targetDate: details.targetDate,
     );
-    if (!mounted) return;
-    setState(() {
-      _ncEditSaving = false;
-      if (error == null) {
-        _ncEditOpen = false;
-      } else {
-        _ncEditError = error;
-      }
-    });
+    if (!mounted) {
+      return;
+    }
+    setState(() => _ncEditSaving = false);
+    if (error != null) {
+      showErrorSnackBar(context, error);
+    }
   }
 
   // Autosaves once this checkpoint is actually complete (see _isComplete) —
@@ -677,45 +695,181 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // detail a bare "NC" finding pill used to leave completely invisible
   // here, even though scoring_workspace already had the full NC document
   // on hand (see checkpoint_card.dart's linkedNc doc comment above).
+  // Shares its layout with the two interactive panels below (see
+  // _ncPanelShell) so an NC reads the same whether you're looking at a
+  // finished audit or still scoring one — only the tint differs.
   Widget _linkedNcBlock(ColorScheme scheme, NcModel nc) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+    return _ncPanelShell(
+      // Neutral rather than the NC red the interactive panels use: a
+      // read-only card that carries an NC finding is ALREADY tinted red
+      // end to end (see build()'s `tone`), so a red panel inside it would
+      // dissolve into its own background. This one has to read as lighter
+      // than its card, not redder.
+      background: scheme.surface.withValues(alpha: 0.6),
+      border: scheme.outlineVariant.withValues(alpha: 0.6),
+      header: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          StatusBadge(label: nc.status, color: AppColors.forNcStatus(nc.status)),
+          NcTimelinessBadge(startDate: nc.startDate, targetDate: nc.targetDate, completionDate: nc.completionDate),
+        ],
+      ),
+      facts: _ncFacts(
+        scheme,
+        auditee: nc.auditee.name,
+        targetDate: nc.targetDate,
+        severity: nc.severity,
+        closed: nc.status == 'Closed',
+      ),
+    );
+  }
+
+  // ── The shared NC panel ─────────────────────────────────────────────
+  // One tinted block, a badge/action header, then the facts on their own
+  // labelled lines. Both interactive summaries below used to be a single
+  // Row that jammed the auditee's name, the due date AND the severity into
+  // one Expanded Text, with a badge on one side of it and a button on the
+  // other. On a 360dp phone that Text is left roughly 150dp once the
+  // card's padding and the panel's own are taken out — so the name
+  // ellipsised away to almost nothing and the due date and flag, the two
+  // facts an auditor actually acts on, were routinely clipped out of
+  // existence entirely. That is the "all the things are collapsed" this
+  // rework is answering.
+  Widget _ncPanelShell({
+    required Widget header,
+    required List<Widget> facts,
+    required Color background,
+    required Color border,
+    VoidCallback? onTap,
+  }) {
+    final panel = Container(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
-        color: scheme.surface.withValues(alpha: 0.6),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
+        color: background,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        children: [header, ...facts],
+      ),
+    );
+    if (onTap == null) {
+      return panel;
+    }
+    return InkWell(onTap: onTap, borderRadius: BorderRadius.circular(10), child: panel);
+  }
+
+  // The three lines every NC panel shows, in the same order everywhere so
+  // the eye can go straight to the one it wants without re-reading the
+  // labels each time.
+  List<Widget> _ncFacts(
+    ColorScheme scheme, {
+    required String auditee,
+    required DateTime? targetDate,
+    required String severity,
+    required bool closed,
+  }) {
+    final overdue = _isDueOverdue(targetDate, closed: closed);
+    return [
+      _ncFactRow(scheme, Icons.person_outline, 'Against', auditee),
+      _ncFactRow(
+        scheme,
+        Icons.event_outlined,
+        'Due',
+        Formatters.date(targetDate),
+        // An overdue date is the single most actionable thing on this
+        // panel and used to render in exactly the same muted grey as
+        // everything else around it. scheme.error, not a hardcoded red, so
+        // it stays legible against the dark theme's own surfaces too.
+        valueColor: overdue ? scheme.error : null,
+      ),
+      _ncFactRow(scheme, Icons.flag_outlined, 'Flag', severity, valueColor: _severityColor(severity)),
+    ];
+  }
+
+  Widget _ncFactRow(ColorScheme scheme, IconData icon, String label, String value, {Color? valueColor}) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              Icon(Icons.person_outline, size: 13, color: scheme.outline),
-              const SizedBox(width: 4),
-              Expanded(
-                child: Text(
-                  'Against ${nc.auditee.name}',
-                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.onSurface),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-              const SizedBox(width: 6),
-              StatusBadge(label: nc.status, color: AppColors.forNcStatus(nc.status)),
-            ],
+          Icon(icon, size: 14, color: scheme.outline),
+          const SizedBox(width: 6),
+          // A fixed-width label column rather than a flex split: "Against"
+          // is the longest label there is, so anything proportional would
+          // hand the value column less room than it needs on exactly the
+          // narrow screens this rework exists for, and the three values
+          // would no longer line up under each other.
+          SizedBox(
+            width: 52,
+            child: Text(label, style: TextStyle(fontSize: 12, color: scheme.outline)),
           ),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 8,
-            runSpacing: 6,
-            crossAxisAlignment: WrapCrossAlignment.center,
-            children: [
-              Text('Due ${Formatters.date(nc.targetDate)}', style: TextStyle(fontSize: 12, color: scheme.outline)),
-              NcTimelinessBadge(startDate: nc.startDate, targetDate: nc.targetDate, completionDate: nc.completionDate),
-              Text(nc.severity, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: _severityColor(nc.severity))),
-            ],
+          Expanded(
+            child: Text(
+              value,
+              // Two lines before it gives up — a genuine "Firstname
+              // Middlename Lastname" wraps onto a second line instead of
+              // being ellipsised away, which is the entire point here.
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: valueColor ?? scheme.onSurface),
+            ),
           ),
         ],
       ),
+    );
+  }
+
+  // Date-only comparison, deliberately: targetDate arrives as a midnight
+  // UTC instant (server/models/NonConformance.js), so comparing instants
+  // would flag an NC that's due TODAY as overdue from the moment the local
+  // day began. A Closed NC is never overdue — it's already done, whenever
+  // that happened; NcTimelinessBadge is what reports whether it landed
+  // late.
+  bool _isDueOverdue(DateTime? due, {required bool closed}) {
+    if (due == null || closed) {
+      return false;
+    }
+    final local = due.toLocal();
+    final now = DateTime.now();
+    return DateTime(local.year, local.month, local.day).isBefore(DateTime(now.year, now.month, now.day));
+  }
+
+  // The edit affordance itself. A full, labelled button with the DEFAULT
+  // tap target (MaterialTapTargetSize.padded → 48dp) — what it replaces
+  // set minimumSize: Size.zero and tapTargetSize: shrinkWrap over 6x2
+  // padding, i.e. a target barely 20dp tall, well under the 44dp minimum,
+  // on the single control the auditor was complaining they were reaching
+  // for. Swapped for a spinner while an update is in flight so a second
+  // tap can't fire updateNc twice over the same NC.
+  Widget _ncEditAction(ColorScheme scheme, VoidCallback onTap) {
+    if (_ncEditSaving) {
+      // Pinned to the button's own 48dp tap-target height so the panel
+      // doesn't visibly shrink and snap back around the swap — the whole
+      // block sits mid-scroll in a list of checkpoints, and a height jump
+      // there moves everything below it under the auditor's thumb.
+      return SizedBox(
+        height: 48,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(height: 13, width: 13, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.outline)),
+              const SizedBox(width: 6),
+              Text('Saving…', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+            ],
+          ),
+        ),
+      );
+    }
+    return TextButton.icon(
+      onPressed: onTap,
+      icon: const Icon(Icons.edit_outlined, size: 16),
+      label: const Text('Edit'),
     );
   }
 
@@ -915,15 +1069,14 @@ class _CheckpointCardState extends State<CheckpointCard> {
         children: [
           Expanded(child: Text(_error!, style: TextStyle(color: scheme.error, fontSize: 12.5))),
           const SizedBox(width: 8),
+          // Default tap target, not the Size.zero + shrinkWrap this used
+          // to carry — a save that actually failed is the one thing on
+          // this card the auditor MUST be able to hit, and it was the same
+          // sub-44dp target the NC Edit button was called out for.
           TextButton.icon(
             onPressed: _save,
             icon: const Icon(Icons.refresh, size: 15),
             label: const Text('Retry'),
-            style: TextButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              minimumSize: Size.zero,
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-            ),
           ),
         ],
       );
@@ -943,38 +1096,54 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // button — null while anything's still missing, so the button above
   // stays in place until then.
   Widget? _ncDetailsSummary(ColorScheme scheme) {
-    if (_needsAuditeePick && _auditeeEmployeeId == null) return null;
-    if (_targetDate == null) return null;
+    if (_needsAuditeePick && _auditeeEmployeeId == null) {
+      return null;
+    }
+    if (_targetDate == null) {
+      return null;
+    }
     final auditeeName = widget.isSelfAudit
-        ? 'you'
+        ? 'You'
         : widget.employees.firstWhere(
             (e) => e.id == _auditeeEmployeeId,
             orElse: () => const EmployeeOption(id: '', name: 'Unknown'),
           ).name;
-    return InkWell(
+    return _ncPanelShell(
+      // The whole panel stays tappable — that's how this summary has
+      // always reopened the details popup — AND now carries its own
+      // labelled Edit button. The tap target alone was undiscoverable: a
+      // tinted block whose only hint was a bare 15px pencil glyph with no
+      // label reads as decoration, not as something you can press.
       onTap: _openNcDetailsPopup,
-      borderRadius: BorderRadius.circular(10),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: AppColors.red.withValues(alpha: 0.06),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: AppColors.red.withValues(alpha: 0.25)),
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.assignment_outlined, size: 15, color: AppColors.red),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Against $auditeeName  •  Due ${Formatters.date(_targetDate)}  •  $_severity',
-                style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w600, color: scheme.onSurface),
-                overflow: TextOverflow.ellipsis,
-              ),
+      background: AppColors.red.withValues(alpha: 0.06),
+      border: AppColors.red.withValues(alpha: 0.25),
+      header: Row(
+        children: [
+          const Icon(Icons.assignment_late_outlined, size: 15, color: AppColors.red),
+          const SizedBox(width: 6),
+          const Expanded(
+            child: Text(
+              'NC details',
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: AppColors.red),
             ),
-            Icon(Icons.edit_outlined, size: 15, color: scheme.outline),
-          ],
-        ),
+          ),
+          TextButton.icon(
+            onPressed: _openNcDetailsPopup,
+            icon: const Icon(Icons.edit_outlined, size: 16),
+            label: const Text('Edit'),
+          ),
+        ],
+      ),
+      // The NC itself doesn't exist yet (it's created by the autosave this
+      // panel's own details unblock — see _needsNcDetails), so there's no
+      // status to badge and nothing is closed: `closed: false` is a
+      // statement of fact here, not a default.
+      facts: _ncFacts(
+        scheme,
+        auditee: auditeeName,
+        targetDate: _targetDate,
+        severity: _severity,
+        closed: false,
       ),
     );
   }
@@ -982,103 +1151,48 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // The already-raised NC's current auditee/due-date/severity, plus an
   // "Edit" affordance when this auditor is allowed to fix a mistake on it
   // (see _canEditNc) — the interactive-card equivalent of _linkedNcBlock's
-  // read-only NC thread, shown right here instead since a still-in-
+  // read-only NC panel, shown right here instead since a still-in-
   // progress audit's checkpoint never renders that read-only branch at
-  // all.
+  // all. Tapping Edit opens the NC-details sheet in edit mode
+  // (_openNcEditSheet); it used to unfold an inline form in place, which
+  // is what pushed every checkpoint below this one down the page.
   Widget _linkedNcEditableBlock(ColorScheme scheme, NcModel nc) {
-    if (!_ncEditOpen) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        decoration: BoxDecoration(
-          color: scheme.surface.withValues(alpha: 0.6),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
-        ),
-        child: Row(
-          children: [
-            StatusBadge(label: nc.status, color: AppColors.forNcStatus(nc.status)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                '${widget.isSelfAudit ? 'You' : nc.auditee.name}  •  Due ${Formatters.date(nc.targetDate)}  •  ${nc.severity}',
-                style: TextStyle(fontSize: 12.5, color: scheme.onSurface),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            if (_canEditNc)
-              TextButton.icon(
-                onPressed: _openNcEditForm,
-                icon: const Icon(Icons.edit_outlined, size: 14),
-                label: const Text('Edit'),
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  minimumSize: Size.zero,
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-              ),
-          ],
-        ),
-      );
-    }
-    return Container(
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: scheme.surface.withValues(alpha: 0.6),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.6)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+    return _ncPanelShell(
+      // Tinted with the NC red — unlike the read-only panel above, an
+      // interactive card has no finding tint of its own, so this is what
+      // makes the block read as one unit instead of loose text stranded
+      // between the photo strip and the status row.
+      background: AppColors.red.withValues(alpha: 0.06),
+      border: AppColors.red.withValues(alpha: 0.25),
+      header: Row(
         children: [
-          if (!widget.isSelfAudit) ...[
-            DropdownButtonFormField<String>(
-              initialValue: widget.employees.any((e) => e.id == _ncEditAuditeeId) ? _ncEditAuditeeId : null,
-              decoration: const InputDecoration(labelText: 'Raise NC against', isDense: true),
-              isExpanded: true,
-              items: widget.employees
-                  .map((e) => DropdownMenuItem(value: e.id, child: Text(e.name, overflow: TextOverflow.ellipsis)))
-                  .toList(),
-              onChanged: (v) => setState(() => _ncEditAuditeeId = v),
-            ),
-            const SizedBox(height: 8),
-          ],
-          DropdownButtonFormField<String>(
-            initialValue: _ncEditSeverity,
-            decoration: const InputDecoration(labelText: 'Flag', isDense: true),
-            items: _ncEditSeverities.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-            onChanged: (v) => setState(() => _ncEditSeverity = v ?? _ncEditSeverity),
-          ),
-          const SizedBox(height: 8),
-          InkWell(
-            onTap: _pickNcEditDate,
-            borderRadius: BorderRadius.circular(8),
-            child: InputDecorator(
-              decoration: const InputDecoration(labelText: 'Due Date', isDense: true),
-              child: Text(_ncEditTargetDate == null ? 'Select a date' : Formatters.date(_ncEditTargetDate)),
+          Expanded(
+            child: Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                StatusBadge(label: nc.status, color: AppColors.forNcStatus(nc.status)),
+                NcTimelinessBadge(startDate: nc.startDate, targetDate: nc.targetDate, completionDate: nc.completionDate),
+              ],
             ),
           ),
-          if (_ncEditError != null) ...[
-            const SizedBox(height: 6),
-            Text(_ncEditError!, style: TextStyle(color: scheme.error, fontSize: 12)),
-          ],
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.end,
-            children: [
-              TextButton(
-                onPressed: _ncEditSaving ? null : () => setState(() => _ncEditOpen = false),
-                child: const Text('Cancel'),
-              ),
-              const SizedBox(width: 4),
-              ElevatedButton(
-                onPressed: _ncEditSaving ? null : _saveNcEdit,
-                child: _ncEditSaving
-                    ? const SizedBox(height: 14, width: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
-                    : const Text('Save'),
-              ),
-            ],
-          ),
+          // _ncEditSaving is checked alongside _canEditNc so the in-flight
+          // spinner can't vanish mid-save: the update's own refetch can
+          // land a fresh linkedNc (a status that's moved on, say) that
+          // makes _canEditNc false while this very save is still settling.
+          if (_canEditNc || _ncEditSaving) _ncEditAction(scheme, _openNcEditSheet),
         ],
+      ),
+      facts: _ncFacts(
+        scheme,
+        // Self Audit resolves the auditee to the auditor themselves
+        // server-side, so their own name here would read as a stranger's
+        // for no reason.
+        auditee: widget.isSelfAudit ? 'You' : nc.auditee.name,
+        targetDate: nc.targetDate,
+        severity: nc.severity,
+        closed: nc.status == 'Closed',
       ),
     );
   }

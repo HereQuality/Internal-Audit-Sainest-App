@@ -62,6 +62,26 @@ class ApiConstants {
   // For the Instant Audit builder's location-scope picker.
   static const locations = '/locations';
 
+  // ── Filter option lists (Dashboard / Audits / Calendar filter sheet) ──
+  // Which locations THIS user may filter by — their own Employee
+  // Management record's locations, not the whole org (SuperAdmin/full
+  // access still gets everything). Deliberately not `locations` above,
+  // which is the paginated admin/CRUD list the Instant Audit scope picker
+  // needs; this is the same endpoint the web app's LocationFilterSelect
+  // uses (location.controller.js#getMyLocationScope).
+  static const myLocationScope = '/locations/my-scope';
+  // Every audit type, for the Audit Type filter. GET /audit-types is
+  // deliberately ungated server-side (routes/auditType.routes.js) because
+  // every audit-type picker in the app needs to read it regardless of who
+  // is asking. activeOnly drops retired types from the picker.
+  static const auditTypes = '/audit-types?activeOnly=true';
+  // Self + everyone reporting into this user, transitively — the candidate
+  // list for the employee filter, same endpoint backing the web app's
+  // TeamFilterPanel. Each row carries its own locationIds, which is what
+  // lets the filter narrow the people list down to the locations that are
+  // currently selected without a second request.
+  static const myHierarchyScope = '/employees/my-hierarchy-scope';
+
   // Everyone actually assigned to given Location(s) — the "who is this NC
   // against" and "select representative auditee" pickers' real candidate
   // list (see AuditsProvider.fetchLocationEmployees), deliberately not

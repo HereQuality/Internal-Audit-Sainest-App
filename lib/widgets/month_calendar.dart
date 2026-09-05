@@ -22,6 +22,12 @@ class CalendarEvent {
 
 DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
 
+// Months are compared and stored as their own 1st here, so a caller can
+// hand over any date inside the month it means (and so two DateTimes for
+// "March 2026" built from different days still compare equal, which the
+// didUpdateWidget echo check below depends on).
+DateTime _monthOnly(DateTime d) => DateTime(d.year, d.month, 1);
+
 // Order-preserving distinct colors across one day's events — Dart's Color
 // has value equality, so a plain Set collapses repeats correctly.
 List<Color> _distinctColors(List<CalendarEvent> events) {
@@ -38,6 +44,12 @@ List<Color> _distinctColors(List<CalendarEvent> events) {
 /// a day to see it below", not a full scheduling UI. Month navigation via
 /// chevrons, a dot under any day with 1+ events, selected day highlighted,
 /// and that day's events listed underneath the grid.
+///
+/// The visible month can optionally be driven from outside as well — see
+/// [visibleMonth]/[onVisibleMonthChanged] and _MonthCalendarState's own
+/// _visibleMonth for how the two directions are reconciled. Both props are
+/// optional and omitting them leaves this widget behaving exactly as it
+/// always has.
 class MonthCalendar extends StatefulWidget {
   final List<CalendarEvent> events;
   final Widget Function(BuildContext context, List<CalendarEvent> dayEvents)
@@ -49,11 +61,33 @@ class MonthCalendar extends StatefulWidget {
   // out (e.g. a single-category list with no ambiguity to label).
   final Widget? legend;
 
+  /// The month to render, given as any date inside it (normalised to the
+  /// 1st internally). OPTIONAL, and null keeps the historical behaviour
+  /// exactly: the grid picks the current month in initState and nothing
+  /// outside it can ever move the view again.
+  ///
+  /// Passed by screens/calendar/calendar_screen.dart, where a control that
+  /// lives OUTSIDE the grid — the filter sheet's Month section — also has
+  /// to be able to jump the month. That sheet is opened with the month
+  /// currently on screen (widgets/filter_sheet.dart's `month` argument), so
+  /// the two have to agree on what "currently on screen" is.
+  final DateTime? visibleMonth;
+
+  /// Fired whenever this widget's OWN chevrons move the month, so a parent
+  /// that passes [visibleMonth] can keep its copy current. Without it the
+  /// parent's month goes stale the instant the user taps a chevron, and the
+  /// next filter-sheet open would offer the month from before those taps —
+  /// the classic half-controlled-widget bug, where the data flows down but
+  /// never back up.
+  final ValueChanged<DateTime>? onVisibleMonthChanged;
+
   const MonthCalendar({
     super.key,
     required this.events,
     required this.emptyDayBuilder,
     this.legend,
+    this.visibleMonth,
+    this.onVisibleMonthChanged,
   });
 
   @override
@@ -61,15 +95,70 @@ class MonthCalendar extends StatefulWidget {
 }
 
 class _MonthCalendarState extends State<MonthCalendar> {
+  /// The month actually being rendered — and deliberately still State, not
+  /// a straight read of [MonthCalendar.visibleMonth]: this widget is only
+  /// half-controlled on purpose.
+  ///
+  /// Making it fully controlled (render the prop, route chevron taps out
+  /// through the callback and wait for a new prop to come back) would mean
+  /// every chevron tap costs a parent rebuild round-trip to repaint, and
+  /// would freeze the grid outright for any caller that wires up
+  /// [MonthCalendar.onVisibleMonthChanged] but forgets to feed the result
+  /// back into [MonthCalendar.visibleMonth] — or passes no props at all,
+  /// which is still a supported way to use this widget. So both directions
+  /// land on this one cursor instead: the prop PUSHES into it
+  /// (didUpdateWidget), the chevrons move it and then TELL the parent
+  /// (onVisibleMonthChanged). It is the single source of truth for what is
+  /// drawn either way.
   late DateTime _visibleMonth;
   late DateTime _selectedDay;
 
   @override
   void initState() {
     super.initState();
+    _visibleMonth = _monthOnly(widget.visibleMonth ?? DateTime.now());
+    _selectedDay = _selectionForMonth(_visibleMonth);
+  }
+
+  @override
+  void didUpdateWidget(covariant MonthCalendar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final incoming = widget.visibleMonth;
+    // A caller that never passes the prop keeps full local control.
+    if (incoming == null) {
+      return;
+    }
+    final normalised = _monthOnly(incoming);
+    // Almost every rebuild lands here with the month we ourselves just
+    // reported through onVisibleMonthChanged, so this equality check is
+    // what stops the two-way sync from ping-ponging (and from stomping the
+    // selected day back to today on every unrelated parent rebuild).
+    if (normalised == _visibleMonth) {
+      return;
+    }
+    setState(() {
+      _visibleMonth = normalised;
+      _selectedDay = _selectionForMonth(normalised);
+    });
+  }
+
+  /// Which day to select when the grid lands on [month].
+  ///
+  /// The day-detail list under the grid has to be showing a day that is
+  /// actually IN the grid, so a month change can't just leave the previous
+  /// selection alone — jumping from March to April used to leave "Fri 15
+  /// Mar" and its events listed under an April grid. Rule: today if today
+  /// is in the new month (overwhelmingly the day you want, and it matches
+  /// where the screen opens), otherwise the 1st — the first cell of the
+  /// month and an obvious, stable landing spot, as opposed to "keep the
+  /// same day number", which needs clamping for 29-31 and lands somewhere
+  /// arbitrary anyway.
+  DateTime _selectionForMonth(DateTime month) {
     final today = _dayOnly(DateTime.now());
-    _visibleMonth = DateTime(today.year, today.month, 1);
-    _selectedDay = today;
+    if (today.year == month.year && today.month == month.month) {
+      return today;
+    }
+    return DateTime(month.year, month.month, 1);
   }
 
   Map<DateTime, List<CalendarEvent>> get _byDay {
@@ -82,13 +171,19 @@ class _MonthCalendarState extends State<MonthCalendar> {
   }
 
   void _changeMonth(int delta) {
-    setState(
-      () => _visibleMonth = DateTime(
-        _visibleMonth.year,
-        _visibleMonth.month + delta,
-        1,
-      ),
-    );
+    // DateTime rolls month 0 / month 13 over into the neighbouring year on
+    // its own, so December -> January needs no special case here.
+    final next = DateTime(_visibleMonth.year, _visibleMonth.month + delta, 1);
+    setState(() {
+      _visibleMonth = next;
+      _selectedDay = _selectionForMonth(next);
+    });
+    // Told AFTER the local move, never instead of it (see _visibleMonth's
+    // own comment). A parent that feeds this straight back into
+    // [MonthCalendar.visibleMonth] hits the equality check in
+    // didUpdateWidget and simply rebuilds, so there is no second setState
+    // and no loop.
+    widget.onVisibleMonthChanged?.call(next);
   }
 
   @override

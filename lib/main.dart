@@ -10,6 +10,7 @@ import 'providers/app_mode_provider.dart';
 import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/dashboard_provider.dart';
+import 'providers/filter_options_provider.dart';
 import 'providers/maintenance_provider.dart';
 import 'providers/nc_provider.dart';
 import 'providers/notifications_provider.dart';
@@ -71,6 +72,9 @@ class InternalAuditApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => ProfileProvider()),
         ChangeNotifierProvider(create: (_) => NotificationsProvider()),
         ChangeNotifierProvider(create: (_) => TicketsProvider()),
+        // Option lists for the Dashboard/Audits/Calendar filter sheet —
+        // loaded lazily the first time a sheet opens, then cached.
+        ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
       ],
       child: Consumer<ThemeProvider>(
         builder: (context, themeProvider, _) => MaterialApp(
@@ -106,6 +110,15 @@ class _RootGateState extends State<_RootGate> {
   // the forced pop-to-root below (see isBlocked handling) only fires on
   // the actual on-transition edge, not every rebuild while already blocked.
   bool _wasBlocked = false;
+  // Same edge-only shape, for the filter-state reset below — every
+  // provider in this app lives for the whole process (main.dart's root
+  // MultiProvider never recreates them), so without an explicit reset on
+  // logout a shared device's NEXT login would inherit the PREVIOUS
+  // account's Team Filter selection, locations and cached people/location/
+  // audit-type option lists. Edge-tracked so it fires once per actual
+  // logout, not on every rebuild while already on the login screen (a
+  // maintenance-status poll, a theme change).
+  bool _wasAuthenticated = false;
 
   @override
   Widget build(BuildContext context) {
@@ -117,8 +130,26 @@ class _RootGateState extends State<_RootGate> {
         return const Scaffold(body: AppLoading());
       case AuthStatus.unauthenticated:
         _wasBlocked = false;
+        if (_wasAuthenticated) {
+          _wasAuthenticated = false;
+          // Deferred exactly like the maintenance pop-to-root above/below
+          // this switch: each resetForLogout() calls notifyListeners(),
+          // and firing that synchronously from inside THIS widget's own
+          // build would ask another still-building widget to rebuild
+          // mid-build — a "setState()/markNeedsBuild() called during
+          // build" framework error. A frame later is soon enough; nothing
+          // reads these providers until AppShell mounts again on the next
+          // login, long after this frame finishes.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            context.read<AuditsProvider>().resetForLogout();
+            context.read<DashboardProvider>().resetForLogout();
+            context.read<NcProvider>().resetForLogout();
+            context.read<FilterOptionsProvider>().resetForLogout();
+          });
+        }
         return const LoginScreen();
       case AuthStatus.authenticated:
+        _wasAuthenticated = true;
         if (!appMode.loaded) return const Scaffold(body: AppLoading());
 
         // Maintenance gate — checked before anything else past this point,
@@ -143,6 +174,43 @@ class _RootGateState extends State<_RootGate> {
         _wasBlocked = isBlocked;
 
         if (isBlocked) return const MaintenanceBlockScreen();
+
+        // Every scoped list/stat endpoint sends `employeeIds=<self>` while
+        // the Me scope is selected (the default — see AuditsProvider's own
+        // isTeamScope), and each provider needs to be told which id that
+        // is. Doing it here, once, on the authenticated build, rather than
+        // in each screen's initState is what makes the default actually
+        // hold everywhere: CalendarScreen and the notification-tap deep
+        // links fetch without ever having gone through a dashboard, and a
+        // provider that hasn't been told its own id silently falls back to
+        // the full hierarchy instead. Plain field writes, no
+        // notifyListeners, so this is safe to repeat on every rebuild.
+        //
+        // EXCEPT for a genuine SuperAdmin: auth.middleware.js resolves a
+        // token against the `User` collection first and only falls back to
+        // `Employee`, so a SuperAdmin's own `auth.user.id` is a `users`
+        // document id that exists in NO `employees` document — sending it
+        // as employeeIds=<id> isn't "just me", it's a filter that can
+        // never match anything (resolveScopedEmployeeIds's `isUnfiltered`
+        // branch returns whatever id was asked for VERBATIM, with no
+        // intersection against real employees), so every list/stat would
+        // silently read empty. Deliberately leaving `_selfEmployeeId`
+        // unset for that one roleType is what makes the fallback further
+        // down each provider's own `filterParams` do the right thing here:
+        // no employeeIds param at all resolves server-side to "no filter"
+        // (org-wide) — the same "all" a SuperAdmin's Me now falls back to
+        // on web, see client/src/hooks/useSelfScope.js. A custom Role with
+        // full access is NOT this case — it's still a real Employee
+        // document with a real, matchable id, so it keeps going through
+        // the branch below like any other employee.
+        // isSuperAdmin is already computed above, for the maintenance
+        // gate — same account field, reused rather than redeclared.
+        final selfId = auth.user?.id;
+        if (!isSuperAdmin && selfId != null && selfId.isNotEmpty) {
+          context.read<AuditsProvider>().setSelfEmployeeId(selfId);
+          context.read<DashboardProvider>().setSelfEmployeeId(selfId);
+          context.read<NcProvider>().setSelfEmployeeId(selfId);
+        }
 
         // Only now — logged in, not blocked, app shell about to actually
         // mount — is it safe to act on a cold-start-from-notification-tap:

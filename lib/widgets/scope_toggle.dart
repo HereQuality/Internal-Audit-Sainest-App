@@ -1,17 +1,27 @@
 import 'package:flutter/material.dart';
 
 /// "Me" (just the logged-in user's own audits/NCs) vs "Team" (self +
-/// everyone in their downstream hierarchy — same "all" scope the web app's
-/// TeamFilterPanel defaults to, see server/utils/scopeEmployeeIds.js#
-/// resolveScopedEmployeeIds). A lightweight binary version of that panel
-/// for the phone: no per-person picker, just the two scopes a small screen
-/// has room for. "Team" is the default everywhere this is used (each
-/// provider's own isTeamScope starts true) — TeamFilterPanel's own default
-/// is "All" (opt-in to NARROW down to specific people), so starting mobile
-/// on "Me" instead was actually the opposite of matching it; this went
-/// back to the two platforms agreeing on the same default, which is also
-/// why the same account's ATS/OTC score used to read differently between
-/// web and mobile with neither side touching either toggle.
+/// everyone in their downstream hierarchy — the "all" scope
+/// server/utils/scopeEmployeeIds.js#resolveScopedEmployeeIds falls back to
+/// when no employeeIds param is sent at all).
+///
+/// "ME" IS THE DEFAULT everywhere this is used — every provider's own
+/// isTeamScope starts false. Someone opening this app on a phone, usually
+/// standing on the floor about to run an audit, is asking "what do I have
+/// to do", not "what does my whole reporting line have to do"; Team is the
+/// deliberate widening from there, one tap away.
+///
+/// This deliberately does NOT match the web app's TeamFilterPanel, whose
+/// own default is "All". An earlier revision of this file changed mobile
+/// TO Team specifically so the two platforms would agree, on the theory
+/// that a same-account ATS/OTC score reading differently between web and
+/// mobile was a bug. It isn't: the two surfaces answer different
+/// questions, and the number differing is explained by a toggle sitting
+/// right above it. Don't flip it back without saying why here.
+///
+/// This is the coarse control. The filter sheet (widgets/filter_sheet.dart)
+/// is where a specific set of PEOPLE can be picked, and a non-empty pick
+/// there overrides this toggle entirely — see AuditFilterScope.filterParams.
 class ScopeToggle extends StatelessWidget {
   final bool isTeam;
   final ValueChanged<bool> onChanged;

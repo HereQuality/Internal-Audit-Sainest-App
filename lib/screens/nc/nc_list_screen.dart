@@ -9,9 +9,9 @@ import '../../providers/auth_provider.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
+import '../../widgets/filter_sheet.dart' show FilterButton;
 import '../../widgets/scope_toggle.dart';
 import '../../widgets/status_badge.dart';
-import '../../widgets/status_filter_chip_row.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
 
@@ -25,26 +25,51 @@ import 'nc_review_screen.dart';
 /// shows both as tabs, same as before.
 enum NcListMode { auditorOnly, auditeeOnly }
 
-// "All", the derived dashboard buckets (On Time/Delayed/Overdue/In
-// Progress/Pending Approval — same mutually-exclusive rules as server's
-// nc.controller.js#computeNcBuckets, mirrored in _matchesFilter below so a
-// dashboard stat tile tap lands on a chip that filters to EXACTLY what it
-// counted), then the raw statuses. Filtered client-side over the one
-// already-fetched list, same reasoning as MyAuditsScreen's own status
-// filter (one person's NC list is small enough that a server round-trip
-// per filter tap would just be lag).
-const _ncStatusFilters = [
+// Two different vocabularies, one per side — each mirroring exactly the
+// stat tiles its OWN dashboard shows (AuditorDashboard's NC Monitoring
+// card / AuditeeDashboardScreen's NC grid), not a shared ten-value list.
+// That combined list used to offer every raw status (Raised/Response
+// Submitted/Verification/Closed) right alongside the derived buckets
+// (In Progress/Pending Approval/Overdue/On Time/Delayed) on BOTH sides,
+// which is a lot of half-overlapping options to scan on a phone — "Pending
+// Approval" and "Response Submitted" read as two different things until
+// you realise one is a raw status and the other already includes it. Each
+// value still runs through the SAME _matchesFilter below (same mutually-
+// exclusive bucket rules as server's nc.controller.js#computeNcBuckets),
+// only which values are OFFERED narrows per screen.
+//
+// Auditor ("Raised by me" / NC Monitoring) — Total NC / Awaiting Approval
+// / Overdue / Closed, the 4 tiles on AuditorDashboard's own NC card.
+// 'Pending Approval' is the underlying value (Response Submitted or
+// Verification, not yet overdue — see _matchesFilter) that tile's own
+// "Awaiting Approval" label describes; the raw Raised/Response Submitted/
+// Verification split and the auditee-side In Progress/On Time/Delayed
+// tracking THEIR OWN response speed aren't a distinction the raising
+// auditor's own dashboard makes, so neither is this list.
+const _auditorStatusFilters = ['All', 'Pending Approval', 'Overdue', 'Closed'];
+const _auditorStatusFilterLabels = {
+  'All': 'Total NC',
+  'Pending Approval': 'Awaiting Approval',
+};
+
+// Auditee ("Against me") — Total NC / In Progress / Overdue / Pending
+// Approval / Delayed / On Time Completion, the 6 tiles on
+// AuditeeDashboardScreen's own NC grid, in that same order. Drops the 4
+// raw statuses (Raised/Response Submitted/Verification/Closed) — each is
+// already folded into exactly one of these 6 buckets (a rejected-and-
+// resent NC goes back to "Raised", i.e. 'In Progress', same as new).
+const _auditeeStatusFilters = [
   'All',
   'In Progress',
-  'Pending Approval',
   'Overdue',
-  'On Time',
+  'Pending Approval',
   'Delayed',
-  'Raised',
-  'Response Submitted',
-  'Verification',
-  'Closed',
+  'On Time',
 ];
+const _auditeeStatusFilterLabels = {
+  'All': 'Total NC',
+  'On Time': 'On Time Completion',
+};
 
 // Same bucket rules as server/controllers/nc.controller.js#computeNcBuckets
 // — kept in sync by hand since there's no shared-across-platforms source
@@ -53,6 +78,18 @@ const _ncStatusFilters = [
 // predicates instead of a "what's due soon" summary).
 bool _matchesFilter(NcModel n, String filter) {
   if (filter == 'All') return true;
+  // Not one of _auditorStatusFilters/_auditeeStatusFilters — this is the
+  // value DashboardScreen's own "NC Pending" tile jumps here with
+  // (stats.ncPending counts server-side `status != "Closed"`, i.e. every
+  // OPEN status regardless of overdue-ness: Raised, Response Submitted AND
+  // Verification). Neither side's picker offers a single chip for exactly
+  // that ("Awaiting Approval"/'Pending Approval' excludes plain Raised,
+  // same as the web app's own tile; 'Overdue' excludes a Raised-but-not-
+  // yet-overdue NC) — deliberately outside the trimmed vocabulary rather
+  // than adding a 7th/5th option nobody would tap on purpose, the same way
+  // a tile-driven jump to a raw status ('Closed', say) needs no chip of
+  // its own either.
+  if (filter == 'Open') return n.status != 'Closed';
   if (![
     'In Progress',
     'Pending Approval',
@@ -83,8 +120,9 @@ bool _matchesFilter(NcModel n, String filter) {
 
 class NcListScreen extends StatefulWidget {
   final NcListMode? mode;
-  // Pre-applies one of _ncStatusFilters above — set by AppShell when a
-  // dashboard stat tile is tapped (AuditorDashboard's NC Pending tile, or
+  // Pre-applies one of _auditorStatusFilters/_auditeeStatusFilters above
+  // (whichever side is showing) — set by AppShell when a dashboard stat
+  // tile is tapped (AuditorDashboard's NC Pending tile, or
   // AuditeeDashboardScreen's _AuditeeStatsGrid), remounted under a fresh
   // key each time so this always takes effect even when the tile tapped
   // is the same filter already showing.
@@ -174,21 +212,202 @@ class _NcListScreenState extends State<NcListScreen>
   }
 }
 
-// Shared by both lists below — a horizontal row of status chips above the
-// list itself, same visual pattern as MyAuditsScreen's own filter row (now
-// literally the same widget — see widgets/status_filter_chip_row.dart).
-class _StatusFilterRow extends StatelessWidget {
-  final String selected;
-  final ValueChanged<String> onSelect;
+// Shared by both lists below — Me/Team on the left, the status Filters
+// button on the right, same spaceBetween header-row shape as
+// DashboardFilterBar/MyAuditsScreen use for their own scope+filter rows.
+//
+// This used to be a permanently-visible horizontal row of ALL TEN status
+// chips (StatusFilterChipRow, one per _ncStatusFilters entry) sitting
+// under the ScopeToggle — on a phone that's a wall of pills wide enough
+// that most of them scroll off-screen, and "In Progress"/"Pending
+// Approval"/"Overdue"/"On Time"/"Delayed" (the derived buckets) sitting
+// right next to "Raised"/"Response Submitted"/"Verification"/"Closed"
+// (the raw statuses) reads as one undifferentiated cluster. A single
+// "Filters" button opening a picker sheet (see showNcStatusFilterSheet)
+// keeps the status choice one tap away without permanently spending
+// screen space on nine options nobody has picked.
+class _NcListFilterRow extends StatelessWidget {
+  final bool isTeam;
+  final ValueChanged<bool> onScopeChanged;
+  final String statusFilter;
+  final ValueChanged<String> onStatusChanged;
 
-  const _StatusFilterRow({required this.selected, required this.onSelect});
+  /// Which values this side's sheet offers — _auditorStatusFilters or
+  /// _auditeeStatusFilters — and their display labels.
+  final List<String> filters;
+  final Map<String, String> labels;
+
+  const _NcListFilterRow({
+    required this.isTeam,
+    required this.onScopeChanged,
+    required this.statusFilter,
+    required this.onStatusChanged,
+    required this.filters,
+    required this.labels,
+  });
+
+  Future<void> _openStatusSheet(BuildContext context) async {
+    final result = await showNcStatusFilterSheet(
+      context,
+      selected: statusFilter,
+      filters: filters,
+      labels: labels,
+    );
+    if (result != null) {
+      onStatusChanged(result);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return StatusFilterChipRow(
-      options: _ncStatusFilters,
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Flexible(
+          child: Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: ScopeToggle(isTeam: isTeam, onChanged: onScopeChanged),
+            ),
+          ),
+        ),
+        FilterButton(
+          activeCount: statusFilter == 'All' ? 0 : 1,
+          onTap: () => _openStatusSheet(context),
+        ),
+      ],
+    );
+  }
+}
+
+/// The status picker sheet _NcListFilterRow's Filters button opens.
+/// Single-select: tapping a row both picks it AND closes the sheet (one
+/// tap, no separate Apply step needed for a single value) and returns the
+/// chosen filter string; dismissing without picking (tap outside, drag
+/// down) returns null and the caller leaves the current filter alone.
+Future<String?> showNcStatusFilterSheet(
+  BuildContext context, {
+  required String selected,
+  required List<String> filters,
+  required Map<String, String> labels,
+}) {
+  return showModalBottomSheet<String>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => _NcStatusFilterSheet(
       selected: selected,
-      onSelected: onSelect,
+      filters: filters,
+      labels: labels,
+    ),
+  );
+}
+
+class _NcStatusFilterSheet extends StatelessWidget {
+  final String selected;
+  final List<String> filters;
+  final Map<String, String> labels;
+
+  const _NcStatusFilterSheet({
+    required this.selected,
+    required this.filters,
+    required this.labels,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      // Status is a single tap-to-pick list, never a text field — no
+      // keyboard can appear over it — but the same viewInsets padding
+      // every other sheet in this app applies costs nothing and keeps
+      // this one consistent if a future revision ever adds a search box.
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        decoration: BoxDecoration(
+          color: scheme.surface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: const EdgeInsets.fromLTRB(0, 20, 0, 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                'Status',
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            // Same capped-height, scrollable list convention as every
+            // other multi-select sheet in this app (see
+            // select_representative_sheet.dart's own identical
+            // ConstrainedBox+shrinkWrap pair) — a fixed cap outside any
+            // Flexible/Expanded needs no ambiguous parent height to work
+            // against, unlike sizing this off a percentage of the sheet's
+            // own (itself content-sized) height would.
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 400),
+              child: ListView(
+                shrinkWrap: true,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                children: [
+                  for (final option in filters)
+                    _StatusOptionTile(
+                      label: labels[option] ?? option,
+                      checked: option == selected,
+                      onTap: () => Navigator.of(context).pop(option),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StatusOptionTile extends StatelessWidget {
+  final String label;
+  final bool checked;
+  final VoidCallback onTap;
+
+  const _StatusOptionTile({
+    required this.label,
+    required this.checked,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontWeight: checked ? FontWeight.w700 : FontWeight.w500,
+                  color: checked ? scheme.primary : scheme.onSurface,
+                ),
+              ),
+            ),
+            if (checked)
+              Icon(Icons.check_rounded, size: 20, color: scheme.primary),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -223,20 +442,16 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
         // switching to "Team" to check your reports' NCs matters most.
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: ScopeToggle(
-              isTeam: provider.isTeamScope,
-              onChanged: (isTeam) =>
-                  context.read<NcProvider>().setTeamScope(isTeam),
-            ),
+          child: _NcListFilterRow(
+            isTeam: provider.isTeamScope,
+            onScopeChanged: (isTeam) =>
+                context.read<NcProvider>().setTeamScope(isTeam),
+            statusFilter: _statusFilter,
+            onStatusChanged: (v) => setState(() => _statusFilter = v),
+            filters: _auditorStatusFilters,
+            labels: _auditorStatusFilterLabels,
           ),
         ),
-        if (!showLoading && !showError && !showEmpty)
-          _StatusFilterRow(
-            selected: _statusFilter,
-            onSelect: (v) => setState(() => _statusFilter = v),
-          ),
         Expanded(
           child: showLoading
               ? const AppLoading()
@@ -320,26 +535,22 @@ class _AgainstMeListState extends State<_AgainstMeList> {
     return Column(
       children: [
         // Kept visible through loading/error/empty too — same reasoning as
-        // _RaisedByMeList's identical toggle: an empty "Me" list (nobody's
+        // _RaisedByMeList's identical row: an empty "Me" list (nobody's
         // raised anything against your own scope) is exactly when switching
         // to "Team" to check your downstream reports' NCs matters most. Same
         // Me/Team scope as the web app's Auditee.jsx TeamFilterPanel.
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Align(
-            alignment: Alignment.centerLeft,
-            child: ScopeToggle(
-              isTeam: provider.isTeamScope,
-              onChanged: (isTeam) =>
-                  context.read<NcProvider>().setTeamScope(isTeam),
-            ),
+          child: _NcListFilterRow(
+            isTeam: provider.isTeamScope,
+            onScopeChanged: (isTeam) =>
+                context.read<NcProvider>().setTeamScope(isTeam),
+            statusFilter: _statusFilter,
+            onStatusChanged: (v) => setState(() => _statusFilter = v),
+            filters: _auditeeStatusFilters,
+            labels: _auditeeStatusFilterLabels,
           ),
         ),
-        if (!showLoading && !showError && !showEmpty)
-          _StatusFilterRow(
-            selected: _statusFilter,
-            onSelect: (v) => setState(() => _statusFilter = v),
-          ),
         Expanded(
           child: showLoading
               ? const AppLoading()

@@ -19,9 +19,10 @@ class NcProvider extends ChangeNotifier {
   // pattern. Independent of those: neither list is shared with any other
   // screen, so this doesn't need to live anywhere but here. One toggle
   // covers both lists (not a separate one per side) since a single person
-  // can appear in both. Defaults true (Team) — matches the web app's
-  // TeamFilterPanel, whose own default is "All", not just-yourself.
-  bool isTeamScope = true;
+  // can appear in both. Defaults FALSE (Me) — see AuditsProvider's
+  // identical field for the reasoning and for the
+  // _selfEmployeeId-must-be-set-first caveat.
+  bool isTeamScope = false;
   String? _selfEmployeeId;
   Map<String, dynamic>? get _scopeParams => isTeamScope
       ? null
@@ -35,6 +36,16 @@ class NcProvider extends ChangeNotifier {
     isTeamScope = isTeam;
     notifyListeners();
     return Future.wait([fetchRaisedByMe(), fetchAgainstMe()]);
+  }
+
+  /// Back to the Me default, without refetching — call on logout. See
+  /// AuditFilterScope.resetForLogout's doc for why this matters on a
+  /// shared device: every provider here is a single, process-lifetime
+  /// instance, so without this the NEXT person to log in would inherit
+  /// whichever scope the PREVIOUS account left this on.
+  void resetForLogout() {
+    isTeamScope = false;
+    notifyListeners();
   }
 
   bool isLoadingRaised = false;

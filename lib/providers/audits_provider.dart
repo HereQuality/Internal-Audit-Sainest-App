@@ -12,8 +12,9 @@ import '../models/audit_model.dart';
 import '../models/employee_option.dart';
 import '../models/location_option.dart';
 import '../models/upload_phase.dart';
+import 'audit_filter_scope.dart';
 
-class AuditsProvider extends ChangeNotifier {
+class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   final Dio _dio = DioClient.instance.dio;
 
   // "Me" vs "Team" scope for fetchMyAudits below — shared by
@@ -21,14 +22,23 @@ class AuditsProvider extends ChangeNotifier {
   // (both read this same `audits` field), so toggling on either screen
   // keeps the other in sync instead of the two drifting apart. See
   // widgets/scope_toggle.dart / DashboardProvider's identical pattern.
-  // Defaults true (Team) — matches the web app's TeamFilterPanel, whose own
-  // default is "All", not just-yourself.
-  bool isTeamScope = true;
+  // Defaults FALSE (Me) — an auditor opening the app on a phone is asking
+  // "what do I have to do", not "what does my whole reporting line have to
+  // do"; Team is the opt-in widening from there, one tap away. This
+  // deliberately no longer mirrors the web TeamFilterPanel's own "All"
+  // default: the two surfaces answer different questions.
+  @override
+  bool isTeamScope = false;
   String? _selfEmployeeId;
-  Map<String, dynamic>? get _scopeParams => isTeamScope
-      ? null
-      : (_selfEmployeeId == null ? null : {'employeeIds': _selfEmployeeId});
-
+  @override
+  String? get selfEmployeeId => _selfEmployeeId;
+  // NOTE the asymmetry below: an unknown _selfEmployeeId falls back to
+  // sending no param at all, which the server reads as the FULL hierarchy
+  // — i.e. a silently WIDER scope than the "Me" showing as selected.
+  // Harmless while Team was the default; not harmless now. main.dart's
+  // _RootGate sets this on every authenticated build, before any screen's
+  // first fetch, so the fallback is unreachable in practice — keep it that
+  // way if you add a new fetch entry point (background isolate, deep link).
   void setSelfEmployeeId(String id) {
     _selfEmployeeId = id;
   }
@@ -36,8 +46,18 @@ class AuditsProvider extends ChangeNotifier {
   Future<void> setTeamScope(bool isTeam) {
     isTeamScope = isTeam;
     notifyListeners();
-    return fetchMyAudits();
+    return refetchForFilters();
   }
+
+  /// Both audit lists respond to the filters: `audits` is what the Audits
+  /// tab, the dashboard's "what needs attention" sections and the
+  /// calendar's amber/green markers all read, and `auditsAtMyLocation` is
+  /// the calendar's blue "someone is auditing your location" layer — a
+  /// location/audit-type filter that skipped the second one would visibly
+  /// only half-apply on the calendar.
+  @override
+  Future<void> refetchForFilters() =>
+      Future.wait([fetchMyAudits(), fetchAuditsAtMyLocation()]);
 
   bool isLoading = false;
   String? errorMessage;
@@ -310,7 +330,7 @@ class AuditsProvider extends ChangeNotifier {
     try {
       final res = await _dio.get(
         ApiConstants.myAudits,
-        queryParameters: _scopeParams,
+        queryParameters: filterParams,
       );
       final list = (res.data['data'] as List? ?? [])
           .whereType<Map>()
@@ -459,11 +479,30 @@ class AuditsProvider extends ChangeNotifier {
   bool isLoadingAtMyLocation = false;
   List<AuditModel> auditsAtMyLocation = [];
 
+  Map<String, dynamic>? get _placeAndTypeParams {
+    final params = <String, dynamic>{};
+    if (locationFilter.isNotEmpty) {
+      params['locationIds'] = locationFilter.join(',');
+    }
+    if (auditTypeFilter.isNotEmpty) {
+      params['auditType'] = auditTypeFilter.join(',');
+    }
+    return params.isEmpty ? null : params;
+  }
+
   Future<void> fetchAuditsAtMyLocation() async {
     isLoadingAtMyLocation = true;
     notifyListeners();
     try {
-      final res = await _dio.get(ApiConstants.auditsAtMyLocation);
+      // Deliberately NOT filterParams: this endpoint is scoped by which
+      // locations the CALLER belongs to, never by employeeIds (see
+      // audit.controller.js#getAuditsAtMyLocation) — sending an
+      // employeeIds here would be meaningless. It does honour
+      // locationFilter/auditTypeFilter, so pass just those.
+      final res = await _dio.get(
+        ApiConstants.auditsAtMyLocation,
+        queryParameters: _placeAndTypeParams,
+      );
       auditsAtMyLocation = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))

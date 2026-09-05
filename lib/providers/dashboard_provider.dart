@@ -6,26 +6,30 @@ import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
 import '../models/audit_model.dart';
 import '../models/auditee_stats_model.dart';
+import 'audit_filter_scope.dart';
 
-class DashboardProvider extends ChangeNotifier {
+class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   final Dio _dio = DioClient.instance.dio;
 
   // "Me" vs "Team" scope for the auditor stat tallies + ATS/OTC score below
-  // (see widgets/scope_toggle.dart) — Team by default, i.e. no employeeIds
-  // param at all so the server falls back to its own default (self +
-  // downstream hierarchy, see resolveScopedEmployeeIds); "Me" sends an
-  // explicit employeeIds=<selfId> to narrow down to just the caller. Team
-  // is the default to match the web app's TeamFilterPanel, whose own
-  // default is "All" — same reason a not-yet-toggled ATS/OTC score used to
-  // read differently between web and mobile for the same account. Remembered
+  // (see widgets/scope_toggle.dart) — Me sends an explicit
+  // employeeIds=<selfId> to narrow down to just the caller; Team sends no
+  // employeeIds param at all so the server falls back to its own default
+  // (self + downstream hierarchy, see resolveScopedEmployeeIds). Remembered
   // here (not just passed per-call) so a live-refresh/pull-to-refresh
   // triggered from elsewhere reuses whatever the user last picked instead
   // of silently reverting to the default.
-  bool isTeamScope = true;
+  //
+  // Defaults FALSE (Me) — see AuditsProvider's identical field for the
+  // reasoning and for the _selfEmployeeId-must-be-set-first caveat. This
+  // now MATCHES the web app's own default (client/src/hooks/useSelfScope.js
+  // — TeamFilterPanel opens on "just you" too), so a not-yet-toggled ATS/
+  // OTC score reads the same on both platforms for the same account.
+  @override
+  bool isTeamScope = false;
   String? _selfEmployeeId;
-  Map<String, dynamic>? get _scopeParams => isTeamScope
-      ? null
-      : (_selfEmployeeId == null ? null : {'employeeIds': _selfEmployeeId});
+  @override
+  String? get selfEmployeeId => _selfEmployeeId;
 
   /// Call once the logged-in user's id is known (DashboardScreen's
   /// initState) — idempotent, safe to call on every build.
@@ -40,8 +44,11 @@ class DashboardProvider extends ChangeNotifier {
   Future<void> setTeamScope(bool isTeam) {
     isTeamScope = isTeam;
     notifyListeners();
-    return Future.wait([fetchStats(), fetchAuditeeStats()]);
+    return refetchForFilters();
   }
+
+  @override
+  Future<void> refetchForFilters() => refreshAll();
 
   bool isLoading = false;
   String? errorMessage;
@@ -109,6 +116,29 @@ class DashboardProvider extends ChangeNotifier {
   Future<void> refreshAll() =>
       Future.wait([fetchStats(), fetchAuditeeStats()]);
 
+  /// Everything from [filterParams] that GET /ncs/ats-summary actually
+  /// honours — deliberately NOT the location filter.
+  ///
+  /// Two separate reasons, both worth knowing before "fixing" this:
+  ///  1. That endpoint reads `locationId` (singular), not the `locationIds`
+  ///     every audit endpoint takes, so the audit-shaped param would be
+  ///     silently ignored anyway.
+  ///  2. Far worse, when a location IS supplied it REPLACES the employee
+  ///     scoping rather than narrowing it — see nc.controller.js#getAtsSummary,
+  ///     where `authorizedLocationIds` short-circuits the `employeeIds`
+  ///     branch entirely. So "Me + Zone A" would quietly become "EVERYONE's
+  ///     NCs in Zone A" and show a personal dashboard a number that is not
+  ///     the user's own. Dropping the param keeps this score honest; the
+  ///     chip row on the dashboard is where we tell the user that location
+  ///     doesn't narrow it.
+  /// Audit type is fine to pass — getAtsSummary applies it alongside the
+  /// scope rather than instead of it.
+  Map<String, dynamic>? get _ncSummaryParams {
+    final params = Map<String, dynamic>.from(filterParams ?? const {});
+    params.remove('locationIds');
+    return params.isEmpty ? null : params;
+  }
+
   Future<void> fetchStats() async {
     isLoading = true;
     errorMessage = null;
@@ -116,7 +146,7 @@ class DashboardProvider extends ChangeNotifier {
     try {
       final res = await _dio.get(
         ApiConstants.auditorStats,
-        queryParameters: _scopeParams,
+        queryParameters: filterParams,
       );
       stats = AuditorStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
@@ -143,7 +173,7 @@ class DashboardProvider extends ChangeNotifier {
     try {
       final res = await _dio.get(
         ApiConstants.ncsAtsSummary,
-        queryParameters: _scopeParams,
+        queryParameters: _ncSummaryParams,
       );
       auditeeStats = AuditeeStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),

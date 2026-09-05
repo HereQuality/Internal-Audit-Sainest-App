@@ -39,6 +39,25 @@ String _locationLabel(dynamic json) {
   return labels.join(', ');
 }
 
+// Mongo sends every date as a UTC ISO string, and DateTime.tryParse keeps
+// it that way — so `DateTime(d.year, d.month, d.day)` on the raw value
+// buckets by the UTC calendar day while Formatters (core/utils/formatters
+// .dart, which every screen prints through) formats in LOCAL time. In a
+// +5:30 timezone that quietly disagrees for anything scheduled late in the
+// local evening: the card reads "5 Sep" while the agenda files it under
+// 4 Sep. Convert once, here, so day-bucketing and display can never drift.
+DateTime? _localDate(dynamic v) =>
+    DateTime.tryParse(v?.toString() ?? '')?.toLocal();
+
+// null for an absent field AND for a present-but-empty string, so
+// callers can treat "no audit type" / "not part of a series" as one
+// falsy case instead of also having to check for ''.
+String? _nonEmpty(dynamic v) {
+  if (v == null) return null;
+  final s = v.toString().trim();
+  return s.isEmpty ? null : s;
+}
+
 class AuditModel {
   final String id;
   final String title;
@@ -88,6 +107,23 @@ class AuditModel {
   final String structureMode;
   final int locationCount;
   bool get hasMultipleZones => structureMode == 'per-location' && locationCount > 1;
+  // The audit's category name (models/Audit.js#auditType is a plain
+  // trimmed String, not a ref — whichever AuditType name was picked at
+  // creation time). Needed on mobile now that the Dashboard/Audits/
+  // Calendar filters can narrow by it, and shown on the agenda card so a
+  // day with several audits is scannable without opening each one.
+  final String? auditType;
+  // A recurring ("Frequency") audit generates one real Audit document per
+  // occurrence, all sharing recurrence.seriesId (see models/Audit.js's own
+  // header comment) — the phone agenda collapses a whole series down to
+  // one group row inside its month bucket instead of repeating N
+  // near-identical cards, same idea as the web app's CreateAudit.jsx/
+  // AuditorDashboard.jsx series collapse.
+  final String? seriesId;
+  final String? frequency;
+  final int? occurrenceIndex;
+  final int? occurrenceCount;
+  bool get isRecurring => seriesId != null && seriesId!.isNotEmpty;
 
   const AuditModel({
     required this.id,
@@ -106,20 +142,26 @@ class AuditModel {
     this.scheduleBatchId,
     this.structureMode = 'same',
     this.locationCount = 0,
+    this.auditType,
+    this.seriesId,
+    this.frequency,
+    this.occurrenceIndex,
+    this.occurrenceCount,
   });
 
   factory AuditModel.fromJson(Map<String, dynamic> json) {
     final scoreResult = json['scoreResult'];
     final rawBatchId = json['scheduleBatchId'];
     final locIds = json['locationIds'];
+    final recurrence = json['recurrence'];
     return AuditModel(
       id: (json['_id'] ?? '').toString(),
       title: json['title']?.toString() ?? 'Untitled Audit',
       scope: json['scope']?.toString() ?? '',
       status: json['status']?.toString() ?? 'Scheduled',
-      scheduledDate: DateTime.tryParse(json['scheduledDate']?.toString() ?? ''),
-      scheduledEndDate: DateTime.tryParse(json['scheduledEndDate']?.toString() ?? ''),
-      completedDate: DateTime.tryParse(json['completedDate']?.toString() ?? ''),
+      scheduledDate: _localDate(json['scheduledDate']),
+      scheduledEndDate: _localDate(json['scheduledEndDate']),
+      completedDate: _localDate(json['completedDate']),
       auditee: AuditeeInfo.fromJson(json['auditeeId']),
       location: _locationLabel(json),
       scorePercentage: scoreResult is Map ? (scoreResult['percentage'] as num?)?.toDouble() : null,
@@ -133,6 +175,17 @@ class AuditModel {
       scheduleBatchId: rawBatchId == null ? null : (rawBatchId is Map ? rawBatchId['_id'] : rawBatchId)?.toString(),
       structureMode: json['structureMode']?.toString() ?? 'same',
       locationCount: locIds is List ? locIds.length : 0,
+      auditType: _nonEmpty(json['auditType']),
+      // recurrence.seriesId is an unpopulated ObjectId today, but read the
+      // populated {_id: ...} shape too so a future .populate() on this
+      // endpoint can't silently turn every occurrence back into its own
+      // ungrouped row.
+      seriesId: _nonEmpty(recurrence is Map
+          ? (recurrence['seriesId'] is Map ? recurrence['seriesId']['_id'] : recurrence['seriesId'])
+          : null),
+      frequency: _nonEmpty(recurrence is Map ? recurrence['frequency'] : null),
+      occurrenceIndex: recurrence is Map ? (recurrence['occurrenceIndex'] as num?)?.toInt() : null,
+      occurrenceCount: recurrence is Map ? (recurrence['occurrenceCount'] as num?)?.toInt() : null,
     );
   }
 }
