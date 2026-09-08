@@ -67,10 +67,18 @@ class AchievedMax {
   const AchievedMax(this.achieved, this.max);
 }
 
-// Whole numbers only, matching server/utils/scoring.js#roundScore and its
-// web mirror (AuditReportShared.jsx#sumAchievedMax) — rounds the final
-// summed totals only, never per-leaf mid-sum.
-AchievedMax sumAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
+// Unrounded achieved/max — the same per-leaf formula sumAchievedMax below
+// uses, without its final rounding step. Exists so a caller that needs to
+// combine several leaf groups (e.g. every top-level node's own leaves, or
+// every section's leaves) into ONE grand total can sum the RAW
+// contributions first and round exactly once at the end, instead of
+// summing several already-rounded sub-totals — rounding isn't
+// distributive over addition, so "sum of rounded parts" and "round of
+// the summed whole" can legitimately land on different numbers. Matches
+// the web's own AuditReportShared.jsx#sumAchievedMax, which callers
+// achieve the same "round once" property with simply by calling it ONCE
+// over a combined leaf list rather than once per group.
+AchievedMax rawAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
   double achieved = 0, max = 0;
   for (final l in leaves) {
     final m = leafMax(l, auditMaxScore);
@@ -89,7 +97,19 @@ AchievedMax sumAchievedMax(List<ParameterNode> leaves, String scoringSystem, dou
       max += m;
     }
   }
-  return AchievedMax(achieved.roundToDouble(), max.roundToDouble());
+  return AchievedMax(achieved, max);
+}
+
+// Whole numbers only, matching server/utils/scoring.js#roundScore and its
+// web mirror (AuditReportShared.jsx#sumAchievedMax) — rounds the final
+// summed totals only, never per-leaf mid-sum. Callers that need to
+// combine MULTIPLE sumAchievedMax-shaped totals into one grand total
+// (a report's overall %, a table's FINAL SCORE row) should use
+// [rawAchievedMax] for each part instead and round once after summing —
+// see its own doc comment for why.
+AchievedMax sumAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
+  final raw = rawAchievedMax(leaves, scoringSystem, auditMaxScore);
+  return AchievedMax(raw.achieved.roundToDouble(), raw.max.roundToDouble());
 }
 
 int? percentageOf(AchievedMax am) => am.max > 0 ? (am.achieved / am.max * 100).round() : null;

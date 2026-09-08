@@ -118,6 +118,11 @@ class ApiConstants {
   // announcement.routes.js). AnnouncementProvider polls this.
   static const announcementStatus = '/announcement/status';
 
+  // Global company config — the report PDF's header line, matching the
+  // web Full Report's own `useCompany()` (companies.api.js#getCompanyDetails).
+  // Public, no auth required (see server/routes/company.routes.js).
+  static const companyDetails = '/companies/getCompanyDetails';
+
   // Tickets
   static const tickets = '/tickets';
   static const ticketsUnreadCount = '/tickets/unread-count';

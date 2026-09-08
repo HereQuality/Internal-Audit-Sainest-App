@@ -10,10 +10,23 @@ import 'package:printing/printing.dart';
 /// NC description, finding, or employee name (real, everyday input in
 /// this app) silently renders as missing glyphs instead of throwing,
 /// which is exactly what reads as "PDF text not properly coming" on the
-/// exported report. Noto Sans (Latin) + Noto Sans Devanagari as a
-/// fallback covers both scripts. PdfGoogleFonts fetches+caches these on
-/// first use — network is already required to fetch the report data this
-/// builds from, so this isn't a new offline requirement.
+/// exported report.
+///
+/// The base/bold faces are deliberately left AS Helvetica (i.e. `base`/
+/// `bold` below are never set — see [_load]) rather than swapped for Noto
+/// Sans wholesale: Helvetica is also jsPDF's own default font on the web
+/// export (client/src/utils/pdfWriter.js never calls `pdf.addFont`, so
+/// every `w.pdf.setFont("helvetica", ...)` there is this exact same
+/// built-in face) — the ONE thing report_pdf_builder.dart's own port
+/// could just inherit for free instead of approximating, so it does. Noto
+/// Sans Devanagari is added only as a `fontFallback` — the `pdf` package
+/// already resolves a fallback font automatically for any glyph the base
+/// face can't cover, so ordinary Latin text (the vast majority of a
+/// report) renders in the SAME Helvetica the web PDF uses, and only
+/// actual Devanagari text quietly switches face mid-string. PdfGoogleFonts
+/// fetches+caches the fallback on first use — network is already required
+/// to fetch the report data this builds from, so this isn't a new offline
+/// requirement.
 ///
 /// Cached in one Future so every report generated in an app session
 /// reuses the same fetch instead of re-downloading per PDF. Each of the
@@ -44,13 +57,14 @@ Future<pw.ThemeData> loadReportPdfTheme() {
 }
 
 Future<pw.ThemeData> _load() async {
-  final base = await PdfGoogleFonts.notoSansRegular().timeout(_perFontTimeout);
-  final bold = await PdfGoogleFonts.notoSansBold().timeout(_perFontTimeout);
   final devanagari = await PdfGoogleFonts.notoSansDevanagariRegular().timeout(_perFontTimeout);
   final devanagariBold = await PdfGoogleFonts.notoSansDevanagariBold().timeout(_perFontTimeout);
+  // No `base`/`bold` here — leaving those unset keeps the package's own
+  // default (Font.helvetica()/Font.helveticaBold(), confirmed in its
+  // TextStyle.defaultStyle()), the same face the web PDF draws every
+  // string with. Only Devanagari script — which that face has no glyphs
+  // for at all — falls through to Noto Sans.
   return pw.ThemeData.withFont(
-    base: base,
-    bold: bold,
     fontFallback: [devanagari, devanagariBold],
   );
 }

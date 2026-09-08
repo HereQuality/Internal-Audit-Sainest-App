@@ -228,7 +228,16 @@ class _AppShellState extends State<AppShell> {
         // either way), this just also lets a left/right drag switch tabs.
         body: PageView(
           controller: _pageController,
-          onPageChanged: (i) => setState(() => _index = i),
+          onPageChanged: (i) {
+            // Every tab is a _KeepAlivePage, so a focused TextField on the
+            // tab being left (the Audits search box, a ticket reply field)
+            // is never disposed and keeps primary focus — a page swipe is
+            // not a route change, so nothing hands focus back on its own.
+            // The keyboard would otherwise follow the user to the next tab
+            // and sit over content they never asked to type into.
+            FocusManager.instance.primaryFocus?.unfocus();
+            setState(() => _index = i);
+          },
           children: keepAliveTabs,
         ),
         bottomNavigationBar: NavigationBar(

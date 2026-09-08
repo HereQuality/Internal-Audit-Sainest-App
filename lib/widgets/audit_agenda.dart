@@ -90,6 +90,32 @@ class AuditMonthGroup {
   const AuditMonthGroup({required this.month, required this.audits});
 }
 
+/// A named, collapsible span of months further out than the handful shown
+/// individually by name — "Past 6 Months", "Past Year", "Older" on one
+/// side, "Next 6 Months", "Next Year", "Later" on the other. Exists so the
+/// agenda doesn't turn into an ever-growing flat list of one row per
+/// calendar month as an auditor's history (or a far-scheduled future)
+/// grows — see buildAuditAgenda's own note on the exact cutoff. Expanding
+/// one reveals its own months one at a time (AgendaRangeBucketSection),
+/// each of which further breaks down by day rather than dumping a
+/// collapsed-series card list straight into a section this size.
+class AgendaRangeBucket {
+  final String label;
+  final String groupKey;
+
+  /// Same chronological order the months inside it were bucketed in —
+  /// see [_tierMonths].
+  final List<AuditMonthGroup> months;
+
+  const AgendaRangeBucket({
+    required this.label,
+    required this.groupKey,
+    required this.months,
+  });
+
+  int get count => months.fold<int>(0, (sum, m) => sum + m.audits.length);
+}
+
 /// The whole tab's content, already bucketed and sorted. Built once per
 /// build from the (status-filtered) provider list — cheap enough at the
 /// size a single auditor's list ever reaches that memoising it would cost
@@ -104,12 +130,27 @@ class AuditAgenda {
   /// today + 7 days: the last day still shown as its own day group.
   final DateTime horizon;
 
-  /// Past audits grouped by month, OLDEST FIRST. The past region renders
-  /// as a normal top-to-bottom Column whose bottom edge sits against
-  /// Today, so oldest-first puts the oldest month at the visual top and
-  /// the most recent month directly above Today — nearest in time is
-  /// nearest on screen, in both directions away from the anchor.
+  /// EVERY past month with anything in it, OLDEST FIRST — the full list
+  /// behind [pastCount]/[pastOverdueCount] below. Not what the past
+  /// region actually renders one row per entry of any more (see
+  /// [recentPastMonths]/[pastBuckets]) — kept as the flat source of truth
+  /// so those two summary numbers don't have to be re-derived from two
+  /// separate tiered lists.
   final List<AuditMonthGroup> pastMonths;
+
+  /// The closest 3 calendar months with past audits (today's own month,
+  /// mid-month, counts as one of them), shown individually by name —
+  /// oldest of these first, so the most recent still sits directly above
+  /// Today, same ordering rule [pastMonths] itself used to be rendered
+  /// with. See [_tierMonths].
+  final List<AuditMonthGroup> recentPastMonths;
+
+  /// Everything in [pastMonths] older than [recentPastMonths], grouped
+  /// into named ranges — FARTHEST bucket first, so the past region still
+  /// reads oldest-at-top, nearest-to-Today-at-bottom overall once
+  /// [recentPastMonths] renders directly below these. Empty when every
+  /// past month is recent enough to be named individually.
+  final List<AgendaRangeBucket> pastBuckets;
 
   final List<AuditModel> todayAudits;
 
@@ -121,8 +162,24 @@ class AuditAgenda {
   /// Same calendar month as today but beyond the seven-day window.
   final List<AuditModel> restOfThisMonth;
 
-  /// Every month after this one that has anything, earliest first.
+  /// EVERY future month (beyond this one) with anything in it, earliest
+  /// first — the flat source of truth behind [laterMonths.isEmpty] checks
+  /// elsewhere. See [pastMonths]'s own doc for why this stays alongside
+  /// the tiered lists below instead of being replaced by them.
   final List<AuditMonthGroup> laterMonths;
+
+  /// The nearest 3 calendar months after this one, shown individually by
+  /// name — nearest first, mirroring [recentPastMonths]. See
+  /// [_tierMonths].
+  final List<AuditMonthGroup> recentLaterMonths;
+
+  /// Everything in [laterMonths] further out than [recentLaterMonths],
+  /// grouped into named ranges — NEAREST bucket first (the opposite order
+  /// from [pastBuckets]): [recentLaterMonths] already renders above these,
+  /// so the whole forward region reads nearest-to-Today-at-top,
+  /// farthest-at-bottom, moving away from the anchor the same direction
+  /// the page scrolls.
+  final List<AgendaRangeBucket> futureBuckets;
 
   /// scheduledDate == null — typically a Draft that was never scheduled.
   /// It has no place on a timeline, so it gets its own group pinned at
@@ -133,10 +190,14 @@ class AuditAgenda {
     required this.today,
     required this.horizon,
     required this.pastMonths,
+    required this.recentPastMonths,
+    required this.pastBuckets,
     required this.todayAudits,
     required this.nextSevenDays,
     required this.restOfThisMonth,
     required this.laterMonths,
+    required this.recentLaterMonths,
+    required this.futureBuckets,
     required this.undated,
   });
 
@@ -262,20 +323,122 @@ AuditAgenda buildAuditAgenda(List<AuditModel> audits, DateTime today) {
 
   final dayKeys = byDay.keys.toList()..sort();
 
+  final pastMonths = months(pastByMonth);
+  final laterMonths = months(laterByMonth);
+  final pastTiers = _tierMonths(
+    pastMonths,
+    distance: (month) => todayOrdinal - _monthOrdinal(month),
+    isPast: true,
+  );
+  final laterTiers = _tierMonths(
+    laterMonths,
+    distance: (month) => _monthOrdinal(month) - todayOrdinal,
+    isPast: false,
+  );
+
   return AuditAgenda(
     today: day0,
     horizon: horizon,
-    pastMonths: months(pastByMonth),
+    pastMonths: pastMonths,
+    recentPastMonths: pastTiers.recent,
+    pastBuckets: pastTiers.buckets,
     todayAudits: todayAudits..sort(_byDateThenTitle),
     nextSevenDays: [
       for (final key in dayKeys)
         AuditDayGroup(day: key, audits: byDay[key]!..sort(_byDateThenTitle)),
     ],
     restOfThisMonth: restOfThisMonth..sort(_byDateThenTitle),
-    laterMonths: months(laterByMonth),
+    laterMonths: laterMonths,
+    recentLaterMonths: laterTiers.recent,
+    futureBuckets: laterTiers.buckets,
     undated: undated
       ..sort((a, b) => a.title.toLowerCase().compareTo(b.title.toLowerCase())),
   );
+}
+
+class _MonthTiers {
+  final List<AuditMonthGroup> recent;
+  final List<AgendaRangeBucket> buckets;
+  const _MonthTiers(this.recent, this.buckets);
+}
+
+/// Splits an ascending (chronologically) list of month groups into the
+/// ones close enough to Today to show individually by name, and the rest,
+/// bucketed into named ranges. `distance` returns how many whole calendar
+/// months a group's own month sits from Today's — always >= 0, growing as
+/// the group gets further from Today in whichever direction the caller is
+/// for. Shared by both the past and future sides of buildAuditAgenda so
+/// the cutoffs (3 / 6 / 12 months) can't quietly drift apart between them.
+///
+/// The three range widths — up to 3 months named individually, 4-6 in one
+/// bucket, 7-12 in the next, 13+ in a final catch-all — are the one
+/// judgement call here; everything else follows from them. A catch-all
+/// for 13+ rather than an unbounded "Past Year" bucket, so a multi-year
+/// history still ends in a single collapsible row instead of silently
+/// growing that bucket's own month count forever.
+_MonthTiers _tierMonths(
+  List<AuditMonthGroup> ascendingGroups, {
+  required int Function(DateTime month) distance,
+  required bool isPast,
+}) {
+  final recent = <AuditMonthGroup>[];
+  final midRange = <AuditMonthGroup>[]; // 4-6 months away
+  final yearRange = <AuditMonthGroup>[]; // 7-12 months away
+  final older = <AuditMonthGroup>[]; // 13+ months away
+  for (final group in ascendingGroups) {
+    final d = distance(group.month);
+    if (d <= 3) {
+      recent.add(group);
+    } else if (d <= 6) {
+      midRange.add(group);
+    } else if (d <= 12) {
+      yearRange.add(group);
+    } else {
+      older.add(group);
+    }
+  }
+  final prefix = isPast ? 'past' : 'future';
+  final buckets = isPast
+      // Farthest bucket first: `recent` (nearest to Today) renders
+      // directly below these, so the whole past region still reads
+      // oldest-at-top / nearest-to-Today-at-bottom overall.
+      ? <AgendaRangeBucket>[
+          if (older.isNotEmpty)
+            AgendaRangeBucket(label: 'Older', groupKey: '$prefix:older', months: older),
+          if (yearRange.isNotEmpty)
+            AgendaRangeBucket(label: 'Past Year', groupKey: '$prefix:year', months: yearRange),
+          if (midRange.isNotEmpty)
+            AgendaRangeBucket(label: 'Past 6 Months', groupKey: '$prefix:6mo', months: midRange),
+        ]
+      // Nearest bucket first: `recent` renders ABOVE these, so the
+      // forward region reads nearest-to-Today-at-top / farthest-at-bottom
+      // — moving away from the anchor the same direction the page itself
+      // scrolls.
+      : <AgendaRangeBucket>[
+          if (midRange.isNotEmpty)
+            AgendaRangeBucket(label: 'Next 6 Months', groupKey: '$prefix:6mo', months: midRange),
+          if (yearRange.isNotEmpty)
+            AgendaRangeBucket(label: 'Next Year', groupKey: '$prefix:year', months: yearRange),
+          if (older.isNotEmpty)
+            AgendaRangeBucket(label: 'Later', groupKey: '$prefix:older', months: older),
+        ];
+  return _MonthTiers(recent, buckets);
+}
+
+/// Groups one bucket month's own audits by day — the day-wise drill-down
+/// AgendaRangeBucketSection asks AgendaMonthSection for via `nestDays`.
+/// Every audit reaching here already passed through buildAuditAgenda's own
+/// `scheduled == null -> undated` filter, so the `!` below is safe.
+List<AuditDayGroup> _groupAuditsByDay(List<AuditModel> audits) {
+  final byDay = <DateTime, List<AuditModel>>{};
+  for (final audit in audits) {
+    byDay.putIfAbsent(dayOnly(audit.scheduledDate!), () => []).add(audit);
+  }
+  final keys = byDay.keys.toList()..sort();
+  return [
+    for (final key in keys)
+      AuditDayGroup(day: key, audits: byDay[key]!..sort(_byDateThenTitle)),
+  ];
 }
 
 /// One row in a month group: either a standalone audit
@@ -740,6 +903,16 @@ class AgendaMonthSection extends StatelessWidget {
   /// plain state living in MyAuditsScreen.
   final VoidCallback onChanged;
 
+  /// True for a month reached through an AgendaRangeBucketSection (see
+  /// that class's own doc) — expanding breaks this month's own audits
+  /// down by day (one nested AgendaDaySection per day that has anything)
+  /// instead of flattening straight to a collapsed-series card list.
+  /// A "Past Year" bucket is exactly the case a flat card list per month
+  /// stops being scannable; a recent month shown by name outside any
+  /// bucket keeps the original flat behaviour, since that was never the
+  /// part of this screen anyone asked to change.
+  final bool nestDays;
+
   const AgendaMonthSection({
     super.key,
     required this.label,
@@ -748,13 +921,17 @@ class AgendaMonthSection extends StatelessWidget {
     required this.today,
     required this.expansion,
     required this.onChanged,
+    this.nestDays = false,
   });
 
   @override
   Widget build(BuildContext context) {
     final expanded = expansion.isMonthExpanded(groupKey);
-    final entries =
-        expanded ? collapseRecurringSeries(audits) : const <AgendaEntry>[];
+    final entries = expanded && !nestDays
+        ? collapseRecurringSeries(audits)
+        : const <AgendaEntry>[];
+    final dayGroups =
+        expanded && nestDays ? _groupAuditsByDay(audits) : const <AuditDayGroup>[];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -771,7 +948,27 @@ class AgendaMonthSection extends StatelessWidget {
             onChanged();
           },
         ),
-        if (expanded) ...[
+        if (expanded && nestDays) ...[
+          const SizedBox(height: 8),
+          for (final group in dayGroups)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: AgendaDaySection(
+                group: group,
+                today: today,
+                // Day keys already encode the full date (see
+                // agendaDayKey), so they stay globally unique across
+                // every month/bucket a day could ever be reached
+                // through — no groupKey qualification needed here the
+                // way a bucket's own nested month keys need one.
+                expanded: expansion.isDayExpanded(agendaDayKey(group.day)),
+                onToggle: () {
+                  expansion.toggleDay(agendaDayKey(group.day));
+                  onChanged();
+                },
+              ),
+            ),
+        ] else if (expanded) ...[
           const SizedBox(height: 8),
           for (final entry in entries) ...[
             if (entry.isSeries)
@@ -788,6 +985,79 @@ class AgendaMonthSection extends StatelessWidget {
               ),
             const SizedBox(height: 12),
           ],
+        ],
+        const SizedBox(height: 4),
+      ],
+    );
+  }
+}
+
+/// A collapsible span of months further out than the individually-named
+/// recent ones — "Past 6 Months", "Past Year", "Older", "Next 6 Months",
+/// "Next Year", "Later" — see AgendaRangeBucket's own doc for why these
+/// exist. Expands to one AgendaMonthSection per month inside it, indented
+/// to read as nested under this row, each drilling further down to its
+/// own days (`nestDays: true`) rather than a flat card list — a bucket
+/// this wide is exactly the case that flat list stops being scannable.
+class AgendaRangeBucketSection extends StatelessWidget {
+  final AgendaRangeBucket bucket;
+  final DateTime today;
+  final AgendaExpansion expansion;
+  final VoidCallback onChanged;
+
+  const AgendaRangeBucketSection({
+    super.key,
+    required this.bucket,
+    required this.today,
+    required this.expansion,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final expanded = expansion.isMonthExpanded(bucket.groupKey);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        AgendaSectionHeader(
+          label: bucket.label,
+          count: bucket.count,
+          expanded: expanded,
+          icon: Icons.calendar_view_month_outlined,
+          onTap: () {
+            expansion.toggleMonth(bucket.groupKey);
+            onChanged();
+          },
+        ),
+        if (expanded) ...[
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.only(left: 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final month in bucket.months)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: AgendaMonthSection(
+                      label: agendaMonthLabel(month.month),
+                      // Qualified by the bucket, unlike a recent month's
+                      // own bare agendaMonthKey — a month reached through
+                      // "Past 6 Months" today could sit in "Past Year"
+                      // months from now as Today moves on, and this keeps
+                      // its expand state from ever colliding with a
+                      // same-named key used somewhere else in the agenda.
+                      groupKey: '${bucket.groupKey}/${agendaMonthKey(month.month)}',
+                      audits: month.audits,
+                      today: today,
+                      expansion: expansion,
+                      onChanged: onChanged,
+                      nestDays: true,
+                    ),
+                  ),
+              ],
+            ),
+          ),
         ],
         const SizedBox(height: 4),
       ],
@@ -1261,7 +1531,18 @@ class AgendaPastRegion extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final month in agenda.pastMonths)
+        // Farthest-back range buckets first, then the recent named
+        // months — see AuditAgenda.pastBuckets' own doc for why this
+        // order keeps the whole region reading oldest-at-top /
+        // nearest-to-Today-at-bottom.
+        for (final bucket in agenda.pastBuckets)
+          AgendaRangeBucketSection(
+            bucket: bucket,
+            today: agenda.today,
+            expansion: expansion,
+            onChanged: onChanged,
+          ),
+        for (final month in agenda.recentPastMonths)
           AgendaMonthSection(
             label: agendaMonthLabel(month.month),
             groupKey: agendaMonthKey(month.month),

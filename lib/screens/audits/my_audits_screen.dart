@@ -114,6 +114,38 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
 
   final ScrollController _scroll = ScrollController();
 
+  /// Free-text narrowing, applied on top of the status chip. Local to
+  /// this screen and deliberately NOT pushed into AuditsProvider like the
+  /// location/type/people filters are: those are server-side query params
+  /// (fetchMyAudits re-requests on change), and round-tripping the
+  /// network on every keystroke would make typing lag on exactly the
+  /// mid-range phones this app targets. Everything the agenda shows is
+  /// already in memory, so this filters the loaded list instead.
+  final TextEditingController _searchController = TextEditingController();
+  String _search = '';
+
+  /// Title, scope and location are all drawn on the agenda card itself
+  /// (audit_agenda.dart renders `audit.scope` under the title), so a hit
+  /// on any of them is visible on the card the user lands on. `scope` in
+  /// particular is the longest free text on the card and the most likely
+  /// thing someone retypes after reading it.
+  ///
+  /// `auditee.name` is the deliberate exception: no agenda widget renders
+  /// it, so a match there looks unexplained on the card. It stays
+  /// searchable anyway because "which audits is this person the
+  /// representative for" is a question auditors actually ask, and the
+  /// name IS shown once the audit is opened.
+  static bool _matchesSearch(AuditModel audit, String query) {
+    bool has(String? value) =>
+        value != null && value.toLowerCase().contains(query);
+    return has(audit.title) ||
+        has(audit.scope) ||
+        has(audit.location) ||
+        has(audit.auditType) ||
+        has(audit.auditee.name) ||
+        audit.auditorNames.any((n) => n.toLowerCase().contains(query));
+  }
+
   /// Drives the floating "Today" pill. A ValueNotifier + ValueListenable
   /// Builder instead of setState: this changes on every scroll frame, and
   /// rebuilding the whole agenda (hundreds of cards) 60 times a second to
@@ -141,6 +173,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
     _jump.dispose();
+    _searchController.dispose();
     super.dispose();
   }
 
@@ -295,9 +328,19 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
         provider.errorMessage != null && provider.audits.isEmpty;
     final bool showLoading =
         provider.isLoading && provider.audits.isEmpty && !showError;
-    final List<AuditModel> filtered = _statusFilter == 'All'
+    // Search narrows alongside the status chip and, like it, runs BEFORE
+    // bucketing (see the note below) so headers, counts and the Today
+    // anchor all describe what is actually on screen.
+    final String query = _search.trim().toLowerCase();
+    final List<AuditModel> filtered =
+        (_statusFilter == 'All' && query.isEmpty)
         ? provider.audits
-        : provider.audits.where((a) => a.status == _statusFilter).toList();
+        : provider.audits.where((a) {
+            if (_statusFilter != 'All' && a.status != _statusFilter) {
+              return false;
+            }
+            return query.isEmpty || _matchesSearch(a, query);
+          }).toList();
 
     // The status chips filter BEFORE bucketing, so every section header's
     // count and the Today anchor itself describe what is actually on
@@ -312,8 +355,55 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     // as "past" if a build happens to straddle midnight.
     final agenda = showAgenda ? buildAuditAgenda(filtered, DateTime.now()) : null;
 
+    // Resync the floating Today pill to whatever this build actually
+    // produced. Without this, narrowing the list to nothing (via the
+    // search box or a status chip) destroys the CustomScrollView while
+    // `_jump` keeps its last value, so the pill stays on screen at full
+    // opacity over the empty state — and tapping it does nothing, because
+    // `_jumpToToday` no-ops once `_scroll` has detached. Done here rather
+    // than in each of the handlers so the search, the chips and a
+    // provider refresh are all covered by one rule.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_scroll.hasClients) {
+        _onScroll();
+      } else {
+        _jump.value = _JumpTarget.hidden;
+      }
+    });
+
     return Column(
       children: [
+        // Hidden while loading/erroring/empty for the same reason the
+        // status chips are: there is nothing to narrow, and a dead search
+        // box over an error message reads as a broken screen.
+        if (!showLoading && !showError && !showEmptyState)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+            child: TextField(
+              controller: _searchController,
+              textInputAction: TextInputAction.search,
+              decoration: InputDecoration(
+                isDense: true,
+                prefixIcon: const Icon(Icons.search, size: 20),
+                hintText: 'Search audits, location, auditor...',
+                suffixIcon: _search.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.clear, size: 18),
+                        tooltip: 'Clear search',
+                        onPressed: () {
+                          _searchController.clear();
+                          setState(() => _search = '');
+                        },
+                      ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+              ),
+              onChanged: (v) => setState(() => _search = v),
+            ),
+          ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
           child: DashboardFilterBar(
@@ -419,11 +509,36 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
               ),
       );
     } else {
+      // There IS data — the on-screen narrowing (status chip and/or the
+      // search box) is what emptied the list. Distinct from
+      // showEmptyState above, which means the provider's own server-side
+      // filters returned nothing, so the way out is different: offer the
+      // search reset here, not clearFilters().
+      final searchTerm = _search.trim();
+      final searching = searchTerm.isNotEmpty;
       child = SizedBox(
         height: height * 0.5,
         child: EmptyState(
-          icon: Icons.filter_alt_off_outlined,
-          title: 'No $_statusFilter audits',
+          icon: searching ? Icons.search_off : Icons.filter_alt_off_outlined,
+          title: searching
+              ? 'No audits match "$searchTerm"'
+              : 'No $_statusFilter audits',
+          // Both narrowings active at once is the case most likely to
+          // read as "the search is broken" — name the other one so the
+          // user knows there is a second thing hiding results.
+          subtitle: searching && _statusFilter != 'All'
+              ? 'Also filtered to $_statusFilter audits.'
+              : null,
+          action: searching
+              ? OutlinedButton.icon(
+                  onPressed: () {
+                    _searchController.clear();
+                    setState(() => _search = '');
+                  },
+                  icon: const Icon(Icons.clear),
+                  label: const Text('Clear search'),
+                )
+              : null,
         ),
       );
     }
@@ -542,8 +657,14 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
                   ),
                 ),
               ),
-            // 5. Next month, the month after, and so on — in bulk.
-            for (final month in agenda.laterMonths)
+            // 5. The nearest 3 months after this one, by name, then
+            // (only once there is anything further out than that)
+            // increasingly wide range buckets — "Next 6 Months", "Next
+            // Year", "Later" — each drilling month-wise then day-wise
+            // instead of the agenda growing one flat row per future
+            // month forever. See AuditAgenda.recentLaterMonths/
+            // futureBuckets' own docs.
+            for (final month in agenda.recentLaterMonths)
               SliverToBoxAdapter(
                 child: Padding(
                   padding: horizontal,
@@ -551,6 +672,18 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
                     label: agendaMonthLabel(month.month),
                     groupKey: agendaMonthKey(month.month),
                     audits: month.audits,
+                    today: agenda.today,
+                    expansion: _expansion,
+                    onChanged: _onExpansionChanged,
+                  ),
+                ),
+              ),
+            for (final bucket in agenda.futureBuckets)
+              SliverToBoxAdapter(
+                child: Padding(
+                  padding: horizontal,
+                  child: AgendaRangeBucketSection(
+                    bucket: bucket,
                     today: agenda.today,
                     expansion: _expansion,
                     onChanged: _onExpansionChanged,

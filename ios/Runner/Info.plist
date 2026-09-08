@@ -53,15 +53,27 @@
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<!-- flutter_background_service_ios registers this exact identifier with
+	     BGTaskScheduler (SwiftFlutterBackgroundServicePlugin.taskIdentifier)
+	     and submits a BGAppRefreshTaskRequest for it. iOS refuses to
+	     register a task identifier that isn't listed here, so without this
+	     key the background refresh silently never ran. -->
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>dev.flutter.background.refresh</string>
+	</array>
 	<!-- Best-effort only — see NOTIFICATIONS.md. "fetch" lets iOS
 	     opportunistically wake the app for background_service's
 	     onIosBackground handler, but the OS decides if/when (no guaranteed
 	     interval, no android_alarm_manager_plus equivalent here); this is
-	     NOT a substitute for FCM/APNs if you need reliable iOS delivery. -->
+	     NOT a substitute for FCM/APNs if you need reliable iOS delivery.
+	     "processing" is deliberately NOT declared: the plugin uses
+	     BGAppRefreshTask only, there is no BGProcessingTask code anywhere in
+	     the app or its pods, and declaring it failed App Store upload with
+	     ITMS-90771 (and invites an App Review 2.5.4 rejection). -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
-		<string>processing</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

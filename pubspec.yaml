@@ -57,6 +57,16 @@ dependencies:
   # report as a PDF, mirroring client/src/pages/AuditFullReport.jsx.
   pdf: ^3.11.1
   printing: ^5.13.4
+  # Was already a transitive dependency of pdf (which uses it to decode
+  # any image handed to pw.MemoryImage) — declared directly so
+  # report_pdf_builder.dart can decode-and-validate a fetched image ITSELF
+  # before ever constructing a pw.MemoryImage from it. See that file's own
+  # note on why: pw.MemoryImage defers decoding until the document is
+  # actually rendered, so an image this package can't decode (e.g. a
+  # lossless-VP8L WebP it has a decoder bug on) throws from deep inside
+  # doc.save() instead of at fetch time, uncatchable by the fetch's own
+  # try/catch and surfacing as a whole report failing to generate.
+  image: ^4.3.0
 
 dev_dependencies:
   flutter_test:
