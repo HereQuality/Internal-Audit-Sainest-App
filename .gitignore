@@ -50,3 +50,4 @@ app.*.map.json
 # local rather than committed.
 /android/app/google-services.json
 /ios/Runner/GoogleService-Info.plist
+

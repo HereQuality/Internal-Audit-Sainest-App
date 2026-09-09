@@ -23,6 +23,36 @@ import 'notification_navigation.dart';
 /// GoogleService-Info.plist yet — see NOTIFICATIONS.md) degrades to "no
 /// push notifications" rather than a crash, same philosophy main.dart's
 /// own NotificationBootstrap.init() guard already follows.
+// Top-level, not a method — the `firebase_messaging` plugin spawns a
+// SEPARATE background isolate to run this when a data-only message
+// arrives while the app is backgrounded/killed (foreground delivery goes
+// through FcmService._handleForegroundMessage instead, same process, no
+// isolate hop needed there). A background isolate has none of the
+// current process's state, so this can only do isolate-safe work — same
+// constraint notification_prefs.dart's own doc comment describes for the
+// AndroidAlarmManager/background_service isolates. Registering it is
+// also what makes a data-only push (fcmPush.service.js sends no
+// `notification` block) get processed AT ALL while backgrounded —
+// without an onBackgroundMessage handler registered, Android has nothing
+// to hand a data-only message to and just drops it silently.
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  debugPrint('FcmService: background message received: ${message.data}');
+  await Firebase.initializeApp();
+  await LocalNotifications.init();
+  final data = message.data;
+  final referenceId = data['referenceId'] as String?;
+  await LocalNotifications.showLive(
+    id: (referenceId ?? message.messageId ?? '').hashCode & 0x7fffffff,
+    title: data['title'] as String? ?? 'Notification',
+    body: data['body'] as String? ?? '',
+    payload: encodeNotificationPayload(
+      type: data['type'] as String? ?? 'general',
+      referenceId: (referenceId == null || referenceId.isEmpty) ? null : referenceId,
+    ),
+  );
+}
+
 class FcmService {
   FcmService._();
 
@@ -30,15 +60,21 @@ class FcmService {
 
   /// Called once from main.dart, right alongside NotificationBootstrap
   /// .init() and BEFORE [consumeLaunchPayload] — registers the
-  /// foreground/opened-app listeners. Token REGISTRATION with the server
-  /// happens separately, per-login (see [registerToken]), not here.
+  /// foreground/opened-app/background listeners. Token REGISTRATION with
+  /// the server happens separately, per-login (see [registerToken]), not
+  /// here.
   static Future<void> init() async {
     if (_initialized) return;
     try {
       await Firebase.initializeApp();
       FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
       FirebaseMessaging.onMessageOpenedApp.listen(_handleOpenedAppMessage);
+      // Must be a top-level function reference, not a closure/method —
+      // the plugin passes it to a background isolate by reference, which
+      // can't capture instance/closure state. See its own doc comment.
+      FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
       _initialized = true;
+      debugPrint('FcmService.init succeeded — Firebase configured, listeners registered.');
     } catch (e, st) {
       debugPrint('FcmService.init failed (Firebase not set up yet?), continuing without push: $e\n$st');
     }
@@ -68,6 +104,7 @@ class FcmService {
   // showLive), so a push and the in-app socket event for the same thing
   // read identically and route identically on tap.
   static void _handleForegroundMessage(RemoteMessage message) {
+    debugPrint('FcmService: foreground message received: ${message.data}');
     final data = message.data;
     final payload = _payloadFor(message);
     LocalNotifications.showLive(
