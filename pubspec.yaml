@@ -44,7 +44,13 @@ dependencies:
   cached_network_image: ^3.4.1
   timeago: ^3.7.0
 
-  # ── Local, non-FCM overdue-NC notifications (see lib/core/notifications) ──
+  # ── Notifications (see lib/core/notifications) — local polling (event_
+  # poll.dart/overdue_poll.dart, works even with no Firebase project set
+  # up) AND real FCM push (fcm_service.dart, arrives with the app fully
+  # closed/killed — needs android/app/google-services.json + iOS's
+  # GoogleService-Info.plist to actually deliver; degrades to "local-only"
+  # everywhere else in this file until those exist, see fcm_service.dart's
+  # own doc comment) ──
   flutter_local_notifications: ^18.0.1
   flutter_background_service: ^5.1.0
   permission_handler: ^11.3.1
@@ -52,6 +58,8 @@ dependencies:
   flutter_timezone: ^5.1.0
   shared_preferences: ^2.3.3
   http: ^1.2.2
+  firebase_core: ^3.8.0
+  firebase_messaging: ^15.1.6
 
   # Reports screen (profile) — builds and shares a completed audit's full
   # report as a PDF, mirroring client/src/pages/AuditFullReport.jsx.

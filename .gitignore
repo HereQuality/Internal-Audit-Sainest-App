@@ -43,3 +43,10 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Firebase platform config (fcm_service.dart / NOTIFICATIONS.md's "FCM
+# push setup") — not a private key the way the server's service-account
+# JSON is, but project-specific and regenerable per-environment, so kept
+# local rather than committed.
+/android/app/google-services.json
+/ios/Runner/GoogleService-Info.plist

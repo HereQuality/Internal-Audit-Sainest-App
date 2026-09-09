@@ -110,6 +110,11 @@ class ApiConstants {
   static const notificationsReadAll = '/notifications/read-all';
   static String notificationRead(String id) => '/notifications/$id/read';
 
+  // FCM device-token registration (fcm_service.dart) — server/routes/
+  // deviceToken.routes.js, the phone counterpart of the web app's own
+  // POST/DELETE /push/subscribe.
+  static const deviceTokenRegister = '/device-tokens/register';
+
   // Maintenance mode — public, no auth required (see server/routes/
   // maintenance.routes.js). MaintenanceProvider polls this.
   static const maintenanceStatus = '/maintenance/status';

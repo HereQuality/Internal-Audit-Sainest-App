@@ -3,6 +3,7 @@ import 'package:flutter/services.dart' show PlatformException;
 
 import 'background_entrypoints.dart';
 import 'event_poll.dart';
+import 'fcm_service.dart';
 import 'notification_bootstrap.dart';
 import 'notification_prefs.dart';
 import 'overdue_poll.dart';
@@ -27,16 +28,22 @@ class NotificationScheduler {
     // NotificationBootstrap.init() failed or was skipped on this device).
     // Reminders are a nice-to-have; login itself must not be affected.
     try {
-      // On by default (see NotificationPrefs.readBackgroundPollingEnabled)
-      // but still gated on the OS permission actually being granted —
-      // requested right here, same as the Settings screen's own toggle-on
-      // path, so a fresh login doesn't start the foreground service before
-      // the user has ever been asked. A denial just means no reminders;
-      // the pref stays on so re-granting later (Settings, or the OS
-      // Settings screen after a permanent denial) picks it back up next
-      // login without the user having to rediscover the toggle.
-      if (await NotificationPrefs.readBackgroundPollingEnabled() &&
-          await _requestPermissions()) {
+      // Requested once here, shared by both paths below — same as the
+      // Settings screen's own toggle-on path, so a fresh login doesn't
+      // start anything before the user has ever been asked. A denial just
+      // means no reminders; the underlying prefs stay on so re-granting
+      // later (Settings, or the OS Settings screen after a permanent
+      // denial) picks everything back up next login with no rediscovery
+      // needed.
+      final granted = await _requestPermissions();
+      // FCM push doesn't depend on the (Android-only) local-poll
+      // foreground-service toggle below — a real server push needs no
+      // persistent foreground service to arrive, so this registers
+      // whenever notification permission is granted, on by default same
+      // as background polling is.
+      if (granted) await FcmService.registerToken();
+      // On by default — see NotificationPrefs.readBackgroundPollingEnabled.
+      if (granted && await NotificationPrefs.readBackgroundPollingEnabled()) {
         await startBackgroundPolling();
         await pollAndNotifyOverdueNcs();
         await pollAndNotifyEvents();
@@ -75,6 +82,11 @@ class NotificationScheduler {
       await stopBackgroundPolling();
     } catch (e, st) {
       debugPrint('NotificationScheduler.onLoggedOut failed to stop polling: $e\n$st');
+    }
+    try {
+      await FcmService.unregisterToken();
+    } catch (e, st) {
+      debugPrint('NotificationScheduler.onLoggedOut failed to unregister FCM token: $e\n$st');
     }
     await NotificationPrefs.clearSession();
   }

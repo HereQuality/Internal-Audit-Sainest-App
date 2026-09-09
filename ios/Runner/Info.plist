@@ -70,10 +70,19 @@
 	     "processing" is deliberately NOT declared: the plugin uses
 	     BGAppRefreshTask only, there is no BGProcessingTask code anywhere in
 	     the app or its pods, and declaring it failed App Store upload with
-	     ITMS-90771 (and invites an App Review 2.5.4 rejection). -->
+	     ITMS-90771 (and invites an App Review 2.5.4 rejection).
+	     "remote-notification" IS the reliable one — required for a
+	     data-only FCM/APNs push (fcm_service.dart sends no `notification`
+	     block, only `data`) to reach didReceiveRemoteNotification while
+	     backgrounded at all; without it iOS just drops a silent push
+	     outright. Needs the Push Notifications capability + an APNs key
+	     uploaded to Firebase too — see NOTIFICATIONS.md's "FCM push setup"
+	     for the Apple Developer Program side of this, which no Info.plist
+	     edit can substitute for. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
+		<string>remote-notification</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

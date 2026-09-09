@@ -1,10 +1,117 @@
-# Overdue-NC local notifications
+# Notifications: local poll + FCM push
 
-Non-FCM, poll-from-the-device pipeline for notifying an auditee that a
-Non-Conformance raised against them has passed its `targetDate` without
-being closed. Android gets a real, resilient background poll; iOS gets
-best-effort only (see **iOS reality check** below) — that asymmetry is
-inherent to the platforms, not a gap in this implementation.
+Two layers, deliberately overlapping rather than one replacing the other:
+
+- **Local poll** (this doc's original content, below) — a
+  poll-from-the-device pipeline, resilient on Android via AlarmManager +
+  a foreground service, best-effort on iOS (see **iOS reality check**).
+  Works with ZERO server/Firebase setup.
+- **FCM push** (`core/notifications/fcm_service.dart`) — real push via
+  Firebase Cloud Messaging, arriving even with the app fully closed/
+  killed on either platform, sourced from the server's own Notification
+  system (`server/services/notification.service.js` ->
+  `fcmPush.service.js`, the exact same funnel the web app's browser push
+  already goes through). See **FCM push setup** below — it needs a real
+  Firebase project to do anything; until then it's a total no-op and the
+  local poll (this whole rest of the doc) is the only thing running.
+
+Neither layer's dedup state (SharedPreferences `notifiedDates`/`seenIds`
+locally, the server's own `Notification.isRead` for pushes) knows about
+the other, so the FIRST event after FCM goes live can show two tray
+entries for the same thing — a one-time overlap, not a bug to chase; see
+`event_poll.dart`'s own header comment.
+
+## FCM push setup
+
+Everything on the SERVER and DART sides is already wired
+(`server/models/DeviceToken.js`, `server/config/firebase.js`,
+`server/services/fcmPush.service.js`, `server/controllers/
+deviceToken.controller.js` + its route, `fcm_service.dart`, and
+`main.dart`/`notification_scheduler.dart` calling into it) — every one of
+those already fails soft to "no push" with nothing configured, so none of
+it risks the app or server today. What's still missing, because it needs
+an actual Firebase project (a Google account, not something committable
+to this repo):
+
+1. **Create a Firebase project** at console.firebase.google.com (free —
+   Cloud Messaging has no usage cap or paid tier).
+2. **Add an Android app** to it, package name **`com.hqepl.audit360`**
+   (the real `applicationId` — `android/app/build.gradle.kts`) — download
+   the generated `google-services.json` and place it at
+   `android/app/google-services.json` (gitignored — never commit it).
+3. **Add the Google Services Gradle plugin** — DONE (`android/settings
+   .gradle.kts` + `android/app/build.gradle.kts`, plugin `4.5.0`, this
+   project's Kotlin DSL `.gradle.kts`, not `.gradle`). `google-services
+   .json` is in place at `android/app/google-services.json` (gitignored).
+   Build-tested twice (`flutter build apk --debug`) — clean.
+4. **iOS** — `GoogleService-Info.plist` is in place at
+   `ios/Runner/GoogleService-Info.plist` (gitignored) and registered on
+   the `Runner` target's Copy Bundle Resources phase (done via the
+   `xcodeproj` Ruby gem, not a manual Xcode drag — same end result).
+   Bundle id **`com.hqepl.audit360`** on both platforms. Build-tested
+   (`flutter build ios --no-codesign --debug`) — clean. **Still needed**
+   for real device delivery (code can't do this part): an APNs
+   Authentication Key from the Apple Developer Portal (Certificates,
+   Identifiers & Profiles -> Keys -> + -> check "Apple Push Notifications
+   service (APNs)"), uploaded to Firebase Console -> Project Settings ->
+   Cloud Messaging -> Apple app configuration, plus the Push Notifications
+   + Background Modes (Remote notifications) capabilities enabled on the
+   `Runner` target in Xcode's Signing & Capabilities tab.
+5. **Server**: Firebase Console -> Project Settings -> Service Accounts ->
+   "Generate new private key" — downloads a JSON file. Save it as
+   `server/firebase-service-account.json` (gitignored) and confirm
+   `server/.env`'s `FIREBASE_SERVICE_ACCOUNT_PATH` points at it (already
+   set to that same default path).
+6. Restart the server, run `flutter pub get` + rebuild the app. Log in on
+   a device — `fcm_service.dart#registerToken` fires automatically and
+   posts this device's token to `POST /device-tokens/register`. Trigger
+   any existing notification (assign an audit, raise an NC) and confirm
+   it now also arrives as a real push, including with the app closed.
+
+## iOS gotcha: Swift Package Manager vs. `firebase_core` 3.15.2
+
+`firebase_core-3.15.2`'s `Package.swift` computes its own version by
+reading `pubspec.yaml` via a path built from `#file` two directories up.
+Flutter's Swift Package Manager integration resolves local plugin
+packages through a SYMLINK
+(`ios/Flutter/ephemeral/Packages/.packages/firebase_core-3.15.2` ->
+`~/.pub-cache/.../firebase_core-3.15.2/ios/firebase_core`), and `#file`
+reports the SYMLINK's own path, not its real target — so "two directories
+up" lands on `ios/Flutter/ephemeral/Packages/pubspec.yaml`, which doesn't
+exist, and `xcodebuild`/`flutter build ios`/`flutter run` all fail with
+`Failed to load configuration: fileNotFound(...pubspec.yaml...)` before
+any of this app's own code is even touched.
+
+**Fix applied**: `flutter config --no-enable-swift-package-manager`
+(global to this machine — there's no other Flutter project on it), then
+the iOS project was regenerated from scratch
+(`flutter create --platforms=ios --org com.hqepl .` on a moved-aside
+`ios/`) so Flutter wires plugins through CocoaPods (`ios/Podfile`,
+already present) instead — CocoaPods vendors real files, no symlink, no
+`#file` mismatch. `pod install` now resolves Firebase in
+`ios/Podfile.lock` correctly. If `ios/` is ever regenerated again for any
+reason, **re-verify no `FlutterGeneratedPluginSwiftPackage` reference
+exists** in `ios/Runner.xcodeproj/project.pbxproj`
+(`grep -c FlutterGeneratedPluginSwiftPackage`) — a nonzero count means
+SPM crept back in and this same build failure will return.
+
+**Side effect to watch for**: regenerating `ios/` from scratch (moving
+the whole folder aside first, not just re-running `flutter create` on an
+existing one — which does NOT retrofit an already-SPM-integrated project)
+resets `ios/Runner/Assets.xcassets/AppIcon.appiconset/*.png` back to the
+stock Flutter template icons and drops `ios/Runner/Info.plist`'s custom
+keys (camera/photo permissions, `BGTaskSchedulerPermittedIdentifiers`,
+`UIBackgroundModes`) back to bare defaults — both are tracked in git, so
+`git checkout HEAD -- ios/Runner/Assets.xcassets/AppIcon.appiconset/`
+recovers the icons, but Info.plist's custom keys need re-adding by hand
+(they're not restorable from git the same way, since this file wasn't
+committed before today — take a copy first if you're about to regenerate
+`ios/` again). Also re-set `PRODUCT_BUNDLE_IDENTIFIER` to
+`com.hqepl.audit360` in the fresh `project.pbxproj` (`flutter create`'s
+own default is `com.hqepl.internalAuditApp`), and revert `pubspec.lock`/
+`.metadata` afterward — `flutter create` bumps transitive dependency
+versions and strips other-platform entries out of `.metadata` as a side
+effect unrelated to iOS itself.
 
 ## Files
 

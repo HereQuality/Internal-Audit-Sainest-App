@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'core/notifications/fcm_service.dart';
 import 'core/notifications/local_notifications.dart';
 import 'core/notifications/notification_bootstrap.dart';
 import 'core/notifications/notification_navigation.dart';
@@ -45,7 +46,14 @@ void main() async {
   // notifications being the only thing lost by skipping it.
   try {
     await NotificationBootstrap.init();
-    _pendingLaunchPayload = await LocalNotifications.consumeLaunchPayload();
+    // Own try/catch internally (Firebase project not set up yet degrades
+    // to "no push", never a crash — see FcmService's own doc comment) —
+    // called here regardless so [consumeLaunchPayload] below has a chance
+    // to actually resolve once it IS set up.
+    await FcmService.init();
+    _pendingLaunchPayload =
+        await LocalNotifications.consumeLaunchPayload() ??
+        await FcmService.consumeLaunchPayload();
   } catch (e, st) {
     debugPrint(
       'NotificationBootstrap.init failed, continuing without it: $e\n$st',

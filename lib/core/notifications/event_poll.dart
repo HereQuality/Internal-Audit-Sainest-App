@@ -2,7 +2,9 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../../models/audit_model.dart';
 import '../constants/api_constants.dart';
+import '../utils/formatters.dart';
 import 'local_notifications.dart';
 import 'notification_navigation.dart';
 import 'notification_prefs.dart';
@@ -52,6 +54,18 @@ Future<Map<String, dynamic>?> _getJson(String path, String token) async {
 
 DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
 
+/// "`title` — `location` · starts/due `date`" — the same "title — due
+/// `date`" idiom overdue_poll.dart's own showOverdueNc body already uses,
+/// extended with location (when known) since a bare title alone doesn't
+/// say WHERE — unlike every audit card in the app itself (audit_agenda
+/// .dart's own location row) — and two audits can share a title (e.g. a
+/// recurring "Monthly Check") at different sites.
+String _eventBody(String title, String location, String verb, DateTime? date) {
+  final when = date == null ? null : '$verb ${Formatters.date(date)}';
+  final parts = [if (location.isNotEmpty) location, ?when];
+  return parts.isEmpty ? title : '$title — ${parts.join(' · ')}';
+}
+
 Future<void> _pollAudits(String token) async {
   final body = await _getJson(ApiConstants.myAudits, token);
   if (body == null) return;
@@ -84,6 +98,16 @@ Future<void> _pollAudits(String token) async {
     final id = audit['_id']?.toString();
     if (id == null) continue;
     final title = audit['title']?.toString() ?? 'Audit';
+    // Only .location is used from this — see AuditModel.fromJson's own
+    // null-safe field-by-field parsing, so a partial/odd payload shape
+    // just degrades to an empty string rather than throwing mid-poll.
+    final location = AuditModel.fromJson(audit).location;
+    final scheduledDate = DateTime.tryParse(
+      audit['scheduledDate']?.toString() ?? '',
+    );
+    final endDate = DateTime.tryParse(
+      audit['scheduledEndDate']?.toString() ?? '',
+    );
 
     if (!seenIds.contains(id)) {
       newSeenIds.add(id);
@@ -91,7 +115,7 @@ Future<void> _pollAudits(String token) async {
         await LocalNotifications.showAuditAssigned(
           id: 'assigned:$id'.hashCode & 0x7fffffff,
           title: 'New audit assigned',
-          body: title,
+          body: _eventBody(title, location, 'starts', scheduledDate),
           payload: encodeNotificationPayload(
             type: 'audit_local',
             referenceId: id,
@@ -104,46 +128,43 @@ Future<void> _pollAudits(String token) async {
     if (status == 'Completed' || status == 'Draft' || status == 'Skipped')
       continue;
 
-    final scheduledDate = DateTime.tryParse(
-      audit['scheduledDate']?.toString() ?? '',
-    );
-    final endDate = DateTime.tryParse(
-      audit['scheduledEndDate']?.toString() ?? '',
-    );
-
-    if (baselineSeeded &&
-        startOn &&
-        scheduledDate != null &&
-        !today.isBefore(_dayOnly(scheduledDate))) {
+    // Dedup bookkeeping (newNotifiedDates) always runs once a date
+    // qualifies, regardless of baselineSeeded/the toggle — otherwise a
+    // key that was skipped while baselineSeeded was still false (or while
+    // the toggle was off) never gets recorded, and the very next poll
+    // treats every already-qualifying audit as newly-due all at once
+    // (the backlog-dump bug this comment used to have).
+    if (scheduledDate != null && !today.isBefore(_dayOnly(scheduledDate))) {
       final key = '$id:start';
       if (!notifiedDates.contains(key)) {
-        await LocalNotifications.showAuditDateReminder(
-          id: key.hashCode & 0x7fffffff,
-          title: 'Audit starting',
-          body: title,
-          payload: encodeNotificationPayload(
-            type: 'audit_local',
-            referenceId: id,
-          ),
-        );
+        if (baselineSeeded && startOn) {
+          await LocalNotifications.showAuditDateReminder(
+            id: key.hashCode & 0x7fffffff,
+            title: 'Audit starting',
+            body: _eventBody(title, location, 'starts', scheduledDate),
+            payload: encodeNotificationPayload(
+              type: 'audit_local',
+              referenceId: id,
+            ),
+          );
+        }
         newNotifiedDates.add(key);
       }
     }
-    if (baselineSeeded &&
-        endOn &&
-        endDate != null &&
-        !today.isBefore(_dayOnly(endDate))) {
+    if (endDate != null && !today.isBefore(_dayOnly(endDate))) {
       final key = '$id:end';
       if (!notifiedDates.contains(key)) {
-        await LocalNotifications.showAuditDateReminder(
-          id: key.hashCode & 0x7fffffff,
-          title: 'Audit due',
-          body: title,
-          payload: encodeNotificationPayload(
-            type: 'audit_local',
-            referenceId: id,
-          ),
-        );
+        if (baselineSeeded && endOn) {
+          await LocalNotifications.showAuditDateReminder(
+            id: key.hashCode & 0x7fffffff,
+            title: 'Audit due',
+            body: _eventBody(title, location, 'due', endDate),
+            payload: encodeNotificationPayload(
+              type: 'audit_local',
+              referenceId: id,
+            ),
+          );
+        }
         newNotifiedDates.add(key);
       }
     }

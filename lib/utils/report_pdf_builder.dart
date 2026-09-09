@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
@@ -23,8 +24,9 @@ import 'report_sections.dart';
 /// same document:
 ///
 ///   header card (+ score ring) → stat tiles / "audit in progress" banner
-///   → final auditor remark(s) → "Audit Index & Score Summary" table
-///   → "Detailed Audit Findings" (group banners + per-checkpoint cards)
+///   → final auditor remark(s) → Parameter Score / Location-wise Score
+///   charts → "Audit Index & Score Summary" table → "Detailed Audit
+///   Findings" (group banners + per-checkpoint cards)
 ///
 /// Colors, type sizes and labels come straight from the web's shared
 /// drawing layer (client/src/utils/pdfWriter.js's `C` palette and
@@ -33,16 +35,21 @@ import 'report_sections.dart';
 /// silently drifting apart the way the previous mobile-only layout had.
 ///
 /// Two deliberate differences from the web, both structural rather than
-/// cosmetic:
+/// cosmetic (see [_barChart] and [_indexTableRows] for the full rationale
+/// of each):
 ///
-///  • No radar chart. The web captures its rendered Recharts SVG with
-///    html2canvas and embeds the bitmap; there's no chart on the mobile
-///    report screen to capture, and hand-drawing one wouldn't be the same
-///    picture. Every number the chart summarizes is in the index table.
-///  • No repeated column header when the index table spans pages. jsPDF
-///    draws rows against a manual cursor (so the web re-runs its header
-///    draw after each break); this builds widgets and lets pw.MultiPage
-///    paginate, and the `pdf` package's Table has no repeat-header hook.
+///  • The two report charts are always the bar layout, never the
+///    radar/spider one the web shows for a handful of audit TYPES that
+///    opt into it — this report spec doesn't carry audit.auditType, and
+///    every number the spider draws is the same one the bar layout shows.
+///    Drawn as real vector bars (a pw.Stack of positioned Containers/Text),
+///    not a captured bitmap — this screen has no on-screen chart DOM node
+///    to screenshot the way the web's html2canvas capture does.
+///  • The index table's column header can reappear at the top of every
+///    location's own row block, not just after a genuine page break —
+///    the `pdf` package's Table has no colspan, so the full-width
+///    location/SUBTOTAL/FINAL SCORE bands force one small repeat-header
+///    Table per location rather than one Table for the whole thing.
 ///
 /// The NC response thread this used to render is intentionally GONE — the
 /// web dropped it on purpose (see exportAuditReportToPdf.js's own note: a
@@ -293,23 +300,67 @@ Future<(String?, String?)> _fetchCompanyInfo() async {
 // either fetch function's own try/catch below. So a byte stream this
 // package's decoder can't handle — confirmed in practice against a real
 // company logo: a lossless-VP8L WebP the `image` package's WebP decoder
-// throws a RangeError on — used to sail straight past "fetched OK,
-// wrapped in a MemoryImage" and then blow up doc.save() itself, which
-// reports_screen.dart's caller can only see as the whole report failing
-// to generate, with no indication an image was the cause.
+// (pinned at 4.3.0, per pubspec.yaml) throws a RangeError on — used to
+// sail straight past "fetched OK, wrapped in a MemoryImage" and then blow
+// up doc.save() itself, which reports_screen.dart's caller can only see
+// as the whole report failing to generate, with no indication an image
+// was the cause. Every logo hits this same decoder: uploadToCloudinary
+// (server/controllers/company.controller.js) always stores a logo as
+// `format: "webp"`, and Cloudinary's own "auto:good" encoder picks
+// lossless VP8L for a logo's typical flat colors + transparency.
 //
-// Decoding it HERE instead, synchronously, inside the same try/catch as
-// the fetch, forces that same failure to happen at fetch time — where it
-// already has a well-defined "treat as failed" fallback — instead of at
-// render time, where the only fallback left is the whole document
-// throwing. package:image is already resolved transitively via pdf (see
-// pubspec.yaml's own note), so calling its decoder ourselves and
-// re-wrapping only the bytes it actually accepted costs one redundant
-// decode per image against the alternative of a report that won't
-// generate at all.
-pw.MemoryImage? _decodeIfSupported(Uint8List bytes) {
-  final decoded = img.decodeImage(bytes);
-  return decoded == null ? null : pw.MemoryImage(bytes);
+// Rather than pre-decode-and-swallow the exception (which only turns a
+// crash into a MISSING logo — decodeImage() still failed, there's nothing
+// to hand pw.MemoryImage), every webp is routed around package:image's
+// WebP decoder entirely and decoded via Flutter's own Skia-backed one
+// (dart:ui) instead — the same one Image.network/the OS image picker
+// already rely on elsewhere in the app, with full WebP coverage — then
+// re-encoded to PNG bytes so both the immediate fetch-time check below
+// and doc.save()'s later paint-time decode (still package:image, just now
+// handed a PNG it has no trouble with) succeed. Every other format
+// (JPEG/PNG evidence photos, effectively never webp) keeps using
+// package:image directly and unmodified, both because it already works
+// for them and to avoid inflating a many-photo report's file size by
+// re-encoding every JPEG as lossless PNG.
+bool _looksLikeWebp(Uint8List bytes) =>
+    bytes.length >= 12 &&
+    // "RIFF" container magic (bytes 0-3; bytes 4-7 are a file-size field)…
+    bytes[0] == 0x52 &&
+    bytes[1] == 0x49 &&
+    bytes[2] == 0x46 &&
+    bytes[3] == 0x46 &&
+    // …holding a "WEBP" payload (bytes 8-11).
+    bytes[8] == 0x57 &&
+    bytes[9] == 0x45 &&
+    bytes[10] == 0x42 &&
+    bytes[11] == 0x50;
+
+Future<pw.MemoryImage?> _decodeIfSupported(Uint8List bytes) async {
+  if (!_looksLikeWebp(bytes)) {
+    try {
+      if (img.decodeImage(bytes) != null) return pw.MemoryImage(bytes);
+    } catch (_) {
+      // fall through to the Skia decode below
+    }
+  }
+  // pw.MemoryImage does NOT decode eagerly — it just wraps the raw bytes,
+  // and only actually decodes them the first time the document is
+  // PAINTED (pw.Image -> ImageProvider.resolve -> PdfImage.file ->
+  // package:image's own decodeImage), deep inside doc.save(). Re-encoding
+  // to PNG here, up front, is what keeps that later decode — which still
+  // goes through the same unreliable package:image WebP path this
+  // function exists to route around — from ever seeing the original webp
+  // bytes at all.
+  try {
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    final png = await frame.image.toByteData(format: ui.ImageByteFormat.png);
+    frame.image.dispose();
+    codec.dispose();
+    return png == null ? null : pw.MemoryImage(png.buffer.asUint8List());
+  } catch (_) {
+    return null;
+  }
 }
 
 // Best-effort fetch of the logo image itself, same null-on-failure
@@ -321,7 +372,7 @@ Future<pw.MemoryImage?> _fetchCompanyLogoImage(String? url) async {
   try {
     final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 20));
     if (res.statusCode != 200) return null;
-    return _decodeIfSupported(res.bodyBytes);
+    return await _decodeIfSupported(res.bodyBytes);
   } catch (_) {
     return null;
   }
@@ -333,7 +384,7 @@ Future<Map<String, pw.MemoryImage?>> _fetchImages(Set<String> urls) async {
       try {
         final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 20));
         if (res.statusCode != 200) return MapEntry<String, pw.MemoryImage?>(url, null);
-        return MapEntry<String, pw.MemoryImage?>(url, _decodeIfSupported(res.bodyBytes));
+        return MapEntry<String, pw.MemoryImage?>(url, await _decodeIfSupported(res.bodyBytes));
       } catch (_) {
         // Bad URL, network blip, or an image format the pdf package can't
         // decode — degrade to a placeholder box rather than failing the
@@ -506,6 +557,8 @@ Future<Uint8List> _render(_ReportSpec spec) async {
   final scoreColor = _scoreColor(overallPct);
 
   final hasRemark = spec.finalAuditorRemark != null || (spec.zoneRemarks?.isNotEmpty ?? false);
+  final paramChartData = _parameterChartData(spec.sections);
+  final locationChartData = _locationChartData(spec.sections, spec.scoringSystem);
 
   doc.addPage(
     pw.MultiPage(
@@ -520,13 +573,22 @@ Future<Uint8List> _render(_ReportSpec spec) async {
           _partialBanner(),
         pw.SizedBox(height: 14),
         if (hasRemark) ...[_finalRemark(spec), pw.SizedBox(height: 14)],
+        if (paramChartData.isNotEmpty) ...[
+          _chartCard('Parameter Score', _barChart(paramChartData)),
+          pw.SizedBox(height: 14),
+        ],
+        if (locationChartData.isNotEmpty) ...[
+          _chartCard(
+            'Location-wise Score',
+            _barChart(locationChartData, referenceValue: overallPct?.toDouble(), referenceColor: scoreColor),
+          ),
+          pw.SizedBox(height: 14),
+        ],
         ..._headingGluedToFirst(_sectionHeading('Audit Index & Score Summary'), 10, _indexTableRows(spec)),
         pw.SizedBox(height: 14),
-        ..._headingGluedToFirst(
-          _sectionHeading('Detailed Audit Findings'),
-          10,
-          [for (final section in spec.sections) ..._findingsForSection(section, spec, images)],
-        ),
+        ..._headingGluedToFirst(_sectionHeading('Detailed Audit Findings'), 10, [
+          for (final section in spec.sections) ..._findingsForSection(section, spec, images),
+        ]),
       ],
     ),
   );
@@ -552,7 +614,11 @@ List<pw.Widget> _headingGluedToFirst(pw.Widget heading, double gap, List<pw.Widg
     pw.Inseparable(
       child: pw.Column(
         crossAxisAlignment: pw.CrossAxisAlignment.start,
-        children: [heading, pw.SizedBox(height: gap), body.first],
+        children: [
+          heading,
+          pw.SizedBox(height: gap),
+          body.first,
+        ],
       ),
     ),
     ...body.skip(1),
@@ -621,7 +687,38 @@ pw.Widget _headerCard(
   int? overallPct,
   PdfColor scoreColor,
 ) {
-  final fieldsText = spec.headerFields.map((f) => '${f.$1.toUpperCase()}: ${f.$2}').join('     ');
+  // A non-breaking space (String.fromCharCode(160), never a plain " ")
+  // glues every label's own words together, and glues the label to the
+  // colon right after it -- the pdf package wraps a pw.Text on ANY plain
+  // space, so a two-word label like "End Date" could otherwise break
+  // mid-label ("...END" / "DATE: 03 Sep 2026") whenever the line-width
+  // limit happened to fall between the two words. A value's OWN spaces
+  // (e.g. a long Auditor list of several names) are left as normal,
+  // breakable spaces on purpose -- that list still needs to wrap freely
+  // between names, just never mid-label. Mirrors the same fix in the
+  // web export, client/src/utils/exportAuditReportToPdf.js's own
+  // drawHeaderCard.
+  final nbsp = String.fromCharCode(160);
+  String fieldChunk((String, String) f) => '${f.$1.toUpperCase().replaceAll(RegExp(r'\s+'), nbsp)}:$nbsp${f.$2}';
+
+  // Start Date and End Date read as a pair — same rule the web's own
+  // drawHeaderCard applies (glue them into one chunk so they don't land
+  // on two separate wrapped lines with nothing to visually connect them).
+  // The web has to hand-measure whether the glued pair fits before
+  // committing to it (jsPDF has no flex/wrap layout of its own); pw.Wrap
+  // does that same "does this chunk fit the current line, else start a
+  // new one" natively, so an oversized pair just reflows onto its own
+  // line automatically, no measurement needed.
+  final fieldChunks = <String>[];
+  final fields = spec.headerFields;
+  for (var i = 0; i < fields.length; i++) {
+    if (fields[i].$1 == 'Start Date' && i + 1 < fields.length && fields[i + 1].$1 == 'End Date') {
+      fieldChunks.add('${fieldChunk(fields[i])}$nbsp$nbsp$nbsp${fieldChunk(fields[i + 1])}');
+      i++;
+    } else {
+      fieldChunks.add(fieldChunk(fields[i]));
+    }
+  }
 
   return pw.Inseparable(
     child: pw.Container(
@@ -657,7 +754,13 @@ pw.Widget _headerCard(
                   ),
                 ],
                 pw.SizedBox(height: 11),
-                pw.Text(fieldsText, style: const pw.TextStyle(fontSize: 8, color: _C.slate, lineSpacing: 3.5)),
+                pw.Wrap(
+                  spacing: 14,
+                  runSpacing: 4,
+                  children: [
+                    for (final c in fieldChunks) pw.Text(c, style: const pw.TextStyle(fontSize: 8, color: _C.ink)),
+                  ],
+                ),
               ],
             ),
           ),
@@ -796,11 +899,271 @@ pw.Widget _finalRemark(_ReportSpec spec) {
   );
 }
 
+// ── Report charts — Parameter Score / Location-wise Score ───────────────
+// Dart port of AuditFullReport.jsx's buildParameterAverageData /
+// buildLocationScoreData (same "average per LOCATION, then average those
+// per-location numbers" / "sum-then-divide per section" rules the
+// on-screen report and the web's own PDF/Word downloads already use) —
+// drawn as real vector bars rather than a captured bitmap, since this
+// screen has no on-screen chart DOM node to screenshot the way the web's
+// html2canvas capture does.
+//
+// Always the bar layout, never the radar/spider one the web shows for a
+// handful of audit TYPES that opt into it (AuditTypeMaster.jsx's
+// parameterChartType) — this report spec doesn't carry audit.auditType,
+// and every number a spider draws is the exact same one the bar layout
+// below shows, so this still covers every audit's data, just always as
+// bars.
+const _chartBarColor = PdfColor.fromInt(0xFF2A78D6); // web's CHART_COLOR
+const _horizontalBarThreshold = 10;
+
+double? _leafRatio(ParameterNode leaf, double? auditMaxScore) {
+  if (leaf.findingType == null) return null;
+  if (leaf.findingType == 'Strong Compliance' || leaf.findingType == 'Compliance') return 1;
+  final max = leafMax(leaf, auditMaxScore);
+  return ((leaf.score ?? 0) / max).clamp(0.0, 1.0);
+}
+
+List<(String, int)> _parameterChartData(List<_SectionSpec> sections) {
+  final axisNames = <String>[];
+  final seen = <String>{};
+  for (final section in sections) {
+    for (final top in section.tree) {
+      if (seen.add(top.name)) axisNames.add(top.name);
+    }
+  }
+  final out = <(String, int)>[];
+  for (final axisName in axisNames) {
+    final perLocationAverages = <double>[];
+    for (final section in sections) {
+      ParameterNode? top;
+      for (final n in section.tree) {
+        if (n.name == axisName) {
+          top = n;
+          break;
+        }
+      }
+      if (top == null) continue;
+      final ratios = collectScoredLeaves([
+        top,
+      ]).map((l) => _leafRatio(l, section.maxScore)).whereType<double>().toList();
+      if (ratios.isNotEmpty) perLocationAverages.add(ratios.reduce((a, b) => a + b) / ratios.length);
+    }
+    if (perLocationAverages.isEmpty) continue;
+    final avg = perLocationAverages.reduce((a, b) => a + b) / perLocationAverages.length;
+    out.add((axisName, (avg * 100).round()));
+  }
+  return out;
+}
+
+List<(String, int)> _locationChartData(List<_SectionSpec> sections, String scoringSystem) {
+  final out = <(String, int)>[];
+  for (var i = 0; i < sections.length; i++) {
+    final section = sections[i];
+    final leaves = collectScoredLeaves(section.tree);
+    if (leaves.isEmpty) continue;
+    final pct = percentageOf(sumAchievedMax(leaves, scoringSystem, section.maxScore));
+    if (pct != null) out.add((section.label.isNotEmpty ? section.label : 'Location ${i + 1}', pct));
+  }
+  return out;
+}
+
+pw.Widget _chartCard(String title, pw.Widget chart) => pw.Inseparable(
+  child: pw.Container(
+    width: double.infinity,
+    padding: const pw.EdgeInsets.fromLTRB(12, 10, 12, 14),
+    decoration: pw.BoxDecoration(
+      border: pw.Border.all(color: _C.border, width: 1),
+      borderRadius: pw.BorderRadius.circular(10),
+    ),
+    child: pw.Column(
+      crossAxisAlignment: pw.CrossAxisAlignment.start,
+      children: [
+        pw.Text(
+          title.toUpperCase(),
+          style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: _C.slate),
+        ),
+        pw.SizedBox(height: 10),
+        chart,
+      ],
+    ),
+  ),
+);
+
+pw.Widget _chartLabel(String text, {bool bold = false, double size = 7.5, PdfColor color = _C.slate}) => pw.Text(
+  text,
+  maxLines: 2,
+  textAlign: pw.TextAlign.center,
+  overflow: pw.TextOverflow.clip,
+  style: pw.TextStyle(fontSize: size, fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal, color: color),
+);
+
+// Single-series 0-100% bar chart — one bar per category, an optional
+// dashed reference line, and (past _horizontalBarThreshold categories, or
+// long names past 5) a horizontal/list layout instead of vertical
+// columns — same "too many/too long labels" switch ScoreBarChart makes
+// on the web, just without the diagonal-rotated-label middle ground a
+// canvas-free widget tree can't easily draw.
+pw.Widget _barChart(
+  List<(String label, int value)> data, {
+  double? referenceValue,
+  PdfColor referenceColor = _chartBarColor,
+}) {
+  final width = _contentWidth - 24;
+  final longest = data.fold<int>(0, (m, d) => math.max(m, d.$1.length));
+  final horizontal = data.length > _horizontalBarThreshold || (data.length > 5 && longest > 16);
+  final refPct = referenceValue == null ? null : referenceValue.clamp(0, 100) / 100;
+
+  if (horizontal) {
+    const rowH = 22.0;
+    final height = data.length * rowH;
+    final labelW = math.min(150.0, math.max(60.0, longest * 4.3 + 10));
+    const valueW = 32.0;
+    final plotW = width - labelW - valueW - 8;
+    return pw.SizedBox(
+      width: width,
+      height: height,
+      child: pw.Stack(
+        children: [
+          for (var i = 0; i < data.length; i++) ...[
+            pw.Positioned(
+              left: 0,
+              top: i * rowH,
+              child: pw.SizedBox(
+                width: labelW,
+                height: rowH,
+                child: pw.Container(alignment: pw.Alignment.centerLeft, child: _chartLabel(data[i].$1)),
+              ),
+            ),
+            pw.Positioned(
+              left: labelW,
+              top: i * rowH + rowH / 2 - 5,
+              child: pw.Container(
+                width: math.max(2.0, plotW * data[i].$2.clamp(0, 100) / 100),
+                height: 10,
+                decoration: const pw.BoxDecoration(
+                  color: _chartBarColor,
+                  borderRadius: pw.BorderRadius.all(pw.Radius.circular(2)),
+                ),
+              ),
+            ),
+            pw.Positioned(
+              left: labelW + plotW * data[i].$2.clamp(0, 100) / 100 + 4,
+              top: i * rowH,
+              child: pw.SizedBox(
+                width: valueW,
+                height: rowH,
+                child: pw.Container(
+                  alignment: pw.Alignment.centerLeft,
+                  child: _chartLabel('${data[i].$2}%', bold: true, color: _C.ink),
+                ),
+              ),
+            ),
+          ],
+          if (refPct != null)
+            pw.Positioned(
+              left: labelW + plotW * refPct,
+              top: 0,
+              child: pw.Container(
+                width: 0,
+                height: height,
+                decoration: pw.BoxDecoration(
+                  border: pw.Border(
+                    left: pw.BorderSide(color: referenceColor, width: 1.4, style: pw.BorderStyle.dashed),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  const maxBarH = 88.0;
+  const valueH = 12.0;
+  const labelH = 20.0;
+  const gap1 = 3.0, gap2 = 4.0, colGap = 6.0;
+  final baselineY = valueH + gap1 + maxBarH;
+  final totalH = baselineY + gap2 + labelH;
+  final colW = (width - (data.length - 1) * colGap) / data.length;
+
+  return pw.SizedBox(
+    width: width,
+    height: totalH,
+    child: pw.Stack(
+      children: [
+        if (refPct != null)
+          pw.Positioned(
+            left: 0,
+            top: baselineY - maxBarH * refPct,
+            child: pw.Container(
+              width: width,
+              height: 0,
+              decoration: pw.BoxDecoration(
+                border: pw.Border(
+                  top: pw.BorderSide(color: referenceColor, width: 1.4, style: pw.BorderStyle.dashed),
+                ),
+              ),
+            ),
+          ),
+        for (var i = 0; i < data.length; i++)
+          ...(() {
+            final x = i * (colW + colGap);
+            final barH = math.max(2.0, maxBarH * data[i].$2.clamp(0, 100) / 100);
+            return [
+              pw.Positioned(
+                left: x,
+                top: baselineY - barH - gap1 - valueH,
+                child: pw.SizedBox(
+                  width: colW,
+                  height: valueH,
+                  child: pw.Container(
+                    alignment: pw.Alignment.center,
+                    child: _chartLabel('${data[i].$2}%', bold: true, color: _C.ink),
+                  ),
+                ),
+              ),
+              pw.Positioned(
+                left: x,
+                top: baselineY - barH,
+                child: pw.Container(
+                  width: colW,
+                  height: barH,
+                  decoration: const pw.BoxDecoration(
+                    color: _chartBarColor,
+                    borderRadius: pw.BorderRadius.vertical(top: pw.Radius.circular(3)),
+                  ),
+                ),
+              ),
+              pw.Positioned(
+                left: x,
+                top: baselineY + gap2,
+                child: pw.SizedBox(
+                  width: colW,
+                  height: labelH,
+                  child: pw.Container(alignment: pw.Alignment.center, child: _chartLabel(data[i].$1)),
+                ),
+              ),
+            ];
+          })(),
+      ],
+    ),
+  );
+}
+
 // ── Audit Index & Score Summary ─────────────────────────────────────────
-// Emitted as a flat list of 20pt row widgets rather than one pw.Table, so
-// pw.MultiPage can break between any two rows AND so the full-width
-// section / subtotal / FINAL SCORE bands can span every column (a Table
-// row has no colspan). Column widths mirror the web's own two layouts.
+// Header row repeats on every page a location's own row block spans
+// (pw.Table's `repeat` row + this file's own [_indexTableRows] splitting
+// the rows into one Table PER location) — the `pdf` package's Table has
+// no colspan, so the full-width location banner / SUBTOTAL / FINAL SCORE
+// bands (see [_spanRow]) can't live inside the same Table as the columned
+// rows; they stay flat widgets between one small Table per location
+// instead. The one visible difference from the web (which redraws a
+// single header only after a genuine page break, wherever in the whole
+// table it lands): here the header also reappears at the top of every
+// new location's block even when no page break happens there — a location
+// boundary always starts a fresh Table, and a fresh Table always shows
+// its own header row. Column widths mirror the web's own two layouts.
 
 class _Col {
   final String label;
@@ -829,44 +1192,45 @@ const _normalCols = [
   _Col('Total Achieved (%)', 96),
 ];
 
-pw.Widget _cellBox(_Col col, String? value, PdfColor fg, bool bold, double size) {
-  final child = pw.Container(
-    height: 20,
-    alignment: col.center ? pw.Alignment.center : pw.Alignment.centerLeft,
-    // Centered cells only need enough padding to keep neighbours apart; the
-    // web's flat 8pt each side leaves too little room for "Weightage" and a
-    // deep "1.1.1" serial once Noto Sans replaces Helvetica's narrower
-    // metrics, and they clipped mid-word.
-    padding: pw.EdgeInsets.symmetric(horizontal: col.center ? 4 : 8),
-    child: value == null
-        ? pw.SizedBox()
-        : pw.Text(
-            value,
-            maxLines: 1,
-            overflow: pw.TextOverflow.clip,
-            style: pw.TextStyle(
-              fontSize: size,
-              fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
-              color: fg,
-            ),
-          ),
-  );
-  return col.width == null ? pw.Expanded(child: child) : pw.SizedBox(width: col.width, child: child);
-}
+// Cell content only — no Expanded/SizedBox width wrapper, since a
+// pw.TableRow's cells get their width from the owning pw.Table's own
+// columnWidths (see [_indexTableRows]), not from a Row-style flex parent.
+pw.Widget _cellContent(_Col col, String? value, PdfColor fg, bool bold, double size) => pw.Container(
+  height: 20,
+  alignment: col.center ? pw.Alignment.center : pw.Alignment.centerLeft,
+  // Centered cells only need enough padding to keep neighbours apart; the
+  // web's flat 8pt each side leaves too little room for "Weightage" and a
+  // deep "1.1.1" serial once Noto Sans replaces Helvetica's narrower
+  // metrics, and they clipped mid-word.
+  padding: pw.EdgeInsets.symmetric(horizontal: col.center ? 4 : 8),
+  child: value == null
+      ? pw.SizedBox()
+      : pw.Text(
+          value,
+          maxLines: 1,
+          overflow: pw.TextOverflow.clip,
+          style: pw.TextStyle(fontSize: size, fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal, color: fg),
+        ),
+);
 
-pw.Widget _tableRow(
+pw.TableRow _tableRow(
   List<_Col> cols,
   List<String?> values, {
   PdfColor? bg,
   PdfColor fg = _C.ink,
   bool bold = false,
   double size = 8,
-}) => pw.Inseparable(
-  child: pw.Container(
-    height: 20,
-    color: bg,
-    child: pw.Row(children: [for (var i = 0; i < cols.length; i++) _cellBox(cols[i], values[i], fg, bold, size)]),
-  ),
+  // Overrides `fg` for just one column index -- the Status column
+  // carries its own finding-type color (see the leaf branch below)
+  // without every other cell in the row following along.
+  Map<int, PdfColor>? cellColors,
+  // Set on the header row only — re-shown at the top of every page THIS
+  // row's own pw.Table spans (see [_indexTableRows]).
+  bool repeat = false,
+}) => pw.TableRow(
+  repeat: repeat,
+  decoration: bg == null ? null : pw.BoxDecoration(color: bg),
+  children: [for (var i = 0; i < cols.length; i++) _cellContent(cols[i], values[i], cellColors?[i] ?? fg, bold, size)],
 );
 
 pw.Widget _spanRow(
@@ -892,9 +1256,21 @@ pw.Widget _spanRow(
 
 List<pw.Widget> _indexTableRows(_ReportSpec spec) {
   final cols = spec.isWeightage ? _weightageCols : _normalCols;
-  final rows = <pw.Widget>[
-    _tableRow(cols, cols.map((c) => c.label).toList(), bg: _C.blueDark, fg: _C.white, bold: true, size: 7.5),
-  ];
+  final columnWidths = <int, pw.TableColumnWidth>{
+    for (var i = 0; i < cols.length; i++)
+      i: cols[i].width == null ? const pw.FlexColumnWidth() : pw.FixedColumnWidth(cols[i].width!),
+  };
+  pw.TableRow headerRow() => _tableRow(
+    cols,
+    cols.map((c) => c.label).toList(),
+    bg: _C.blueDark,
+    fg: _C.white,
+    bold: true,
+    size: 7.5,
+    repeat: true,
+  );
+
+  final rows = <pw.Widget>[];
 
   // FINAL SCORE below is built from THIS accumulator, not a total handed
   // in from outside — same reason the web's own drawIndexTable computes
@@ -915,6 +1291,7 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
 
     var sectionAchieved = 0.0;
     var sectionMax = 0.0;
+    final sectionRows = <pw.TableRow>[headerRow()];
 
     void walk(ParameterNode node, String serial, int depth) {
       final leaves = collectScoredLeaves([node]);
@@ -937,7 +1314,7 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
             ? leaves.fold<double>(0, (sum, l) => sum + leafWeightage(l, section.maxScore)).round()
             : 0;
         final isTop = depth == 0;
-        rows.add(
+        sectionRows.add(
           _tableRow(
             cols,
             spec.isWeightage
@@ -967,21 +1344,30 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
       // Still rendered when not yet scored (findingType/score fall back to
       // "—") — same as the web's ReportIndexTable.jsx, so a checkpoint that
       // predates full scoring doesn't just vanish from the PDF.
-      rows.add(
+      //
+      // Same finding-type palette (and same short label) the Detailed
+      // Findings section below already colors its own status pills with —
+      // this column used to print plain black text, the one place on the
+      // page a finding's color went missing. Mirrors the identical fix in
+      // the web export's own drawIndexTable.
+      final tone = node.findingType != null ? _findingMeta[node.findingType!] : null;
+      final statusLabel = tone?.label ?? '—';
+      sectionRows.add(
         _tableRow(
           cols,
           spec.isWeightage
               ? [
                   serial,
                   name,
-                  node.findingType ?? '—',
+                  statusLabel,
                   node.score != null ? '${node.score!.round()}' : '—',
                   '${leafWeightage(node, section.maxScore).round()}',
                   am.max > 0 ? '${am.achieved.round()}/${am.max.round()}' : '—',
                   '—',
                 ]
-              : [serial, name, node.findingType ?? '—', node.score != null ? '${node.score!.round()}' : '—', '—'],
+              : [serial, name, statusLabel, node.score != null ? '${node.score!.round()}' : '—', '—'],
           bg: _C.blueBg,
+          cellColors: tone != null ? {2: tone.fg} : null,
         ),
       );
     }
@@ -991,6 +1377,8 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
       walk(node, '$i', 0);
       i++;
     }
+
+    rows.add(pw.Table(columnWidths: columnWidths, children: sectionRows));
 
     if (spec.sections.length > 1) {
       final subPct = sectionMax > 0 ? (sectionAchieved / sectionMax * 100).round() : null;
@@ -1033,10 +1421,7 @@ List<pw.Widget> _findingsForSection(_SectionSpec section, _ReportSpec spec, Map<
     nodeWidgets.addAll(_findingNode(node, '$i', 0, section, spec, images));
     i++;
   }
-  return [
-    ..._headingGluedToFirst(heading, 8, nodeWidgets),
-    pw.SizedBox(height: 6),
-  ];
+  return [..._headingGluedToFirst(heading, 8, nodeWidgets), pw.SizedBox(height: 6)];
 }
 
 /// A serial chip — the web's Writer#pill (padX 7, height = size + 6, fully
@@ -1116,107 +1501,118 @@ List<pw.Widget> _findingNode(
       ],
     );
 
-    return [
-      pw.Inseparable(
-        child: pw.Container(
-          margin: pw.EdgeInsets.only(left: indent, bottom: 8),
-          padding: pw.EdgeInsets.symmetric(horizontal: 10, vertical: isTop ? 6 : 5),
-          decoration: pw.BoxDecoration(
-            color: isTop ? _C.blueDark : _C.blueBg,
-            borderRadius: pw.BorderRadius.circular(isTop ? 10 : 6),
-          ),
-          child: pw.Row(
-            crossAxisAlignment: pw.CrossAxisAlignment.center,
-            children: [
-              pw.Expanded(
-                child: pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.start,
-                  mainAxisAlignment: pw.MainAxisAlignment.center,
-                  children: [
-                    nameRow,
-                    if (hasCounts) ...[
-                      pw.SizedBox(height: 7),
-                      pw.Row(
-                        children: [
-                          for (var i = 0; i < _findingSummaryOrder.length; i++)
-                            if (counts[i] > 0) ...[
-                              pw.Container(
-                                width: 6,
-                                height: 6,
-                                decoration: pw.BoxDecoration(color: _dotColors[i], shape: pw.BoxShape.circle),
-                              ),
-                              pw.SizedBox(width: 4),
-                              pw.Text(
-                                '${counts[i]} ${_findingMeta[_findingSummaryOrder[i]]!.label}',
-                                style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.white),
-                              ),
-                              pw.SizedBox(width: 16),
-                            ],
-                        ],
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              if (avg != null) ...[
-                pw.SizedBox(width: 8),
-                if (isTop)
-                  // AVG SCORE box — the banner's own right-hand block, a
-                  // flat stand-in for the on-screen translucent-white panel.
-                  pw.Container(
-                    width: 82,
-                    padding: const pw.EdgeInsets.symmetric(vertical: 5),
-                    decoration: pw.BoxDecoration(color: _C.bannerAccent, borderRadius: pw.BorderRadius.circular(8)),
-                    child: pw.Column(
-                      mainAxisAlignment: pw.MainAxisAlignment.center,
+    final banner = pw.Inseparable(
+      child: pw.Container(
+        margin: pw.EdgeInsets.only(left: indent, bottom: 8),
+        padding: pw.EdgeInsets.symmetric(horizontal: 10, vertical: isTop ? 6 : 5),
+        decoration: pw.BoxDecoration(
+          color: isTop ? _C.blueDark : _C.blueBg,
+          borderRadius: pw.BorderRadius.circular(isTop ? 10 : 6),
+        ),
+        child: pw.Row(
+          crossAxisAlignment: pw.CrossAxisAlignment.center,
+          children: [
+            pw.Expanded(
+              child: pw.Column(
+                crossAxisAlignment: pw.CrossAxisAlignment.start,
+                mainAxisAlignment: pw.MainAxisAlignment.center,
+                children: [
+                  nameRow,
+                  if (hasCounts) ...[
+                    pw.SizedBox(height: 7),
+                    pw.Row(
                       children: [
-                        pw.Text(
-                          'AVG SCORE',
-                          style: pw.TextStyle(fontSize: 6, fontWeight: pw.FontWeight.bold, color: _C.white),
-                        ),
-                        pw.SizedBox(height: 2),
-                        pw.Row(
-                          mainAxisAlignment: pw.MainAxisAlignment.center,
-                          crossAxisAlignment: pw.CrossAxisAlignment.end,
-                          children: [
-                            pw.Text(
-                              '$avg',
-                              style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold, color: _C.white),
+                        for (var i = 0; i < _findingSummaryOrder.length; i++)
+                          if (counts[i] > 0) ...[
+                            pw.Container(
+                              width: 6,
+                              height: 6,
+                              decoration: pw.BoxDecoration(color: _dotColors[i], shape: pw.BoxShape.circle),
                             ),
-                            pw.Text('/${_num(scale)}', style: const pw.TextStyle(fontSize: 7, color: _C.blueBg)),
+                            pw.SizedBox(width: 4),
+                            pw.Text(
+                              '${counts[i]} ${_findingMeta[_findingSummaryOrder[i]]!.label}',
+                              style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.white),
+                            ),
+                            pw.SizedBox(width: 16),
                           ],
-                        ),
-                        pw.SizedBox(height: 2),
-                        pw.Text(
-                          'Total: ${am.achieved.round()}/${am.max.round()}',
-                          style: const pw.TextStyle(fontSize: 6, color: _C.blueBg),
-                        ),
                       ],
                     ),
-                  )
-                else
-                  pw.Column(
-                    crossAxisAlignment: pw.CrossAxisAlignment.end,
+                  ],
+                ],
+              ),
+            ),
+            if (avg != null) ...[
+              pw.SizedBox(width: 8),
+              if (isTop)
+                // AVG SCORE box — the banner's own right-hand block, a
+                // flat stand-in for the on-screen translucent-white panel.
+                pw.Container(
+                  width: 82,
+                  padding: const pw.EdgeInsets.symmetric(vertical: 5),
+                  decoration: pw.BoxDecoration(color: _C.bannerAccent, borderRadius: pw.BorderRadius.circular(8)),
+                  child: pw.Column(
+                    mainAxisAlignment: pw.MainAxisAlignment.center,
                     children: [
                       pw.Text(
-                        'Avg: $avg/${_num(scale)}',
-                        style: pw.TextStyle(fontSize: 7.5, fontWeight: pw.FontWeight.bold, color: _C.blue),
+                        'AVG SCORE',
+                        style: pw.TextStyle(fontSize: 6, fontWeight: pw.FontWeight.bold, color: _C.white),
+                      ),
+                      pw.SizedBox(height: 2),
+                      pw.Row(
+                        mainAxisAlignment: pw.MainAxisAlignment.center,
+                        crossAxisAlignment: pw.CrossAxisAlignment.end,
+                        children: [
+                          pw.Text(
+                            '$avg',
+                            style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold, color: _C.white),
+                          ),
+                          pw.Text('/${_num(scale)}', style: const pw.TextStyle(fontSize: 7, color: _C.blueBg)),
+                        ],
                       ),
                       pw.SizedBox(height: 2),
                       pw.Text(
                         'Total: ${am.achieved.round()}/${am.max.round()}',
-                        style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.teal),
+                        style: const pw.TextStyle(fontSize: 6, color: _C.blueBg),
                       ),
                     ],
                   ),
-              ],
+                )
+              else
+                pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.end,
+                  children: [
+                    pw.Text(
+                      'Avg: $avg/${_num(scale)}',
+                      style: pw.TextStyle(fontSize: 7.5, fontWeight: pw.FontWeight.bold, color: _C.blue),
+                    ),
+                    pw.SizedBox(height: 2),
+                    pw.Text(
+                      'Total: ${am.achieved.round()}/${am.max.round()}',
+                      style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.teal),
+                    ),
+                  ],
+                ),
             ],
-          ),
+          ],
         ),
       ),
+    );
+    final childWidgets = <pw.Widget>[
       for (var i = 0; i < node.children.length; i++)
         ..._findingNode(node.children[i], '$serial.${i + 1}', depth + 1, section, spec, images),
     ];
+    // Glue the banner to only its first child's own first widget (e.g. a
+    // "2 Shine" banner to "2.1 Shine check 1"'s card) — the same
+    // [_headingGluedToFirst] pattern used for the section/page heading
+    // above it, for the same reason: a bare Inseparable banner with
+    // nothing glued after it is still just another block pw.MultiPage can
+    // legally break straight after, landing it alone at the bottom of a
+    // page with its first checkpoint only starting on the next one. gap:
+    // 0 since the banner's own Container margin (bottom: 8) already
+    // provides that spacing; everything after the first child stays flat
+    // and individually breakable, same as before.
+    return _headingGluedToFirst(banner, 0, childWidgets);
   }
 
   return _leafCardWidgets(node, serial, indent, section, spec, images);

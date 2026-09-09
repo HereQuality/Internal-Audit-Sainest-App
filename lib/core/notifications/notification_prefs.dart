@@ -27,9 +27,13 @@ class NotificationPrefs {
   // ── Session-scoped dedup state for the event poll (event_poll.dart) ──
   // Same idea as _notifiedIdsKey above, one bucket per event type so a
   // toggle flipped off/on later doesn't resurrect stale state from another
-  // type. All cleared on logout alongside the session, same as
-  // _notifiedIdsKey, since a different account logging in on this device
-  // shouldn't inherit "already seen" state that was never about them.
+  // type. Cleared only on an ACCOUNT CHANGE (see [setSession]), not on
+  // every logout — a different account logging in on this device
+  // shouldn't inherit "already seen" state that was never about them, but
+  // the SAME person re-authenticating (a forced logout on token expiry is
+  // common, not just an explicit Sign Out) should still see every
+  // already-acknowledged reminder stay acknowledged, not re-fire as if it
+  // were brand new.
   static const _seenAuditIdsKey = 'bg_seen_audit_ids';
   static const _auditBaselineSeededKey = 'bg_audit_baseline_seeded';
   static const _notifiedAuditDatesKey = 'bg_notified_audit_dates';
@@ -84,23 +88,38 @@ class NotificationPrefs {
     await prefs.setBool(_bgPollingEnabledKey, value);
   }
 
+  /// Writes the new session — and, only when the account logging in is
+  /// DIFFERENT from whoever was last signed in on this device, wipes every
+  /// dedup set above first. Comparing against the OUTGOING userId (still
+  /// on disk here since [clearSession] deliberately leaves it) is what
+  /// lets a same-person re-login be told apart from an actual account
+  /// switch; a first-ever login on this device (previousUserId null) has
+  /// no dedup state to wipe either way.
   static Future<void> setSession({required String token, required String userId}) async {
     final prefs = await SharedPreferences.getInstance();
+    final previousUserId = prefs.getString(_userIdKey);
+    if (previousUserId != null && previousUserId != userId) {
+      await prefs.remove(_notifiedIdsKey);
+      await prefs.remove(_seenAuditIdsKey);
+      await prefs.remove(_auditBaselineSeededKey);
+      await prefs.remove(_notifiedAuditDatesKey);
+      await prefs.remove(_seenNcIdsKey);
+      await prefs.remove(_ncBaselineSeededKey);
+      await prefs.remove(_ncLastStatusKey);
+    }
     await prefs.setString(_tokenKey, token);
     await prefs.setString(_userIdKey, userId);
   }
 
+  /// Called on logout. Deliberately clears ONLY the token — a stopped
+  /// background poll has nothing to authenticate with either way (see
+  /// background_entrypoints.dart#stopBackgroundPolling) — and leaves
+  /// userId and every dedup set above untouched, so the NEXT [setSession]
+  /// can tell whether it's the same person logging back in (keep the
+  /// dedup state) or a different account on this shared device (wipe it).
   static Future<void> clearSession() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_tokenKey);
-    await prefs.remove(_userIdKey);
-    await prefs.remove(_notifiedIdsKey);
-    await prefs.remove(_seenAuditIdsKey);
-    await prefs.remove(_auditBaselineSeededKey);
-    await prefs.remove(_notifiedAuditDatesKey);
-    await prefs.remove(_seenNcIdsKey);
-    await prefs.remove(_ncBaselineSeededKey);
-    await prefs.remove(_ncLastStatusKey);
   }
 
   static Future<String?> readToken() async => (await SharedPreferences.getInstance()).getString(_tokenKey);

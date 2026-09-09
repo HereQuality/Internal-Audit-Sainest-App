@@ -3,6 +3,13 @@ import java.io.FileInputStream
 
 plugins {
     id("com.android.application")
+    // FCM push (fcm_service.dart) — reads android/app/google-services.json
+    // (gitignored, see NOTIFICATIONS.md's "FCM push setup"); this plugin
+    // is what generates the resources firebase_core/firebase_messaging
+    // read at runtime from it. A build with the file missing fails loudly
+    // at Gradle sync, not silently — see that same doc section before
+    // touching this if the file is ever absent again.
+    id("com.google.gms.google-services")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }

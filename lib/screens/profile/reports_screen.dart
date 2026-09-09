@@ -62,15 +62,16 @@ class ReportsScreen extends StatefulWidget {
 
 // Same list (and same "fetch once, filter locally" reasoning) as
 // my_audits_screen.dart's own _statusFilters — kept as its own copy since
-// that one is file-private, not because the values should ever drift
-// apart.
-const _statusFilters = [
-  'All',
-  'Not Started',
-  'In Progress',
-  'Completed',
-  'Draft',
-];
+// that one is file-private. Deliberately WITHOUT 'Draft', unlike that
+// copy: Reports is "download a report", and a Draft-status audit (which,
+// per AuditDetailModel.isInstant's own doc comment, is also where every
+// Instant Audit lives for its whole build-and-score life, not just
+// genuinely-unstarted ones) has no finished report to hand out — a filter
+// chip whose result is either nothing or a half-built one doesn't belong
+// on this screen the way it does on My Audits' own "what do I still have
+// to work on" list. Still reachable via 'All' if one somehow shows up
+// here, just not surfaced as its own one-tap chip.
+const _statusFilters = ['All', 'Not Started', 'In Progress', 'Completed'];
 
 class _ReportsScreenState extends State<ReportsScreen> {
   // Which row's PDF is currently generating — gates that one row's download

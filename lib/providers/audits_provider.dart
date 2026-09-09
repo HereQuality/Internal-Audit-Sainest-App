@@ -444,7 +444,21 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     reportsError = null;
     notifyListeners();
     try {
-      final res = await _dio.get(ApiConstants.myAudits);
+      final res = await _dio.get(
+        ApiConstants.myAudits,
+        // Always self only — per this section's own doc comment above.
+        // Can't reuse `filterParams`: it deliberately sends NO employeeIds
+        // for Team scope, which resolveScopedEmployeeIds (server) reads as
+        // "self + whole downstream hierarchy" — for a SuperAdmin/
+        // full-access role, no scope at ALL — the exact opposite of what a
+        // personal Reports list is for. Omitting this was a real bug: a
+        // manager's Reports screen was silently pooling in every
+        // subordinate's audits too, and a SuperAdmin's showed the entire
+        // org's.
+        queryParameters: selfEmployeeId != null
+            ? {'employeeIds': selfEmployeeId}
+            : null,
+      );
       final list = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
