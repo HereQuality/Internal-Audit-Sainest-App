@@ -45,15 +45,20 @@ void main() async {
   // without this try/catch was a silent crash at launch with no UI at all,
   // notifications being the only thing lost by skipping it.
   try {
-    await NotificationBootstrap.init();
+    await NotificationBootstrap.init().timeout(const Duration(seconds: 5));
     // Own try/catch internally (Firebase project not set up yet degrades
     // to "no push", never a crash — see FcmService's own doc comment) —
     // called here regardless so [consumeLaunchPayload] below has a chance
     // to actually resolve once it IS set up.
-    await FcmService.init();
+    await FcmService.init().timeout(const Duration(seconds: 5));
+    // Timeouts guard against a hung platform-channel reply (seen on iOS
+    // with flutter_local_notifications' getNotificationAppLaunchDetails
+    // under the newer implicit-engine registration) — without them, an
+    // unresolved await here blocks runApp() forever: no crash, no error,
+    // just the native launch screen staying up indefinitely.
     _pendingLaunchPayload =
-        await LocalNotifications.consumeLaunchPayload() ??
-        await FcmService.consumeLaunchPayload();
+        await LocalNotifications.consumeLaunchPayload().timeout(const Duration(seconds: 3)) ??
+        await FcmService.consumeLaunchPayload().timeout(const Duration(seconds: 3));
   } catch (e, st) {
     debugPrint(
       'NotificationBootstrap.init failed, continuing without it: $e\n$st',
