@@ -4,26 +4,34 @@ import 'package:flutter/foundation.dart';
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
+import '../core/network/socket_service.dart';
 import '../models/announcement_status.dart';
 
-/// Foreground-only poll for Announcement Mode (see
-/// server/models/AnnouncementMode.js and the web app's
-/// hooks/useAnnouncement.jsx counterpart this mirrors) — same
-/// no-socket-listener reasoning as MaintenanceProvider, which this is a
-/// near-duplicate of: SocketService only connects post-login, so wiring a
-/// "announcement:update" listener here before that would silently never
-/// attach.
+/// Live-updated via the same "announcement:update" socket push the web
+/// app uses (see server/controllers/announcement.controller.js's
+/// `io.emit` and hooks/useAnnouncement.jsx) — near-duplicate of
+/// MaintenanceProvider, see that file for why the fallback poll below can
+/// now be long instead of short.
 class AnnouncementProvider extends ChangeNotifier {
   AnnouncementStatus status = AnnouncementStatus.empty;
   bool loaded = false;
 
   Timer? _timer;
-  static const _pollInterval = Duration(seconds: 30);
+  static const _pollInterval = Duration(minutes: 5);
 
   Future<void> bootstrap() async {
+    SocketService.instance.on('announcement:update', _onSocketUpdate);
     await refreshNow();
     _timer?.cancel();
     _timer = Timer.periodic(_pollInterval, (_) => refreshNow());
+  }
+
+  void _onSocketUpdate(dynamic payload) {
+    if (payload is Map) {
+      status = AnnouncementStatus.fromJson(Map<String, dynamic>.from(payload));
+      loaded = true;
+      notifyListeners();
+    }
   }
 
   Future<void> refreshNow() async {

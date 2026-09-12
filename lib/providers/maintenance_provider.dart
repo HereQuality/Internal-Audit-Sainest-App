@@ -4,35 +4,38 @@ import 'package:flutter/foundation.dart';
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
+import '../core/network/socket_service.dart';
 import '../models/maintenance_status.dart';
 
-/// Foreground-only poll for the site-wide maintenance kill-switch +
-/// scheduled-maintenance announcement (see server/models/MaintenanceMode.js
-/// and the web app's hooks/useMaintenance.jsx for the counterpart this
-/// mirrors). A plain Timer.periodic is enough here — unlike the overdue-NC
-/// background poll (core/notifications/), this only ever needs to matter
-/// while the app is actually open in the foreground; see NOTIFICATIONS.md
-/// for why that heavier AlarmManager/foreground-service pipeline exists
-/// and why this one deliberately doesn't need any of it.
-///
-/// No socket push for this one (unlike the web app's instant
-/// "maintenance:update" listener) — SocketService.instance.connect() only
-/// happens once AuthProvider finishes logging in, and registering a
-/// listener here before that connection exists would silently never
-/// attach (SocketService.on is a no-op until `_socket` is non-null, with
-/// no queueing). The poll interval below is short enough that this isn't
-/// a meaningful gap.
+/// Live-updated via the same "maintenance:update" socket push the web app
+/// uses (see server/controllers/maintenance.controller.js's `io.emit` and
+/// the web app's hooks/useMaintenance.jsx counterpart this mirrors).
+/// SocketService now queues a listener registered before login and
+/// replays it once connect() actually creates the socket, so this no
+/// longer needs a short poll to cover that ordering gap — Timer.periodic
+/// below is just the same fallback role the web hook's refetchInterval
+/// plays for a visitor whose socket isn't connected (offline tablet,
+/// dropped connection, pre-login screen with no push yet at all).
 class MaintenanceProvider extends ChangeNotifier {
   MaintenanceStatus status = MaintenanceStatus.empty;
   bool loaded = false;
 
   Timer? _timer;
-  static const _pollInterval = Duration(seconds: 30);
+  static const _pollInterval = Duration(minutes: 5);
 
   Future<void> bootstrap() async {
+    SocketService.instance.on('maintenance:update', _onSocketUpdate);
     await refreshNow();
     _timer?.cancel();
     _timer = Timer.periodic(_pollInterval, (_) => refreshNow());
+  }
+
+  void _onSocketUpdate(dynamic payload) {
+    if (payload is Map) {
+      status = MaintenanceStatus.fromJson(Map<String, dynamic>.from(payload));
+      loaded = true;
+      notifyListeners();
+    }
   }
 
   Future<void> refreshNow() async {
