@@ -61,6 +61,12 @@ dependencies:
   firebase_core: ^3.8.0
   firebase_messaging: ^15.1.6
 
+  # Force-update gate (lib/providers/app_update_provider.dart) — reads the
+  # installed build's own version to compare against the server's minimum,
+  # and opens the Play Store/App Store listing from the block screen.
+  package_info_plus: ^8.1.2
+  url_launcher: ^6.3.1
+
   # Reports screen (profile) — builds and shares a completed audit's full
   # report as a PDF, mirroring client/src/pages/AuditFullReport.jsx.
   pdf: ^3.11.1
