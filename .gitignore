@@ -51,3 +51,6 @@ app.*.map.json
 /android/app/google-services.json
 /ios/Runner/GoogleService-Info.plist
 
+# Release signing (keystore path + passwords) — never commit.
+/android/key.properties
+
