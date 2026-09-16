@@ -1,11 +1,21 @@
-/// API base URL — points directly at the production backend. No
-/// --dart-define/environment override; this app always talks to one
-/// server.
+/// API base URL — points at the dev backend by default. Every real build
+/// (debug or release, on a device or in the store) still gets exactly this
+/// same server with zero extra flags, so nothing changes for the normal
+/// workflow. The one override below exists ONLY for pointing a local
+/// `flutter run` at a developer's own machine while testing a
+/// not-yet-deployed server change (e.g. App Update) — pass
+/// `--dart-define=API_BASE_URL=http://localhost:5001/api/v1` (iOS
+/// Simulator reaches the host's `localhost` directly; an Android emulator
+/// needs `http://10.0.2.2:5001/api/v1` instead, since `localhost` there
+/// means the emulator itself).
 class ApiConstants {
   ApiConstants._();
 
-//   static const String baseUrl = 'https://audit.hqepl.com/api/v1';
-  static const String baseUrl = 'https://devaudit.hqepl.com/api/v1';
+//   static const String prodUrl = 'https://audit.hqepl.com/api/v1';
+  static const String baseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'https://devaudit.hqepl.com/api/v1',
+  );
 
   /// Socket.io connects to the server root, not the /api/v1 REST prefix.
   static String get socketUrl {
@@ -122,6 +132,11 @@ class ApiConstants {
   // Announcement mode — public, no auth required (see server/routes/
   // announcement.routes.js). AnnouncementProvider polls this.
   static const announcementStatus = '/announcement/status';
+
+  // Force-update gate — public, no auth required (see server/routes/
+  // appUpdate.routes.js). AppUpdateProvider reads this before login even
+  // resolves, same reasoning as maintenanceStatus above.
+  static const appUpdateStatus = '/app-update/status';
 
   // Global company config — the report PDF's header line, matching the
   // web Full Report's own `useCompany()` (companies.api.js#getCompanyDetails).

@@ -12,6 +12,15 @@ class SocketService {
 
   io.Socket? _socket;
 
+  // Listeners registered while no socket exists yet — e.g. Maintenance/
+  // AnnouncementProvider attach at app cold-start, before login, so
+  // `connect()` hasn't run and `_socket` is still null. Previously `on()`
+  // silently dropped those (a no-op), forcing those two providers to fall
+  // back to polling alone. Kept (not consumed) across calls so it's
+  // replayed on every `connect()` — i.e. every login, including a
+  // re-login after logout on a kiosk device that's shared across shifts.
+  final List<MapEntry<String, void Function(dynamic)>> _pending = [];
+
   bool get isConnected => _socket?.connected ?? false;
 
   void connect(String token) {
@@ -23,16 +32,26 @@ class SocketService {
           .disableAutoConnect()
           .build(),
     );
+    for (final entry in _pending) {
+      _socket!.on(entry.key, entry.value);
+    }
     _socket!.connect();
     _socket!.onConnect((_) => _socket!.emit('join', token));
   }
 
   void on(String event, void Function(dynamic data) handler) {
-    _socket?.on(event, handler);
+    if (_socket != null) {
+      _socket!.on(event, handler);
+    } else {
+      _pending.add(MapEntry(event, handler));
+    }
   }
 
   void off(String event, [void Function(dynamic data)? handler]) {
     _socket?.off(event, handler);
+    _pending.removeWhere(
+      (entry) => entry.key == event && (handler == null || entry.value == handler),
+    );
   }
 
   void joinTicket(String ticketId) => _socket?.emit('join_ticket', ticketId);

@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import 'core/constants/api_constants.dart';
 import 'core/notifications/fcm_service.dart';
 import 'core/notifications/local_notifications.dart';
 import 'core/notifications/notification_bootstrap.dart';
@@ -8,6 +10,7 @@ import 'core/notifications/notification_navigation.dart';
 import 'core/theme/app_theme.dart';
 import 'providers/announcement_provider.dart';
 import 'providers/app_mode_provider.dart';
+import 'providers/app_update_provider.dart';
 import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/dashboard_provider.dart';
@@ -22,6 +25,7 @@ import 'screens/auth/login_screen.dart';
 import 'screens/root/app_shell.dart';
 import 'screens/root/maintenance_block_screen.dart';
 import 'screens/root/role_picker_screen.dart';
+import 'screens/root/update_required_screen.dart';
 import 'widgets/app_loading.dart';
 import 'widgets/maintenance/maintenance_announcement_host.dart';
 
@@ -77,6 +81,7 @@ class InternalAuditApp extends StatelessWidget {
         ChangeNotifierProvider(create: (_) => AuthProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => AppModeProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => ThemeProvider()..bootstrap()),
+        ChangeNotifierProvider(create: (_) => AppUpdateProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => MaintenanceProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => AnnouncementProvider()..bootstrap()),
         ChangeNotifierProvider(create: (_) => DashboardProvider()),
@@ -101,6 +106,43 @@ class InternalAuditApp extends StatelessWidget {
           // screen's own BuildContext.
           navigatorKey: notificationNavigatorKey,
           home: const _RootGate(),
+          // Debug-only — every screen (login, Update Required, the app
+          // itself) gets this same tiny strip showing which server the app
+          // is actually talking to. Exists purely because "why isn't the
+          // change I made on the web admin page showing up" turned out
+          // repeatedly to be "this build is still pointed at the remote
+          // dev server, not the local one" (see ApiConstants.baseUrl's own
+          // doc comment on the --dart-define override) — this makes that
+          // instantly visible instead of guessable. `kDebugMode` keeps it
+          // out of release builds entirely, zero risk of a real user ever
+          // seeing it.
+          builder: kDebugMode
+              ? (context, child) => Stack(
+                    children: [
+                      ?child,
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: SafeArea(
+                          top: false,
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                            color: Colors.black87,
+                            child: Text(
+                              'API: ${ApiConstants.baseUrl}',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(color: Colors.amberAccent, fontSize: 10),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  )
+              : null,
         ),
       ),
     );
@@ -114,7 +156,7 @@ class _RootGate extends StatefulWidget {
   State<_RootGate> createState() => _RootGateState();
 }
 
-class _RootGateState extends State<_RootGate> {
+class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
   // Consuming _pendingLaunchPayload is one-shot — a rebuild triggered by
   // anything else (theme change, a later logout/login) must not re-fire
   // the same cold-start navigation a second time.
@@ -132,11 +174,62 @@ class _RootGateState extends State<_RootGate> {
   // logout, not on every rebuild while already on the login screen (a
   // maintenance-status poll, a theme change).
   bool _wasAuthenticated = false;
+  // Same edge-only pop-to-root shape as the maintenance gate below, for
+  // the force-update gate.
+  bool _wasUpdateBlocked = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Same pattern as settings_screen.dart's own permission-status refresh —
+  // whoever is sitting on the pre-login/Update-Required screen has no
+  // socket yet (SocketService only connects post-login), so an admin
+  // toggling Force Update off/on elsewhere never reaches them live. Without
+  // this they'd only find out on the next 30s background poll (see
+  // AppUpdateProvider's own `_pollInterval`) or a full app restart. Coming
+  // back from the home-screen/app-switcher (locking the phone and
+  // unlocking it, or switching apps and back) is the moment a real person
+  // actually re-opens their attention to this screen, so re-checking right
+  // then is what makes "the admin already fixed it" resolve itself instead
+  // of needing an explicit "Check again" tap.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      context.read<AppUpdateProvider>().refreshNow();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final auth = context.watch<AuthProvider>();
     final appMode = context.watch<AppModeProvider>();
+
+    // Force-update gate — checked before EVERYTHING else, including
+    // login: an old build may not even be able to talk to a changed API
+    // contract, so unlike the maintenance gate below (which only applies
+    // once authenticated) this can't wait for a session to resolve first.
+    // No role bypass either — see AppUpdateProvider's own doc comment.
+    final appUpdate = context.watch<AppUpdateProvider>();
+    final updateBlocked = appUpdate.isForceUpdateRequired;
+    if (updateBlocked && !_wasUpdateBlocked) {
+      // Same reasoning as the maintenance gate's own pop-to-root: a no-op
+      // if there's no pushed route yet (e.g. still on the login screen),
+      // but pops back to root if this fires while several screens deep.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
+      });
+    }
+    _wasUpdateBlocked = updateBlocked;
+    if (updateBlocked) return const UpdateRequiredScreen();
 
     switch (auth.status) {
       case AuthStatus.unknown:
