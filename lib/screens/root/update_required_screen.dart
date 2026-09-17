@@ -1,23 +1,10 @@
-import 'dart:io' show Platform;
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/constants/store_links.dart';
 import '../../core/theme/app_colors.dart';
 import '../../providers/app_update_provider.dart';
-
-/// Android's Play Store package name (android/app/build.gradle.kts's own
-/// `applicationId`) — used to deep-link straight to this app's listing.
-const _androidPackageId = 'com.hqepl.audit360';
-
-/// Apple's numeric App Store id for this app (ios/Runner.xcodeproj's own
-/// `PRODUCT_BUNDLE_IDENTIFIER` is "com.hqepl.internalaudit", but Apple's
-/// store URL needs the numeric listing id, not the bundle id, and that
-/// only exists once the app has actually been submitted/published). Fill
-/// this in once the iOS listing exists — see the fallback below for what
-/// happens while it's still blank.
-const _iosAppStoreId = '';
 
 /// Full-screen, unavoidable block shown in place of the ENTIRE app (see
 /// main.dart's _RootGate) whenever AppUpdateProvider.isForceUpdateRequired
@@ -43,15 +30,7 @@ class _UpdateRequiredScreenState extends State<UpdateRequiredScreen> {
   }
 
   Future<void> _openStore() async {
-    final Uri? uri;
-    if (Platform.isAndroid) {
-      uri = Uri.parse('https://play.google.com/store/apps/details?id=$_androidPackageId');
-    } else if (Platform.isIOS && _iosAppStoreId.isNotEmpty) {
-      uri = Uri.parse('https://apps.apple.com/app/id$_iosAppStoreId');
-    } else {
-      uri = null;
-    }
-
+    final uri = StoreLinks.appStoreUri();
     if (uri == null) return;
 
     setState(() => _opening = true);
@@ -71,7 +50,7 @@ class _UpdateRequiredScreenState extends State<UpdateRequiredScreen> {
     final scheme = Theme.of(context).colorScheme;
     final provider = context.watch<AppUpdateProvider>();
     final status = provider.status;
-    final canOpenStore = Platform.isAndroid || (Platform.isIOS && _iosAppStoreId.isNotEmpty);
+    final canOpenStore = StoreLinks.hasStoreLink;
     final installedVersion = provider.installedVersion;
 
     return Scaffold(
@@ -162,9 +141,9 @@ class _UpdateRequiredScreenState extends State<UpdateRequiredScreen> {
                       )
                     else
                       // No store link configured for this platform yet
-                      // (see _iosAppStoreId above) — still tell the person
-                      // something actionable instead of a dead-looking
-                      // screen with only "Check again" on it.
+                      // (see StoreLinks.iosAppStoreId) — still tell the
+                      // person something actionable instead of a
+                      // dead-looking screen with only "Check again" on it.
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                         decoration: BoxDecoration(

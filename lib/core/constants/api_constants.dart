@@ -1,11 +1,21 @@
-/// API base URL. Exactly one of the two lines below must be uncommented:
-/// keep the dev line active while testing, and switch to the prod line
-/// before making a release build.
+/// API base URL — points at the dev backend by default. Every real build
+/// (debug or release, on a device or in the store) still gets exactly this
+/// same server with zero extra flags, so nothing changes for the normal
+/// workflow. The one override below exists ONLY for pointing a local
+/// `flutter run` at a developer's own machine while testing a
+/// not-yet-deployed server change (e.g. App Update) — pass
+/// `--dart-define=API_BASE_URL=http://localhost:5001/api/v1` (iOS
+/// Simulator reaches the host's `localhost` directly; an Android emulator
+/// needs `http://10.0.2.2:5001/api/v1` instead, since `localhost` there
+/// means the emulator itself).
 class ApiConstants {
   ApiConstants._();
 
-  static const String baseUrl = 'https://devaudit.hqepl.com/api/v1';
-  // static const String baseUrl = 'https://audit.hqepl.com/api/v1';
+//   static const String prodUrl = 'https://audit.hqepl.com/api/v1';
+  static const String baseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'https://devaudit.hqepl.com/api/v1',
+  );
 
   /// Socket.io connects to the server root, not the /api/v1 REST prefix.
   static String get socketUrl {

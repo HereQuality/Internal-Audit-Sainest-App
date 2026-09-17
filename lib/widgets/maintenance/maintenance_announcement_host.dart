@@ -19,6 +19,13 @@ import 'maintenance_announcement_dialog.dart';
 /// (it's the more operationally important one); the announcement dialog
 /// only opens once the maintenance one has been awaited (dismissed, or
 /// there was nothing to show in the first place).
+///
+/// The soft-update banner is a SEPARATE wrapper (see
+/// widgets/app_update/soft_update_overlay.dart), applied by _RootGate
+/// around both this host AND LoginScreen — unlike these two popups, that
+/// nudge doesn't need a session to be useful and has no SuperAdmin bypass,
+/// so it doesn't belong inside a host that's skipped for SuperAdmin/never
+/// mounted pre-login.
 class MaintenanceAnnouncementHost extends StatefulWidget {
   final Widget child;
   const MaintenanceAnnouncementHost({super.key, required this.child});

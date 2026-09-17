@@ -38,6 +38,18 @@ class AppUpdateProvider extends ChangeNotifier {
   String? _installedVersion;
   String? get installedVersion => _installedVersion;
 
+  // Per-SESSION only, deliberately NOT persisted to disk — see
+  // [isSoftUpdateAvailable]/[dismissSoftUpdate] below. This provider is
+  // created once per app PROCESS (main.dart's root MultiProvider) and
+  // lives for as long as the process does, so backgrounding the app (home
+  // button, app switcher, screen lock) keeps this same instance and this
+  // flag alive — dismiss sticks through that. A genuine cold start (swiped
+  // away from recents, force-quit, device reboot) creates a brand new
+  // instance with this back at false, so the nudge reappears on next open
+  // if the update condition still holds. That's intentional: "not now"
+  // should hold for the rest of THIS session, not forever.
+  bool _softUpdateDismissed = false;
+
   Timer? _timer;
   static const _pollInterval = Duration(seconds: 30);
 
@@ -118,6 +130,31 @@ class AppUpdateProvider extends ChangeNotifier {
     final minVersion = status.minVersion;
     if (minVersion.isEmpty) return false;
     return _compareVersions(_installedVersion!, minVersion) < 0;
+  }
+
+  // Separate, NON-blocking nudge (see SoftUpdateBanner/SoftUpdateOverlay) —
+  // deliberately does NOT gate on `status.isActive` the way
+  // isForceUpdateRequired does, since that switch only governs the
+  // force-update block; a newer build being merely *available* is
+  // independent of whether the old one has been declared unusable. Instead
+  // this fires purely off `status.latestVersion` being ahead of what's
+  // installed, and is dismissible for the rest of THIS app session only
+  // (see [_softUpdateDismissed] above) — reappears on the next full app
+  // relaunch if the update still hasn't been installed. Never blocks
+  // navigation — unlike the force-update gate, nothing here ever replaces
+  // the app's normal screens.
+  bool get isSoftUpdateAvailable {
+    if (!loaded || _installedVersion == null) return false;
+    if (!Platform.isAndroid && !Platform.isIOS) return false;
+    if (_softUpdateDismissed) return false;
+    final latestVersion = status.latestVersion;
+    if (latestVersion.isEmpty) return false;
+    return _compareVersions(_installedVersion!, latestVersion) < 0;
+  }
+
+  void dismissSoftUpdate() {
+    _softUpdateDismissed = true;
+    notifyListeners();
   }
 
   @override

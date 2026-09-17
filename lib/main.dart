@@ -27,6 +27,7 @@ import 'screens/root/maintenance_block_screen.dart';
 import 'screens/root/role_picker_screen.dart';
 import 'screens/root/update_required_screen.dart';
 import 'widgets/app_loading.dart';
+import 'widgets/app_update/soft_update_overlay.dart';
 import 'widgets/maintenance/maintenance_announcement_host.dart';
 
 // Set once, before runApp, if the app process was NOT already running and
@@ -253,7 +254,7 @@ class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
             context.read<FilterOptionsProvider>().resetForLogout();
           });
         }
-        return const LoginScreen();
+        return const SoftUpdateOverlay(child: LoginScreen());
       case AuthStatus.authenticated:
         _wasAuthenticated = true;
         if (!appMode.loaded) return const Scaffold(body: AppLoading());
@@ -338,8 +339,13 @@ class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
         final content = appMode.mode == null ? const RolePickerScreen() : const AppShell();
         // The once-a-day scheduled-maintenance popup only makes sense for
         // people who'd actually be blocked by it later — skip it for
-        // SuperAdmin, who set the schedule themselves.
-        return isSuperAdmin ? content : MaintenanceAnnouncementHost(child: content);
+        // SuperAdmin, who set the schedule themselves. SoftUpdateOverlay
+        // wraps this UNCONDITIONALLY (outside the isSuperAdmin ternary) —
+        // it has no role bypass, same reasoning as the force-update gate
+        // above: a SuperAdmin's device can be on an old build too.
+        return SoftUpdateOverlay(
+          child: isSuperAdmin ? content : MaintenanceAnnouncementHost(child: content),
+        );
     }
   }
 }

@@ -55,7 +55,14 @@ class DioClient {
           handler.next(options);
         },
         onError: (error, handler) async {
-          if (error.response?.statusCode == 401) {
+          // Only treat this as a session expiring — and trigger the
+          // logout flow — if the request actually carried a token. A 401
+          // on a request that had none (e.g. FcmService.unregisterToken
+          // firing from within _forceLogout itself, after the token was
+          // already cleared) is expected, not a new logout signal; treating
+          // it as one re-entered _forceLogout and looped forever.
+          final hadToken = error.requestOptions.headers['Authorization'] != null;
+          if (error.response?.statusCode == 401 && hadToken) {
             await SecureStorage.instance.clear();
             onUnauthorized?.call();
           }
