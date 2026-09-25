@@ -5,6 +5,7 @@ import '../../providers/nc_provider.dart';
 import '../../screens/audits/audit_detail_screen.dart';
 import '../../screens/nc/nc_response_screen.dart';
 import '../../screens/nc/nc_review_screen.dart';
+import '../../screens/support/ticket_detail_screen.dart';
 
 /// Global navigator access for code with no BuildContext of its own — a
 /// local-notification tap (see local_notifications.dart's
@@ -26,12 +27,14 @@ final GlobalKey<NavigatorState> notificationNavigatorKey =
 // came through, instead of two independently-maintained routing rules
 // drifting apart.
 //
-// `type` only ever needs its audit_/nc_ prefix checked below —
+// `type` only ever needs its audit_/nc_/ticket_ prefix checked below —
 // event_poll.dart/overdue_poll.dart poll raw audit/NC state directly
 // rather than a real server Notification doc, so they have no genuine
 // `type` string to pass; 'audit_local'/'nc_local' satisfy the same prefix
 // check those two client-only sources need without claiming to be one of
-// the 11 real server types.
+// the real server types. Ticket notifications are the opposite: they only
+// ever come from the server (ticket_created/ticket_reply/ticket_status/
+// ticket_forwarded), there is no local-poll counterpart.
 String encodeNotificationPayload({
   required String type,
   required String? referenceId,
@@ -56,7 +59,12 @@ String encodeNotificationPayload({
 // notification only ever ships the bare id, not the full NcModel the NC
 // screens need — see NcProvider#fetchById) before landing on whichever of
 // Respond/Review fits its current status, same split nc_list_screen.dart's
-// "against me" list already uses. Summary digests (morning_summary/
+// "against me" list already uses; ticket_* types carry the ticket's Mongo
+// id and open its chat thread, which fetches itself (TicketDetailScreen).
+// Every way a notification can be tapped — the in-app list, an OS-tray
+// (local) notification, an FCM tap, a cold start — lands here, so a ticket
+// notification opens the same screen whichever of them delivered it.
+// Summary digests (morning_summary/
 // evening_summary) and anything else unrecognized are a deliberate no-op
 // — there's no single record to land on, same as the web app's own
 // notificationRoute.js returning null for those two.
@@ -74,6 +82,10 @@ Future<void> openNotificationTarget(
     );
     return;
   }
+  if (type.startsWith('ticket_')) {
+    _openTicket(context, referenceId);
+    return;
+  }
   if (type.startsWith('nc_')) {
     final nc = await context.read<NcProvider>().fetchById(referenceId);
     if (!context.mounted || nc == null) return;
@@ -84,6 +96,31 @@ Future<void> openNotificationTarget(
             : NcReviewScreen(nc: nc),
       ),
     );
+  }
+}
+
+// TicketsProvider holds a single active ticket + socket room, so two ticket
+// screens stacked on each other would fight over it — popping the top one
+// closes the room and blanks the one beneath. A tap for a DIFFERENT ticket
+// while one is already on top therefore replaces that screen instead of
+// stacking on it, and a tap for the very ticket already on screen (the
+// thread is live, nothing to reload) does nothing.
+void _openTicket(BuildContext context, String ticketId) {
+  final navigator = Navigator.of(context);
+  // popUntil that returns true straight away pops nothing — it's just the
+  // public way to read the top route's name/arguments.
+  Route<dynamic>? top;
+  navigator.popUntil((route) {
+    top = route;
+    return true;
+  });
+  final ticketOnTop = top?.settings.name == TicketDetailScreen.routeName;
+  if (ticketOnTop && top?.settings.arguments == ticketId) return;
+  final route = TicketDetailScreen.route(ticketId);
+  if (ticketOnTop) {
+    navigator.pushReplacement(route);
+  } else {
+    navigator.push(route);
   }
 }
 

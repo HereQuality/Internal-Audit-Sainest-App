@@ -790,20 +790,24 @@ class AgendaTodaySection extends StatelessWidget {
             child: InkWell(
               onTap: onViewPast,
               borderRadius: BorderRadius.circular(8),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.arrow_upward_rounded,
-                      size: 15, color: scheme.primary),
-                  const SizedBox(width: 6),
-                  Text(
-                    'Nothing scheduled today — past audits above',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: scheme.primary,
-                          fontWeight: FontWeight.w600,
-                        ),
-                  ),
-                ],
+              // minHeight: the bare Row was a 15px-tall tap target.
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 44),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.arrow_upward_rounded,
+                        size: 15, color: scheme.primary),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Nothing scheduled today — past audits above',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: scheme.primary,
+                            fontWeight: FontWeight.w600,
+                          ),
+                    ),
+                  ],
+                ),
               ),
             ),
           )
@@ -1220,12 +1224,12 @@ class _OverduePill extends StatelessWidget {
         color: AppColors.red.withValues(alpha: 0.12),
         borderRadius: BorderRadius.circular(999),
       ),
-      child: const Text(
+      child: Text(
         'Overdue',
         style: TextStyle(
           fontSize: 11,
           fontWeight: FontWeight.w700,
-          color: AppColors.red,
+          color: AppColors.readable(context, AppColors.red),
         ),
       ),
     );
@@ -1482,10 +1486,10 @@ class AgendaPastBar extends StatelessWidget {
                   ),
                   child: Text(
                     '$overdue overdue',
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
-                      color: AppColors.red,
+                      color: AppColors.readable(context, AppColors.red),
                     ),
                   ),
                 ),

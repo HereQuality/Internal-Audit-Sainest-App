@@ -109,7 +109,17 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
   Widget build(BuildContext context) {
     final nc = _resolveNc(context.watch<NcProvider>());
     return Scaffold(
-      appBar: AppBar(title: Text('${nc.ncId} — ${nc.title}')),
+      // Two lines: the NC's title is shown nowhere else on this screen, and on
+      // one line it was cut off after ~30 characters ("NC-1 — Waste segregation bi…").
+      // softWrap is explicit because AppBar's title style defaults it to false.
+      appBar: AppBar(
+        title: Text(
+          '${nc.ncId} — ${nc.title}',
+          maxLines: 2,
+          softWrap: true,
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
       body: Column(
         children: [
           Expanded(
@@ -218,7 +228,8 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
           else if (_awaitingReview(nc))
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.all(12),
+              // + home-indicator inset, same as the action bar above.
+              padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + MediaQuery.paddingOf(context).bottom),
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
               child: Text(
                 'Waiting for the auditor to review your response.',
@@ -258,7 +269,10 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
   Widget _buildActionBar(BuildContext context, NcModel nc) {
     final scheme = Theme.of(context).colorScheme;
     return Container(
-      padding: const EdgeInsets.all(12),
+      // The bottom 12 + the home-indicator inset: this bar has no bottom
+      // navigation under it, so Reject / Approve & Close used to sit inside
+      // the safe area, on top of the iPhone home indicator.
+      padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + MediaQuery.paddingOf(context).bottom),
       decoration: BoxDecoration(
         color: scheme.surface,
         border: Border(top: BorderSide(color: scheme.outlineVariant)),
@@ -282,7 +296,7 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
                   icon: const Icon(Icons.close, size: 18),
                   label: const Text('Reject'),
                   style: OutlinedButton.styleFrom(
-                    foregroundColor: AppColors.red,
+                    foregroundColor: AppColors.readable(context, AppColors.red),
                     side: const BorderSide(color: AppColors.red),
                   ),
                 ),

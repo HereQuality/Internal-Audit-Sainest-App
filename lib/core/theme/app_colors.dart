@@ -14,6 +14,17 @@ class AppColors {
   static const blue = Color(0xFF2563EB); // blue-600
   static const slate = Color(0xFF64748B); // slate-500
 
+  /// [color] as SMALL TEXT / thin icons on the current theme's surfaces. The
+  /// 500/600-level tokens above are tuned for light backgrounds: as 11-13px
+  /// text on the dark theme's tinted pills and cards blue, red, slate and
+  /// purple measure only 2.5-3.6:1 (WCAG AA wants 4.5:1). Lightened 30%
+  /// toward white every one of them clears 4.6:1 there; the light theme gets
+  /// the exact token back.
+  static Color readable(BuildContext context, Color color) =>
+      Theme.of(context).brightness == Brightness.dark
+      ? Color.lerp(color, Colors.white, 0.3)!
+      : color;
+
   // Matches web's Components/Common/AuditStatusBadge.jsx#AUDIT_STATUS_COLORS
   // — 'Draft'/'Not Started'/'In Progress'/'Completed'/'Skipped' are the
   // only stored+derived statuses an audit ever actually has (see server/

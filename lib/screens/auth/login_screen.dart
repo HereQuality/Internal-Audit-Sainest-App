@@ -134,6 +134,10 @@ class _LoginScreenState extends State<LoginScreen> {
                             ],
                             TextFormField(
                               controller: _usernameController,
+                              // Once touched, the field re-validates as it is edited, so
+                              // "Username is required" doesn't stay under a filled field
+                              // after an earlier empty Sign In tap.
+                              autovalidateMode: AutovalidateMode.onUserInteraction,
                               textInputAction: TextInputAction.next,
                               decoration: const InputDecoration(
                                 labelText: 'Username or Office Email',
@@ -144,6 +148,7 @@ class _LoginScreenState extends State<LoginScreen> {
                             const SizedBox(height: 16),
                             TextFormField(
                               controller: _passwordController,
+                              autovalidateMode: AutovalidateMode.onUserInteraction,
                               obscureText: _obscurePassword,
                               textInputAction: TextInputAction.done,
                               onFieldSubmitted: (_) => _submit(),

@@ -309,10 +309,15 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
 
     return Padding(
       padding: EdgeInsets.only(bottom: media.viewInsets.bottom),
-      child: Container(
-        decoration: BoxDecoration(
-          color: scheme.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+      // A Material, not a decorated Container: the location checkboxes and the
+      // people rows below are ListTiles, which paint their ink on the nearest
+      // Material — under a coloured Container that ink (and Flutter's
+      // "ListTile background color or ink splashes may be invisible"
+      // assertion) is lost.
+      child: Material(
+        color: scheme.surface,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
         ),
         child: ConstrainedBox(
           constraints: BoxConstraints(maxHeight: maxSheetHeight),
@@ -771,7 +776,9 @@ class FilterButton extends StatelessWidget {
         // invisible height and push the header row out of line.
         minimumSize: const Size(0, 40),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        visualDensity: VisualDensity.compact,
+        // No VisualDensity.compact here: compact takes 8px off a button's
+        // minimum height, so the 40px floor above rendered as a 32px button
+        // (visibly shorter than the SegmentedButton beside it).
         padding: const EdgeInsets.symmetric(horizontal: 14),
         foregroundColor: scheme.onSurface,
         side: BorderSide(color: scheme.outlineVariant),

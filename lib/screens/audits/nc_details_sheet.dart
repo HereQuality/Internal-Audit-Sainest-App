@@ -2,19 +2,21 @@ import 'package:flutter/material.dart';
 
 import '../../core/utils/formatters.dart';
 import '../../models/employee_option.dart';
+import '../../models/nc_model.dart';
 
-// The server's NC_SEVERITIES also allows "Observation" (audit.controller.
-// js#scoreParameter) — deliberately not offered here, mobile only ever
-// picks between these two. Labeled "Flag" in the UI below, not
-// "Severity" — same underlying `severity` field server-side either way.
-const _ncSeverities = ['Major', 'Minor'];
+// The Flag picker offers nc_model.dart#kNcFlags (Major / Minor) only.
+// "Observation" is no longer a Flag — the server merely tolerates it on
+// legacy NCs — so it is never offered, and an existing NC that still
+// carries it is seeded as Minor (see initState). Labeled "Flag" in the UI
+// below, not "Severity" — same underlying `severity` field server-side
+// either way.
 
 /// screens/audits/nc_details_sheet.dart
 /// ───────────────────────────────────────
 /// The popup a checkpoint's "Raise NC" pick opens to collect what the
 /// server needs before it'll create the linked NC (audit.controller.js#
 /// scoreParameter): who it's against (skipped for Self Audit — always
-/// resolves to the auditor themselves), a due date, a severity, plus the
+/// resolves to the auditor themselves), a due date, a flag, plus the
 /// remark that's shared with the checkpoint's own text field. Same shape
 /// as the standalone raise_nc_sheet.dart's freeform flow, just scoped to
 /// one specific checkpoint instead of a blank NC.
@@ -36,7 +38,7 @@ enum NcSheetMode {
 
   /// Fixing a mistake on an NC that already exists (nc.controller.js#
   /// updateNC). That endpoint only ever accepts auditeeEmployeeId /
-  /// severity / targetDate — the checkpoint's remark is NOT part of the
+  /// severity (the flag) / targetDate — the checkpoint's remark is NOT part of the
   /// update, so showing the field here would imply an edit that silently
   /// went nowhere.
   edit,
@@ -153,7 +155,10 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
     final fallback = DateTime.now().add(const Duration(days: 7));
     _targetDate = widget.initialTargetDate ??
         DateTime(fallback.year, fallback.month, fallback.day);
-    _severity = widget.initialSeverity;
+    // Through flagOf so a legacy "Observation" (or missing) severity seeds
+    // as Minor: the dropdown below only has Major/Minor items, and a
+    // DropdownButtonFormField whose value matches none of them throws.
+    _severity = flagOf(widget.initialSeverity);
   }
 
   @override
@@ -244,12 +249,16 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
         : widget.employees;
     return Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      child: Container(
+      // Ink, not Container: the sheet's own Material is transparent, so a
+      // decorated Container would sit on top of the due-date row's InkWell ink.
+      child: Ink(
         decoration: BoxDecoration(
           color: scheme.surface,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
         ),
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+        // + the home-indicator inset: without it the Save button sat inside the
+        // bottom safe area, under the iPhone's home indicator.
+        padding: EdgeInsets.fromLTRB(16, 12, 16, 20 + MediaQuery.paddingOf(context).bottom),
         child: SingleChildScrollView(
           child: Form(
             key: _formKey,
@@ -302,6 +311,10 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                             ))
                         .toList(),
                     onChanged: (v) => setState(() => _auditeeEmployeeId = v),
+                    // Re-validates once the user has touched the picker, so the
+                    // "Pick who this NC is against" error clears the moment they do
+                    // (it used to stay under a correctly filled-in name).
+                    autovalidateMode: AutovalidateMode.onUserInteraction,
                     validator: (v) => v == null ? 'Pick who this NC is against' : null,
                   ),
                   if (pickable.isEmpty)
@@ -330,7 +343,7 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                 DropdownButtonFormField<String>(
                   initialValue: _severity,
                   decoration: const InputDecoration(labelText: 'Flag', prefixIcon: Icon(Icons.priority_high_outlined)),
-                  items: _ncSeverities.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                  items: kNcFlags.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
                   onChanged: (v) => setState(() => _severity = v ?? _severity),
                 ),
                 // Raise only — the checkpoint remark isn't one of the three

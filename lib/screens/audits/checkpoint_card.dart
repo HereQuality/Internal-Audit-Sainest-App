@@ -71,24 +71,17 @@ typedef UploadCheckpointPhotos = Future<String?> Function({
 typedef DeleteEvidencePhoto = Future<String?> Function(String url);
 
 /// Auditor: fix a mistake on an already-raised NC (see AuditsProvider#
-/// updateNc) — reassign who it's against, its severity/flag, or its due
-/// date. Only ever called with all three set together, because the edit
-/// mode of the NC-details sheet (nc_details_sheet.dart, opened by
-/// _openNcEditSheet below) collects them as one unit — the very same
-/// sheet, and the very same three fields, the raise-time flow already
+/// updateNc) — reassign who it's against, its flag (`severity` on the
+/// wire), or its due date. Only ever called with all three set together,
+/// because the edit mode of the NC-details sheet (nc_details_sheet.dart,
+/// opened by _openNcEditSheet below) collects them as one unit — the very
+/// same sheet, and the very same three fields, the raise-time flow already
 /// goes through. Returns an error message on failure, null on success.
 typedef UpdateNc = Future<String?> Function({
   String? auditeeEmployeeId,
   String? severity,
   DateTime? targetDate,
 });
-
-// Mirrors nc_details_sheet.dart's own _ncSeverities exactly — no
-// "Observation" there either. Kept here purely to normalise an existing
-// NC's stored severity into a value that sheet's dropdown actually has an
-// item for before seeding it (see _openNcEditSheet); a
-// DropdownButtonFormField whose value matches none of its items throws.
-const _ncEditSeverities = ['Major', 'Minor'];
 
 const _findingLabels = {
   'Strong Compliance': 'Strong',
@@ -117,21 +110,12 @@ Color _findingColor(String ft) {
   }
 }
 
-// No SeverityBadge exists yet anywhere in the app (checked lib/widgets/)
-// — a plain colored label mirrors server/utils/ncScoring.js's own
-// Major/Minor/Observation severity scale (SEVERITY_WEIGHT: 3/1/0) without
-// building out a whole new widget for one label.
-Color _severityColor(String severity) {
-  switch (severity) {
-    case 'Major':
-      return AppColors.red;
-    case 'Observation':
-      return AppColors.slate;
-    case 'Minor':
-    default:
-      return AppColors.amber;
-  }
-}
+// No Flag badge widget exists yet anywhere in the app (checked
+// lib/widgets/) — a plain colored label for the Major/Minor Flag (see
+// nc_model.dart#flagOf) without building out a whole new widget for one
+// label. Takes the already-normalised Flag, so a legacy "Observation" NC
+// shows as Minor in Minor's colour.
+Color _flagColor(String flag) => flag == 'Major' ? AppColors.red : AppColors.amber;
 
 class CheckpointCard extends StatefulWidget {
   final ParameterNode node;
@@ -189,10 +173,9 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // _openNcDetailsPopup) alongside the auditee pick, same shape as the
   // web app's ParameterScoreCard.jsx once it grows the equivalent field.
   DateTime? _targetDate;
-  // Severity for a fresh NC — same Major/Minor/Observation choice the
-  // NC-details popup collects and the web app's ParameterScoreCard.jsx
-  // already offers inline; defaults to "Minor" so it's never a second
-  // blocking field on top of the auditee pick and due date.
+  // Flag (`severity` on the wire) for a fresh NC — the same Major/Minor
+  // choice the NC-details popup collects; defaults to "Minor" so it's never
+  // a second blocking field on top of the auditee pick and due date.
   String _severity = 'Minor';
   final _remarkController = TextEditingController();
   final _scoreController = TextEditingController();
@@ -371,9 +354,10 @@ class _CheckpointCardState extends State<CheckpointCard> {
       // right behind this sheet stays where that gets changed.
       initialRemark: _remarkController.text,
       // A legacy NC can still carry "Observation", which that sheet's
-      // dropdown has no item for — falls back to the same 'Minor' default
-      // the server itself uses (server/models/NonConformance.js).
-      initialSeverity: _ncEditSeverities.contains(nc.severity) ? nc.severity : 'Minor',
+      // dropdown has no item for (a DropdownButtonFormField whose value
+      // matches none of its items throws) — flagOf reads it as 'Minor',
+      // the same way the server and web do.
+      initialSeverity: flagOf(nc.severity),
     );
     if (result == null || !mounted) {
       return;
@@ -620,7 +604,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(color: _findingColor(widget.node.findingType!).withValues(alpha: 0.12), borderRadius: BorderRadius.circular(999)),
                     child: Text(_findingLabels[widget.node.findingType] ?? widget.node.findingType!,
-                        style: TextStyle(color: _findingColor(widget.node.findingType!), fontSize: 11, fontWeight: FontWeight.w700)),
+                        style: TextStyle(color: AppColors.readable(context, _findingColor(widget.node.findingType!)), fontSize: 11, fontWeight: FontWeight.w700)),
                   ),
               ],
             ),
@@ -729,7 +713,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // ── The shared NC panel ─────────────────────────────────────────────
   // One tinted block, a badge/action header, then the facts on their own
   // labelled lines. Both interactive summaries below used to be a single
-  // Row that jammed the auditee's name, the due date AND the severity into
+  // Row that jammed the auditee's name, the due date AND the flag into
   // one Expanded Text, with a badge on one side of it and a button on the
   // other. On a 360dp phone that Text is left roughly 150dp once the
   // card's padding and the panel's own are taken out — so the name
@@ -773,6 +757,9 @@ class _CheckpointCardState extends State<CheckpointCard> {
     required bool closed,
   }) {
     final overdue = _isDueOverdue(targetDate, closed: closed);
+    // `severity` is the stored value; what's shown is always its Flag, so a
+    // legacy "Observation" (or missing) NC reads as Minor here too.
+    final flag = flagOf(severity);
     return [
       _ncFactRow(scheme, Icons.person_outline, 'Against', auditee),
       _ncFactRow(
@@ -786,7 +773,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
         // it stays legible against the dark theme's own surfaces too.
         valueColor: overdue ? scheme.error : null,
       ),
-      _ncFactRow(scheme, Icons.flag_outlined, 'Flag', severity, valueColor: _severityColor(severity)),
+      _ncFactRow(scheme, Icons.flag_outlined, 'Flag', flag, valueColor: AppColors.readable(context, _flagColor(flag))),
     ];
   }
 
@@ -883,16 +870,19 @@ class _CheckpointCardState extends State<CheckpointCard> {
           children: _findingLabels.keys.map((ft) {
             final active = _findingType == ft;
             final color = _findingColor(ft);
+            // Text/icon in the theme-readable shade (the raw token is ~3:1 on the
+            // dark theme); the fill and border keep the exact brand colour.
+            final textColor = AppColors.readable(context, color);
             return ChoiceChip(
               label: Row(mainAxisSize: MainAxisSize.min, children: [
-                Icon(_findingIcons[ft], size: 15, color: active ? color : scheme.outline),
+                Icon(_findingIcons[ft], size: 15, color: active ? textColor : scheme.outline),
                 const SizedBox(width: 4),
                 Text(_findingLabels[ft]!),
               ]),
               selected: active,
               onSelected: (_) => _selectFinding(ft),
               selectedColor: color.withValues(alpha: 0.14),
-              labelStyle: TextStyle(color: active ? color : scheme.onSurface, fontWeight: FontWeight.w600),
+              labelStyle: TextStyle(color: active ? textColor : scheme.onSurface, fontWeight: FontWeight.w600),
               side: BorderSide(color: active ? color : scheme.outlineVariant),
             );
           }).toList(),
@@ -1119,12 +1109,12 @@ class _CheckpointCardState extends State<CheckpointCard> {
       border: AppColors.red.withValues(alpha: 0.25),
       header: Row(
         children: [
-          const Icon(Icons.assignment_late_outlined, size: 15, color: AppColors.red),
+          Icon(Icons.assignment_late_outlined, size: 15, color: AppColors.readable(context, AppColors.red)),
           const SizedBox(width: 6),
-          const Expanded(
+          Expanded(
             child: Text(
               'NC details',
-              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: AppColors.red),
+              style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700, color: AppColors.readable(context, AppColors.red)),
             ),
           ),
           TextButton.icon(
@@ -1148,7 +1138,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
     );
   }
 
-  // The already-raised NC's current auditee/due-date/severity, plus an
+  // The already-raised NC's current auditee/due-date/flag, plus an
   // "Edit" affordance when this auditor is allowed to fix a mistake on it
   // (see _canEditNc) — the interactive-card equivalent of _linkedNcBlock's
   // read-only NC panel, shown right here instead since a still-in-
@@ -1207,19 +1197,25 @@ class _CheckpointCardState extends State<CheckpointCard> {
       clipBehavior: Clip.none,
       children: [
         Opacity(opacity: busy ? 0.4 : 1, child: child),
+        // Inside the corner (was -6/-6): a button hanging half outside the
+        // Stack's bounds only receives taps on its inner 12x12, and the 8px
+        // padding brings the live target to 34x34.
         Positioned(
-          top: -6,
-          right: -6,
+          top: 0,
+          right: 0,
           child: busy
-              ? const SizedBox(width: 18, height: 18, child: Padding(padding: EdgeInsets.all(2), child: CircularProgressIndicator(strokeWidth: 2)))
+              ? const SizedBox(width: 34, height: 34, child: Padding(padding: EdgeInsets.all(8), child: CircularProgressIndicator(strokeWidth: 2)))
               : InkWell(
                   onTap: onRemove,
-                  borderRadius: BorderRadius.circular(999),
-                  child: Container(
-                    width: 18,
-                    height: 18,
-                    decoration: const BoxDecoration(color: Colors.black87, shape: BoxShape.circle),
-                    child: const Icon(Icons.close, size: 12, color: Colors.white),
+                  customBorder: const CircleBorder(),
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Container(
+                      width: 18,
+                      height: 18,
+                      decoration: const BoxDecoration(color: Colors.black87, shape: BoxShape.circle),
+                      child: const Icon(Icons.close, size: 12, color: Colors.white),
+                    ),
                   ),
                 ),
         ),

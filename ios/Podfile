@@ -39,5 +39,19 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+
+    # permission_handler_apple (CocoaPods build) only compiles a permission's
+    # native code when its PERMISSION_* define is 1 (PermissionHandlerEnums.h
+    # defaults every one of them to 0). Without this, Permission.notification
+    # is an empty stub on iOS: request() never shows the OS prompt and just
+    # returns permanentlyDenied, and status reads denied forever. Re-run
+    # `pod install` after touching this.
+    if target.name == 'permission_handler_apple'
+      target.build_configurations.each do |config|
+        defs = Array(config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] || '$(inherited)')
+        defs << 'PERMISSION_NOTIFICATIONS=1' unless defs.include?('PERMISSION_NOTIFICATIONS=1')
+        config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = defs
+      end
+    end
   end
 end

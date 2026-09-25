@@ -81,15 +81,21 @@ class ProfileProvider extends ChangeNotifier {
   /// isOk/data shape web's AuthContext#updatePreferences trusts wholesale
   /// rather than reconstructing the merge client-side — the server already
   /// did the real merge, see profile.controller.js#updateOwnPreferences),
-  /// or an error message on failure. `emailNotificationTypes` only needs
-  /// to carry the one (or few) key(s) actually being toggled — the server
-  /// merges it into whatever the rest already were, it does not replace
-  /// the whole map.
+  /// or an error message on failure. Only the fields actually being changed
+  /// need to be passed — the server applies just those keys, so two devices
+  /// changing different switches at the same time don't overwrite each
+  /// other. The two per-topic maps follow the same rule: pass only the
+  /// topics being changed, and ALWAYS both channels' values for each of
+  /// them (audit_reminder has no email value). The server falls back to the
+  /// old shared setting for a channel that was never set explicitly, and
+  /// sending both is what ends that fallback for the topic.
   Future<Object?> updatePreferences({
     bool? themeMode,
     bool? showDashboardClock,
     bool? emailNotifications,
+    bool? pushNotifications,
     Map<String, bool>? emailNotificationTypes,
+    Map<String, bool>? pushNotificationTypes,
   }) async {
     try {
       final res = await _dio.put(
@@ -98,7 +104,11 @@ class ProfileProvider extends ChangeNotifier {
           if (themeMode != null) 'themeMode': themeMode ? 'dark' : 'light',
           'showDashboardClock': ?showDashboardClock,
           'emailNotifications': ?emailNotifications,
-          'emailNotificationTypes': ?emailNotificationTypes,
+          'pushNotifications': ?pushNotifications,
+          if (emailNotificationTypes != null && emailNotificationTypes.isNotEmpty)
+            'emailNotificationTypes': emailNotificationTypes,
+          if (pushNotificationTypes != null && pushNotificationTypes.isNotEmpty)
+            'pushNotificationTypes': pushNotificationTypes,
         },
       );
       return UserPreferences.fromJson(

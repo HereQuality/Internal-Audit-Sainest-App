@@ -732,11 +732,11 @@ class _StatsGrid extends StatelessWidget {
       // Smaller than before (compact:true StatCard + tighter extent) — this
       // grid is now secondary detail under the headline ScoreRow above it,
       // not the dashboard's main event.
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         mainAxisSpacing: 10,
         crossAxisSpacing: 10,
-        mainAxisExtent: 100,
+        mainAxisExtent: StatCard.compactTileExtent(context),
       ),
       itemBuilder: (context, index) {
         final c = cards[index];

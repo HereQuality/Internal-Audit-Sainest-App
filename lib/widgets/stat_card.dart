@@ -1,6 +1,17 @@
 import 'package:flutter/material.dart';
 
 class StatCard extends StatelessWidget {
+  /// Row height for the 2-column grid of compact tiles (both dashboards). It
+  /// used to be a flat 100, which is exactly what a compact tile needs at
+  /// the default text size and nothing more — so at any larger Dynamic Type
+  /// size (even iOS "Extra Extra Large") the tile's column overflowed and
+  /// the label got clipped. 40 is the fixed part (icon row + padding), 60 the
+  /// text part, which scales.
+  static double compactTileExtent(BuildContext context) {
+    final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
+    return 40 + 60 * (scale < 1 ? 1 : scale);
+  }
+
   final String label;
   final int value;
   final IconData icon;

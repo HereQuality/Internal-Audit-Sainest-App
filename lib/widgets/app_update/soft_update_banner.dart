@@ -74,7 +74,10 @@ class _SoftUpdateBannerState extends State<SoftUpdateBanner> {
                       ? status.softMessage
                       : 'Update available — v${status.latestVersion} is out',
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600),
-                  maxLines: 2,
+                  // 3, not 2: the Dismiss/Update buttons leave this column only
+                  // ~150px on a phone, so an admin-typed message was cut off after
+                  // about 45 characters.
+                  maxLines: 3,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),

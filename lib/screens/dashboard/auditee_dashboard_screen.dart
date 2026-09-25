@@ -402,11 +402,11 @@ class _AuditeeStatsGrid extends StatelessWidget {
       // Smaller than before (compact:true StatCard + tighter extent) — this
       // grid is now secondary detail under the headline ScoreRow above it,
       // matching the auditor dashboard's own _StatsGrid.
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
         crossAxisCount: 2,
         mainAxisSpacing: 10,
         crossAxisSpacing: 10,
-        mainAxisExtent: 100,
+        mainAxisExtent: StatCard.compactTileExtent(context),
       ),
       itemBuilder: (context, index) {
         final c = cards[index];

@@ -58,8 +58,14 @@ dependencies:
   flutter_timezone: ^5.1.0
   shared_preferences: ^2.3.3
   http: ^1.2.2
-  firebase_core: ^3.8.0
-  firebase_messaging: ^15.1.6
+  # firebase_messaging 15.x does all of its iOS push setup (swizzling, APNs
+  # registration, UN delegate) inside a UIApplicationDidFinishLaunching
+  # observer, which has already fired by the time this app's UIScene +
+  # implicit-engine iOS template creates the plugin — so on iOS it never
+  # registered for remote notifications at all. 16.7.0 carries the UIScene
+  # launch fixes (and needs firebase_core ^4.14.0), see NOTIFICATIONS.md.
+  firebase_core: ^4.14.0
+  firebase_messaging: ^16.7.0
 
   # Force-update gate (lib/providers/app_update_provider.dart) — reads the
   # installed build's own version to compare against the server's minimum,

@@ -4,12 +4,14 @@ import 'package:provider/provider.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
 import '../../models/ticket_model.dart';
+import '../../providers/auth_provider.dart';
 import '../../providers/tickets_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/status_badge.dart';
 import 'create_ticket_screen.dart';
 import 'ticket_detail_screen.dart';
+import 'ticket_status_badge.dart';
 
 class TicketsListScreen extends StatefulWidget {
   const TicketsListScreen({super.key});
@@ -19,17 +21,30 @@ class TicketsListScreen extends StatefulWidget {
 }
 
 class _TicketsListScreenState extends State<TicketsListScreen> {
+  // Held from initState: dispose() can't safely look a provider up through
+  // the (already deactivated) context.
+  late final TicketsProvider _tickets;
+
   @override
   void initState() {
     super.initState();
+    _tickets = context.read<TicketsProvider>();
+    _tickets.watchTicketList();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<TicketsProvider>().fetchTickets();
+      _tickets.fetchTickets();
     });
+  }
+
+  @override
+  void dispose() {
+    _tickets.unwatchTicketList();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<TicketsProvider>();
+    final currentUserId = context.watch<AuthProvider>().user?.id;
 
     return Scaffold(
       appBar: AppBar(title: const Text('Support')),
@@ -40,11 +55,11 @@ class _TicketsListScreenState extends State<TicketsListScreen> {
         icon: const Icon(Icons.add),
         label: const Text('New Ticket'),
       ),
-      body: _buildBody(context, provider),
+      body: _buildBody(context, provider, currentUserId),
     );
   }
 
-  Widget _buildBody(BuildContext context, TicketsProvider provider) {
+  Widget _buildBody(BuildContext context, TicketsProvider provider, String? currentUserId) {
     if (provider.isLoadingList && provider.tickets.isEmpty) {
       return const AppLoading();
     }
@@ -65,7 +80,7 @@ class _TicketsListScreenState extends State<TicketsListScreen> {
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 88),
         itemCount: provider.tickets.length,
         separatorBuilder: (context, index) => const SizedBox(height: 10),
-        itemBuilder: (context, index) => _TicketTile(ticket: provider.tickets[index]),
+        itemBuilder: (context, index) => _TicketTile(ticket: provider.tickets[index], viewerId: currentUserId),
       ),
     );
   }
@@ -73,8 +88,9 @@ class _TicketsListScreenState extends State<TicketsListScreen> {
 
 class _TicketTile extends StatelessWidget {
   final TicketModel ticket;
+  final String? viewerId;
 
-  const _TicketTile({required this.ticket});
+  const _TicketTile({required this.ticket, required this.viewerId});
 
   @override
   Widget build(BuildContext context) {
@@ -82,9 +98,7 @@ class _TicketTile extends StatelessWidget {
     return Card(
       clipBehavior: Clip.antiAlias,
       child: InkWell(
-        onTap: () => Navigator.of(context).push(
-          MaterialPageRoute(builder: (_) => TicketDetailScreen(ticketId: ticket.id)),
-        ),
+        onTap: () => Navigator.of(context).push(TicketDetailScreen.route(ticket.id)),
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(
@@ -98,7 +112,7 @@ class _TicketTile extends StatelessWidget {
                     Container(width: 7, height: 7, decoration: const BoxDecoration(color: AppColors.red, shape: BoxShape.circle)),
                   ],
                   const Spacer(),
-                  StatusBadge(label: ticket.status, color: AppColors.forTicketStatus(ticket.status)),
+                  TicketStatusBadge(ticket: ticket, viewerId: viewerId),
                 ],
               ),
               const SizedBox(height: 8),

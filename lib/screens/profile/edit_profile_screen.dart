@@ -159,10 +159,16 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                   right: 0,
                   child: InkWell(
                     onTap: _pickImage,
-                    child: CircleAvatar(
-                      radius: 16,
-                      backgroundColor: Theme.of(context).colorScheme.primary,
-                      child: const Icon(Icons.camera_alt, size: 16, color: Colors.white),
+                    customBorder: const CircleBorder(),
+                    // 6px of padding around the 32px badge: a 44px tap target
+                    // instead of a bare 32px one.
+                    child: Padding(
+                      padding: const EdgeInsets.all(6),
+                      child: CircleAvatar(
+                        radius: 16,
+                        backgroundColor: Theme.of(context).colorScheme.primary,
+                        child: const Icon(Icons.camera_alt, size: 16, color: Colors.white),
+                      ),
                     ),
                   ),
                 ),

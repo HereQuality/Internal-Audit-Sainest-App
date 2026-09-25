@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../core/theme/app_colors.dart';
+
 class StatusBadge extends StatelessWidget {
   final String label;
   final Color color;
@@ -16,7 +18,8 @@ class StatusBadge extends StatelessWidget {
       ),
       child: Text(
         label,
-        style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600),
+        // readable(): the raw token is only 2.5-3.6:1 on the tinted pill in dark mode.
+        style: TextStyle(color: AppColors.readable(context, color), fontSize: 12, fontWeight: FontWeight.w600),
       ),
     );
   }

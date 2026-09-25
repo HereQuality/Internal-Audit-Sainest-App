@@ -157,19 +157,19 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(Icons.warning_amber_outlined, size: 18, color: AppColors.red),
+                  Icon(Icons.warning_amber_outlined, size: 18, color: AppColors.readable(context, AppColors.red)),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('Your previous response was rejected', style: TextStyle(color: AppColors.red, fontWeight: FontWeight.w700)),
+                        Text('Your previous response was rejected', style: TextStyle(color: AppColors.readable(context, AppColors.red), fontWeight: FontWeight.w700)),
                         const SizedBox(height: 2),
-                        Text(widget.nc.verificationNote!, style: TextStyle(color: AppColors.red)),
+                        Text(widget.nc.verificationNote!, style: TextStyle(color: AppColors.readable(context, AppColors.red))),
                         const SizedBox(height: 2),
                         Text(
                           "Your last answers are pre-filled below — edit what's needed and resubmit.",
-                          style: TextStyle(color: AppColors.red, fontWeight: FontWeight.w400),
+                          style: TextStyle(color: AppColors.readable(context, AppColors.red), fontWeight: FontWeight.w400),
                         ),
                       ],
                     ),
@@ -210,12 +210,19 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
                         ),
                         child: ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.network(e.value, width: 64, height: 64, fit: BoxFit.cover)),
                       ),
+                      // Positioned at -6 put two thirds of this 18px button outside
+                      // the Stack's own bounds, where taps never reach it (a 12x12
+                      // live area). Inside the corner, with a padded 34px target.
                       Positioned(
-                        top: -6,
-                        right: -6,
+                        top: 0,
+                        right: 0,
                         child: InkWell(
                           onTap: () => setState(() => _existingPhotos.removeAt(e.key)),
-                          child: const CircleAvatar(radius: 9, backgroundColor: Colors.black87, child: Icon(Icons.close, size: 12, color: Colors.white)),
+                          customBorder: const CircleBorder(),
+                          child: const Padding(
+                            padding: EdgeInsets.all(8),
+                            child: CircleAvatar(radius: 9, backgroundColor: Colors.black87, child: Icon(Icons.close, size: 12, color: Colors.white)),
+                          ),
                         ),
                       ),
                     ],
@@ -235,11 +242,15 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
                         child: ClipRRect(borderRadius: BorderRadius.circular(8), child: Image.file(e.value, width: 64, height: 64, fit: BoxFit.cover)),
                       ),
                       Positioned(
-                        top: -6,
-                        right: -6,
+                        top: 0,
+                        right: 0,
                         child: InkWell(
                           onTap: () => setState(() => _photos.removeAt(e.key)),
-                          child: const CircleAvatar(radius: 9, backgroundColor: Colors.black87, child: Icon(Icons.close, size: 12, color: Colors.white)),
+                          customBorder: const CircleBorder(),
+                          child: const Padding(
+                            padding: EdgeInsets.all(8),
+                            child: CircleAvatar(radius: 9, backgroundColor: Colors.black87, child: Icon(Icons.close, size: 12, color: Colors.white)),
+                          ),
                         ),
                       ),
                     ],

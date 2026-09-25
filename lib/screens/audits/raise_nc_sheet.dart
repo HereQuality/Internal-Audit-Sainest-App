@@ -5,14 +5,15 @@ import '../../core/utils/formatters.dart';
 import '../../core/utils/snackbar.dart';
 import '../../core/utils/validators.dart';
 import '../../models/employee_option.dart';
+import '../../models/nc_model.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/dashboard_provider.dart';
 import '../../providers/nc_provider.dart';
 
-// Same set nc_details_sheet.dart's checkpoint-scoped flow offers — see its
-// own doc comment for why "Observation" (server-accepted, NC_SEVERITIES)
-// isn't included, and why this is labeled "Flag" below, not "Severity".
-const _ncSeverities = ['Major', 'Minor'];
+// The Flag picker below offers nc_model.dart#kNcFlags (Major / Minor) — the
+// same set nc_details_sheet.dart's checkpoint-scoped flow offers; see its
+// comment for why "Observation" isn't a Flag any more and why this is
+// labeled "Flag" below, not "Severity".
 
 Future<void> showRaiseNcSheet(
   BuildContext context, {
@@ -47,8 +48,9 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
   final _descriptionController = TextEditingController();
   DateTime? _targetDate;
   String? _auditeeEmployeeId;
-  // Defaults to "Minor" — matches models/NonConformance.js#severity's own
-  // schema default — so it's never a second field to remember to touch.
+  // The Flag (wire field `severity`). Defaults to "Minor" — matches
+  // models/NonConformance.js#severity's own schema default — so it's never a
+  // second field to remember to touch.
   String _severity = 'Minor';
   bool _isSubmitting = false;
 
@@ -114,12 +116,16 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      child: Container(
+      // Ink, not Container: the sheet's own Material is transparent, so a
+      // decorated Container would sit on top of the date row's InkWell ink.
+      child: Ink(
         decoration: BoxDecoration(
           color: scheme.surface,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
         ),
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 20),
+        // + the home-indicator inset: without it the Raise NC button sat inside
+        // the bottom safe area, under the iPhone's home indicator.
+        padding: EdgeInsets.fromLTRB(16, 12, 16, 20 + MediaQuery.paddingOf(context).bottom),
         child: SingleChildScrollView(
           child: Form(
             key: _formKey,
@@ -168,7 +174,7 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
                 DropdownButtonFormField<String>(
                   initialValue: _severity,
                   decoration: const InputDecoration(labelText: 'Flag', prefixIcon: Icon(Icons.priority_high_outlined)),
-                  items: _ncSeverities.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                  items: kNcFlags.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
                   onChanged: (v) => setState(() => _severity = v ?? _severity),
                 ),
                 if (!widget.isSelfAudit) ...[

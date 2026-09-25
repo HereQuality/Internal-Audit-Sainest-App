@@ -671,7 +671,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   /// Auditor: fix a mistake on an already-raised NC — reassign who it's
-  /// against, its severity/flag, or its due date. Server only allows this
+  /// against, its flag (`severity` on the wire), or its due date. Server only allows this
   /// for the raising auditor, and only while the NC is still "Raised"
   /// (nc.controller.js#updateNC) — passing all three every time, since
   /// this always comes from checkpoint_card.dart's edit form which

@@ -107,22 +107,33 @@ class _NotificationTile extends StatelessWidget {
           size: 20,
         ),
       ),
-      title: Text(
-        notification.title,
-        style: TextStyle(
-          fontWeight: notification.isRead ? FontWeight.w500 : FontWeight.w700,
-        ),
+      // The time sits in the title row instead of ListTile.trailing: as a
+      // trailing widget "6 minutes ago" took ~40% of a phone's width, which
+      // squeezed the message into a ~175px column that cut off the audit /
+      // location name (the part that says what the notification is about).
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              notification.title,
+              style: TextStyle(
+                fontWeight: notification.isRead ? FontWeight.w500 : FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            Formatters.relative(notification.createdAt),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.outline),
+          ),
+        ],
       ),
       subtitle: Text(
         notification.message,
-        maxLines: 2,
+        maxLines: 4,
         overflow: TextOverflow.ellipsis,
-      ),
-      trailing: Text(
-        Formatters.relative(notification.createdAt),
-        style: Theme.of(
-          context,
-        ).textTheme.bodySmall?.copyWith(color: scheme.outline),
       ),
     );
   }

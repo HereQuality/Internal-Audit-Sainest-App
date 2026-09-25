@@ -5,6 +5,7 @@ import 'package:intl/intl.dart';
 
 import '../constants/api_constants.dart';
 import '../utils/nc_timeliness.dart';
+import 'event_poll.dart' show refreshPushGate;
 import 'local_notifications.dart';
 import 'notification_navigation.dart';
 import 'notification_prefs.dart';
@@ -21,12 +22,20 @@ import 'notification_prefs.dart';
 /// AuthProvider) that assume a running app with a ChangeNotifier tree —
 /// none of that exists in a background isolate, so this reads the mirrored
 /// token straight out of NotificationPrefs and sets the header itself.
+///
+/// Like event_poll.dart, opens with the account's push-switch guard
+/// ([refreshPushGate]) — with the master Push switch or the "NC overdue"
+/// topic off nothing is shown, but overdue NCs are still recorded as handled
+/// so turning it back on later doesn't dump every NC that went overdue in
+/// the meantime.
 Future<void> pollAndNotifyOverdueNcs() async {
   final token = await NotificationPrefs.readToken();
   if (token == null || token.isEmpty)
     return; // logged out — nothing to poll for
 
   await LocalNotifications.init();
+
+  final gate = await refreshPushGate(token);
 
   final uri = Uri.parse('${ApiConstants.baseUrl}${ApiConstants.ncsMine}');
   http.Response res;
@@ -102,6 +111,13 @@ Future<void> pollAndNotifyOverdueNcs() async {
   }
 
   if (newlyOverdue.isEmpty) return;
+
+  if (!gate.allows(NotificationTypes.ncOverdue)) {
+    await NotificationPrefs.addNotifiedIds(
+      newlyOverdue.map((n) => n.ncId).toList(),
+    );
+    return;
+  }
 
   if (newlyOverdue.length == 1) {
     final one = newlyOverdue.first;

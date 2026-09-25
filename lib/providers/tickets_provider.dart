@@ -22,6 +22,14 @@ class TicketsProvider extends ChangeNotifier {
   bool isSendingReply = false;
 
   String? _joinedTicketRoom;
+  bool _watchingList = false;
+  bool _listeningForUpdates = false;
+
+  // Bumped by every detail fetch, and whenever the open ticket changes or
+  // closes — a response that comes back after any of those is stale and is
+  // dropped, so a slow reply for ticket A can never overwrite ticket B (or
+  // resurrect a ticket whose screen is already gone).
+  int _detailSeq = 0;
 
   Future<void> fetchTickets() async {
     isLoadingList = true;
@@ -71,18 +79,22 @@ class TicketsProvider extends ChangeNotifier {
   }
 
   Future<void> fetchTicketDetail(String id) async {
+    final seq = ++_detailSeq;
     isLoadingDetail = true;
     detailError = null;
     notifyListeners();
     try {
       final res = await _dio.get(ApiConstants.ticketById(id));
+      if (seq != _detailSeq) return;
       activeTicket = TicketModel.fromJson(Map<String, dynamic>.from(res.data['data']));
       unawaited(_dio.patch(ApiConstants.ticketRead(id)).then((_) {}, onError: (_) {}));
     } on DioException catch (e) {
-      detailError = extractErrorMessage(e, fallback: 'Could not load this ticket.');
+      if (seq == _detailSeq) detailError = extractErrorMessage(e, fallback: 'Could not load this ticket.');
     } finally {
-      isLoadingDetail = false;
-      notifyListeners();
+      if (seq == _detailSeq) {
+        isLoadingDetail = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -95,7 +107,9 @@ class TicketsProvider extends ChangeNotifier {
         form.files.add(MapEntry('attachments', await MultipartFile.fromFile(file.path, filename: file.path.split('/').last)));
       }
       final res = await _dio.post(ApiConstants.ticketReply(ticketId), data: form);
-      activeTicket = TicketModel.fromJson(Map<String, dynamic>.from(res.data['data']));
+      if (_joinedTicketRoom == ticketId) {
+        activeTicket = TicketModel.fromJson(Map<String, dynamic>.from(res.data['data']));
+      }
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not send your reply.');
@@ -105,49 +119,113 @@ class TicketsProvider extends ChangeNotifier {
     }
   }
 
-  void openTicketRoom(String ticketId) {
-    if (_joinedTicketRoom == ticketId) return;
-    if (_joinedTicketRoom != null) SocketService.instance.leaveTicket(_joinedTicketRoom!);
-    _joinedTicketRoom = ticketId;
-    SocketService.instance.joinTicket(ticketId);
-    SocketService.instance.on('new_message', _onNewMessage);
-    SocketService.instance.on('ticket_updated', _onTicketUpdated);
+  /// The raiser's answer to a "please confirm" request: [action] is
+  /// 'Accept' (closes the ticket) or 'Reject' (back to In Progress, with
+  /// the [reason] the raiser gave). Returns null on success — by then both
+  /// the open ticket and the list have been refreshed — else an error
+  /// message, same contract as [reply].
+  Future<String?> verifyTicket(String id, String action, {String? reason}) async {
+    try {
+      await _dio.post(
+        ApiConstants.ticketVerify(id),
+        data: {'action': action, 'reason': ?reason},
+      );
+    } on DioException catch (e) {
+      return extractErrorMessage(e, fallback: 'Could not update this ticket.');
+    }
+    // Both fetches swallow their own network errors, so a refresh that
+    // fails never reads as a failed verify — the server's ticket_updated
+    // broadcast refreshes both screens again anyway.
+    await Future.wait([fetchTicketDetail(id), fetchTickets()]);
+    return null;
   }
 
-  void closeTicketRoom() {
-    if (_joinedTicketRoom != null) {
-      SocketService.instance.leaveTicket(_joinedTicketRoom!);
-      _joinedTicketRoom = null;
+  void openTicketRoom(String ticketId) {
+    if (_joinedTicketRoom == ticketId) return;
+    _detailSeq++;
+    final previous = _joinedTicketRoom;
+    if (previous != null) {
+      // Another ticket's screen is taking over the room (a notification tap
+      // replacing the one on screen). Its message handler is already
+      // registered, and the new screen must not start on the old thread —
+      // a live message for this room would otherwise land on it.
+      SocketService.instance.leaveTicket(previous);
+      activeTicket = null;
+    } else {
+      SocketService.instance.on('new_message', _onNewMessage);
     }
+    _joinedTicketRoom = ticketId;
+    SocketService.instance.joinTicket(ticketId);
+    _syncUpdatesListener();
+  }
+
+  void closeTicketRoom(String ticketId) {
+    // A screen replaced by another ticket's is disposed AFTER the new one
+    // opened its room — by then the room is no longer this screen's to close.
+    if (_joinedTicketRoom != ticketId) return;
+    SocketService.instance.leaveTicket(ticketId);
+    _joinedTicketRoom = null;
     SocketService.instance.off('new_message', _onNewMessage);
-    SocketService.instance.off('ticket_updated', _onTicketUpdated);
+    _syncUpdatesListener();
+    _detailSeq++;
+    isLoadingDetail = false;
     activeTicket = null;
   }
 
+  /// The Support list is on screen: refetch it whenever the server says a
+  /// ticket changed, so a "please confirm" arriving while it's open shows
+  /// up without a pull-to-refresh.
+  void watchTicketList() {
+    if (_watchingList) return;
+    _watchingList = true;
+    SocketService.instance.on('refresh_unread_count', _onTicketsNudged);
+    _syncUpdatesListener();
+  }
+
+  void unwatchTicketList() {
+    if (!_watchingList) return;
+    _watchingList = false;
+    SocketService.instance.off('refresh_unread_count', _onTicketsNudged);
+    _syncUpdatesListener();
+  }
+
+  // 'ticket_updated' is wanted while either the list or a ticket room is
+  // open — one shared registration, so the two can never double-register
+  // (and double-fire) the same handler.
+  void _syncUpdatesListener() {
+    final wanted = _watchingList || _joinedTicketRoom != null;
+    if (wanted == _listeningForUpdates) return;
+    _listeningForUpdates = wanted;
+    if (wanted) {
+      SocketService.instance.on('ticket_updated', _onTicketUpdated);
+    } else {
+      SocketService.instance.off('ticket_updated', _onTicketUpdated);
+    }
+  }
+
   void _onNewMessage(dynamic data) {
-    if (activeTicket == null || data is! Map) return;
+    final current = activeTicket;
+    if (current == null || data is! Map) return;
     final message = TicketMessage.fromJson(Map<String, dynamic>.from(data));
-    activeTicket = TicketModel(
-      id: activeTicket!.id,
-      ticketId: activeTicket!.ticketId,
-      subject: activeTicket!.subject,
-      description: activeTicket!.description,
-      status: activeTicket!.status,
-      priority: activeTicket!.priority,
-      platform: activeTicket!.platform,
-      raisedById: activeTicket!.raisedById,
-      raisedByName: activeTicket!.raisedByName,
-      attachments: activeTicket!.attachments,
-      messages: [...activeTicket!.messages, message],
-      hasUnread: activeTicket!.hasUnread,
-      createdAt: activeTicket!.createdAt,
-      updatedAt: activeTicket!.updatedAt,
-    );
+    // The sender's own reply also comes back in the POST response —
+    // whichever of the two lands second must not append it again.
+    if (message.id.isNotEmpty && current.messages.any((m) => m.id == message.id)) return;
+    activeTicket = current.withMessage(message);
     notifyListeners();
   }
 
   void _onTicketUpdated(dynamic _) {
-    if (activeTicket != null) fetchTicketDetail(activeTicket!.id);
-    fetchTickets();
+    final open = activeTicket;
+    if (open != null) fetchTicketDetail(open.id);
+    _refreshListFromSocket();
+  }
+
+  void _onTicketsNudged(dynamic _) => _refreshListFromSocket();
+
+  // One server change fires several of these events back to back (e.g. a
+  // verify emits both ticket_updated and refresh_unread_count); a fetch
+  // already in flight started after the change was saved, so it is fresh.
+  void _refreshListFromSocket() {
+    if (!isLoadingList) fetchTickets();
   }
 }

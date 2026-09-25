@@ -139,27 +139,39 @@ class _AuditListSection extends StatelessWidget {
           children: [
             Icon(icon, size: 18, color: scheme.primary),
             const SizedBox(width: 6),
-            Text(
-              title,
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(width: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                color: scheme.primaryContainer.withValues(alpha: 0.5),
-                borderRadius: BorderRadius.circular(999),
+            // Expanded + a Flexible title (and no Spacer): at the larger Dynamic Type
+            // sizes title + count + "See all" no longer fit one line and this Row
+            // overflowed (yellow/black stripes, cut-off text).
+            Expanded(
+              child: Row(
+                children: [
+                  Flexible(
+                    child: Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: scheme.primaryContainer.withValues(alpha: 0.5),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      '${audits.length}',
+                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: scheme.onPrimaryContainer),
+                    ),
+                  ),
+                ],
               ),
-              child: Text(
-                '${audits.length}',
-                style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: scheme.onPrimaryContainer),
-              ),
             ),
-            const Spacer(),
             if (onSeeAll != null)
               TextButton(
                 onPressed: onSeeAll,
-                style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: Size.zero, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(48, 44), tapTargetSize: MaterialTapTargetSize.shrinkWrap),
                 child: const Text('See all', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700)),
               ),
           ],
@@ -212,7 +224,9 @@ class _AuditListCard extends StatelessWidget {
                   children: [
                     Text(
                       audit.title,
-                      maxLines: 1,
+                      // 2 lines: on one line "Cold Store Temperature Audit" was cut to
+                      // "Cold Store Temperature A…" on a 390pt phone.
+                      maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
                     ),

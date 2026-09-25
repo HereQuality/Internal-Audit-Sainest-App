@@ -65,12 +65,18 @@ class _SelectRepresentativeSheetState
       padding: EdgeInsets.only(
         bottom: MediaQuery.of(context).viewInsets.bottom,
       ),
-      child: Container(
+      // Ink, not Container: the sheet's own Material is transparent, so a
+      // decorated Container sat on top of the CheckboxListTiles' ink (Flutter's
+      // "ListTile background color or ink splashes may be invisible"
+      // assertion, and no tap feedback).
+      child: Ink(
         decoration: BoxDecoration(
           color: scheme.surface,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
         ),
-        padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+        // + the home-indicator inset: the Confirm button used to sit 12px from
+        // the bottom edge, i.e. right on top of the iPhone home indicator.
+        padding: EdgeInsets.fromLTRB(16, 20, 16, 12 + MediaQuery.paddingOf(context).bottom),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,

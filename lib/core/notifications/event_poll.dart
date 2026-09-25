@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../../models/audit_model.dart';
+import '../../models/user_model.dart';
 import '../constants/api_constants.dart';
 import '../utils/formatters.dart';
 import 'local_notifications.dart';
@@ -16,12 +17,13 @@ import 'notification_prefs.dart';
 /// app's Dio instance) pattern as overdue_poll.dart — see its own doc
 /// comment for why — called from the same background tick.
 ///
-/// Each of the 6 notification types below is independently toggle-able
-/// from the Settings screen (NotificationPrefs.keyAuditAssigned etc,
-/// readToggle default ON) — a toggle being off just skips emitting that
-/// one type, the underlying dedup/seen-state bookkeeping still runs so
-/// flipping it back on later doesn't suddenly dump every event that
-/// happened while it was off.
+/// Everything below obeys the account's push switches (Settings > Push
+/// Notifications and the per-topic Push column under "Choose what you get",
+/// the same server-side preferences the web Settings page shares) — see
+/// [refreshPushGate]. A banner is shown only when the master switch AND that
+/// event's topic are on. With one off nothing is shown for it, but the
+/// underlying dedup/seen-state bookkeeping still runs so turning it back on
+/// later doesn't suddenly dump every event that happened while it was off.
 Future<void> pollAndNotifyEvents() async {
   final token = await NotificationPrefs.readToken();
   if (token == null || token.isEmpty)
@@ -29,8 +31,31 @@ Future<void> pollAndNotifyEvents() async {
 
   await LocalNotifications.init();
 
-  await _pollAudits(token);
-  await _pollNcs(token);
+  final gate = await refreshPushGate(token);
+  await _pollAudits(token, gate);
+  await _pollNcs(token, gate);
+}
+
+/// The one guard every poll opens with: re-reads the account's push switches
+/// (the master and every per-topic value) from the server and refreshes the
+/// SharedPreferences mirror with them, so a change made on the web (or on
+/// this phone) is obeyed by the very next tick even in a background isolate
+/// that never hears the socket event. On any failure (offline, an expired
+/// token, an older server without the endpoint or without the per-topic
+/// map) the last mirrored values stand — a tick must never flip to a guess.
+/// Returns what this tick may show.
+Future<PushGate> refreshPushGate(String token) async {
+  final body = await _getJson(ApiConstants.mePreferences, token);
+  final data = body?['data'];
+  if (data is Map) {
+    final pushOn = data['pushNotifications'];
+    if (pushOn is bool) await NotificationPrefs.setPushEnabled(pushOn);
+    final types = data['pushNotificationTypes'];
+    if (types is Map) {
+      await NotificationPrefs.setPushTypes(UserPreferences.parseTypeMap(types));
+    }
+  }
+  return NotificationPrefs.readPushGate();
 }
 
 Future<Map<String, dynamic>?> _getJson(String path, String token) async {
@@ -66,20 +91,10 @@ String _eventBody(String title, String location, String verb, DateTime? date) {
   return parts.isEmpty ? title : '$title — ${parts.join(' · ')}';
 }
 
-Future<void> _pollAudits(String token) async {
+Future<void> _pollAudits(String token, PushGate gate) async {
   final body = await _getJson(ApiConstants.myAudits, token);
   if (body == null) return;
   final audits = (body['data'] as List? ?? []).whereType<Map>().toList();
-
-  final assignedOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyAuditAssigned,
-  );
-  final startOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyAuditStart,
-  );
-  final endOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyAuditEnd,
-  );
 
   // Gates the very first poll ever on this device from announcing every
   // already-assigned audit as "new" — same idea for the date reminders
@@ -89,6 +104,16 @@ Future<void> _pollAudits(String token) async {
   final seenIds = await NotificationPrefs.readSeenAuditIds();
   final notifiedDates = await NotificationPrefs.readNotifiedAuditDates();
   final today = _dayOnly(DateTime.now());
+
+  // An audit that newly shows up in /audits/mine is either brand new
+  // (audit_created) or one this person was just reassigned to
+  // (audit_reassigned) — the list can't say which, so the banner needs BOTH
+  // topics on. With either off the server's own push, which does know which
+  // it is and follows the exact switch, stays the only alert.
+  final announceAssigned =
+      gate.allows(NotificationTypes.auditCreated) &&
+      gate.allows(NotificationTypes.auditReassigned);
+  final announceReminders = gate.allows(NotificationTypes.auditReminder);
 
   final newSeenIds = <String>[];
   final newNotifiedDates = <String>[];
@@ -111,7 +136,7 @@ Future<void> _pollAudits(String token) async {
 
     if (!seenIds.contains(id)) {
       newSeenIds.add(id);
-      if (baselineSeeded && assignedOn) {
+      if (baselineSeeded && announceAssigned) {
         await LocalNotifications.showAuditAssigned(
           id: 'assigned:$id'.hashCode & 0x7fffffff,
           title: 'New audit assigned',
@@ -129,15 +154,15 @@ Future<void> _pollAudits(String token) async {
       continue;
 
     // Dedup bookkeeping (newNotifiedDates) always runs once a date
-    // qualifies, regardless of baselineSeeded/the toggle — otherwise a
-    // key that was skipped while baselineSeeded was still false (or while
-    // the toggle was off) never gets recorded, and the very next poll
+    // qualifies, regardless of baselineSeeded/the push switches — otherwise
+    // a key that was skipped while baselineSeeded was still false (or while
+    // push was off) never gets recorded, and the very next poll
     // treats every already-qualifying audit as newly-due all at once
     // (the backlog-dump bug this comment used to have).
     if (scheduledDate != null && !today.isBefore(_dayOnly(scheduledDate))) {
       final key = '$id:start';
       if (!notifiedDates.contains(key)) {
-        if (baselineSeeded && startOn) {
+        if (baselineSeeded && announceReminders) {
           await LocalNotifications.showAuditDateReminder(
             id: key.hashCode & 0x7fffffff,
             title: 'Audit starting',
@@ -154,7 +179,7 @@ Future<void> _pollAudits(String token) async {
     if (endDate != null && !today.isBefore(_dayOnly(endDate))) {
       final key = '$id:end';
       if (!notifiedDates.contains(key)) {
-        if (baselineSeeded && endOn) {
+        if (baselineSeeded && announceReminders) {
           await LocalNotifications.showAuditDateReminder(
             id: key.hashCode & 0x7fffffff,
             title: 'Audit due',
@@ -177,20 +202,10 @@ Future<void> _pollAudits(String token) async {
   if (!baselineSeeded) await NotificationPrefs.setAuditBaselineSeeded();
 }
 
-Future<void> _pollNcs(String token) async {
+Future<void> _pollNcs(String token, PushGate gate) async {
   final body = await _getJson(ApiConstants.ncsMine, token);
   if (body == null) return;
   final ncs = (body['data'] as List? ?? []).whereType<Map>().toList();
-
-  final raisedOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyNcRaised,
-  );
-  final approvedOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyNcApproved,
-  );
-  final rejectedOn = await NotificationPrefs.readToggle(
-    NotificationPrefs.keyNcRejected,
-  );
 
   final baselineSeeded = await NotificationPrefs.readNcBaselineSeeded();
   final seenIds = await NotificationPrefs.readSeenNcIds();
@@ -210,7 +225,7 @@ Future<void> _pollNcs(String token) async {
 
     if (!seenIds.contains(id)) {
       newSeenIds.add(id);
-      if (baselineSeeded && raisedOn) {
+      if (baselineSeeded && gate.allows(NotificationTypes.ncRaised)) {
         await LocalNotifications.showNewNc(
           id: 'raised:$id'.hashCode & 0x7fffffff,
           title: 'New NC raised against you',
@@ -226,26 +241,34 @@ Future<void> _pollNcs(String token) async {
       final prev = lastStatus[id];
       if (prev != null && prev != key) {
         final prevReopen = int.tryParse(prev.split('|').last) ?? 0;
-        if (status == 'Closed' && approvedOn) {
-          await LocalNotifications.showNcApproved(
-            id: 'approved:$id'.hashCode & 0x7fffffff,
-            title: 'NC response approved',
-            body: title,
-            payload: encodeNotificationPayload(
-              type: 'nc_local',
-              referenceId: id,
-            ),
-          );
-        } else if (reopenCount > prevReopen && rejectedOn) {
-          await LocalNotifications.showNcRejected(
-            id: 'rejected:$id'.hashCode & 0x7fffffff,
-            title: 'NC response rejected',
-            body: title,
-            payload: encodeNotificationPayload(
-              type: 'nc_local',
-              referenceId: id,
-            ),
-          );
+        // Nested rather than `status == 'Closed' && allowed`: an NC that was
+        // rejected AND finally approved between two ticks is an approval,
+        // and must stay quiet with approvals off instead of falling through
+        // to a "rejected" banner.
+        if (status == 'Closed') {
+          if (gate.allows(NotificationTypes.ncApproved)) {
+            await LocalNotifications.showNcApproved(
+              id: 'approved:$id'.hashCode & 0x7fffffff,
+              title: 'NC response approved',
+              body: title,
+              payload: encodeNotificationPayload(
+                type: 'nc_local',
+                referenceId: id,
+              ),
+            );
+          }
+        } else if (reopenCount > prevReopen) {
+          if (gate.allows(NotificationTypes.ncRejected)) {
+            await LocalNotifications.showNcRejected(
+              id: 'rejected:$id'.hashCode & 0x7fffffff,
+              title: 'NC response rejected',
+              body: title,
+              payload: encodeNotificationPayload(
+                type: 'nc_local',
+                referenceId: id,
+              ),
+            );
+          }
         }
       }
     }

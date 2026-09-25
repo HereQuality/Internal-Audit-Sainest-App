@@ -1,11 +1,15 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
+import '../core/notifications/fcm_service.dart';
 import '../core/notifications/local_notifications.dart';
 import '../core/notifications/notification_navigation.dart';
+import '../core/notifications/notification_prefs.dart';
 import '../models/notification_model.dart';
 
 class NotificationsProvider extends ChangeNotifier {
@@ -36,23 +40,46 @@ class NotificationsProvider extends ChangeNotifier {
         notifications = [NotificationModel.fromJson(map), ...notifications];
         unreadCount += 1;
         notifyListeners();
-        // Real-time heads-up, on top of the badge above — otherwise the
-        // only OS-level alert for this event would be up to 15 minutes
-        // later, via the background poll (event_poll.dart).
-        LocalNotifications.showLive(
-          id: (map['_id']?.toString() ?? '').hashCode & 0x7fffffff,
-          title: map['title']?.toString() ?? 'Notification',
-          body: map['message']?.toString() ?? '',
-          payload: encodeNotificationPayload(
-            type: map['type']?.toString() ?? '',
-            referenceId: map['referenceId']?.toString(),
-          ),
-        );
+        unawaited(_showLiveBanner(map));
       }
     };
     _onRefreshUnreadCount = (_) => fetchUnreadCount();
     SocketService.instance.on('new_notification', _onNewNotification!);
     SocketService.instance.on('refresh_unread_count', _onRefreshUnreadCount!);
+  }
+
+  // Real-time heads-up, on top of the badge — otherwise the only OS-level
+  // alert for this event would be up to 15 minutes later, via the
+  // background poll (event_poll.dart). Two cases stay quiet: the account's
+  // Push switch is off, or this notification's own topic is (server:
+  // preferences.pushNotifications / pushNotificationTypes[type], mirrored
+  // into SharedPreferences — a type outside the catalog answers to the
+  // master alone), and iOS once FCM is registered — there iOS already draws
+  // the server's alert push for this same event, also while the app is open,
+  // so this would be a second banner.
+  Future<void> _showLiveBanner(Map<String, dynamic> map) async {
+    if (FcmService.pushShownNatively) return;
+    try {
+      if (!await NotificationPrefs.readPushAllowed(
+        map['type']?.toString() ?? '',
+      )) {
+        return;
+      }
+      await LocalNotifications.showLive(
+        // Same id an FCM banner for this notification gets (FcmService
+        // derives it from the identical Mongo _id), so if both do show
+        // they replace each other instead of stacking.
+        id: FcmService.localNotificationId(notificationId: map['_id']?.toString()),
+        title: map['title']?.toString() ?? 'Notification',
+        body: map['message']?.toString() ?? '',
+        payload: encodeNotificationPayload(
+          type: map['type']?.toString() ?? '',
+          referenceId: map['referenceId']?.toString(),
+        ),
+      );
+    } catch (e, st) {
+      debugPrint('NotificationsProvider: live banner failed: $e\n$st');
+    }
   }
 
   void stopListening() {

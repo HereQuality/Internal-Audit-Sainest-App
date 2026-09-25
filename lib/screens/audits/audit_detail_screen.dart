@@ -104,21 +104,28 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     if (leave == true && context.mounted) Navigator.of(context).pop();
   }
 
+  // Kept from initState so dispose() below can reach the provider without a
+  // context lookup — looking a provider up through a deactivated element in
+  // dispose() is what Flutter's "Looking up a deactivated widget's ancestor
+  // is unsafe" assertion fires on every time this screen is closed.
+  late final AuditsProvider _auditsProvider;
+
   @override
   void initState() {
     super.initState();
+    _auditsProvider = context.read<AuditsProvider>();
     // See AuditsProvider#beginActiveAuditReload's own header comment — this
     // screen's very first build must never read a previous audit's
     // leftover activeAudit (a real Navigator.pop()-timing race, not just
     // theoretical) or a false "not found" before _load()'s fetch (deferred
     // to addPostFrameCallback below) has even started.
-    context.read<AuditsProvider>().beginActiveAuditReload();
+    _auditsProvider.beginActiveAuditReload();
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
   }
 
   @override
   void dispose() {
-    context.read<AuditsProvider>().clearActiveAudit();
+    _auditsProvider.clearActiveAudit();
     _newCheckpointController.dispose();
     super.dispose();
   }
@@ -732,7 +739,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
               child: Text(
                 "You're not an assigned auditor for this audit — showing read-only.",
                 style: TextStyle(
-                  color: AppColors.blue,
+                  color: AppColors.readable(context, AppColors.blue),
                   fontWeight: FontWeight.w600,
                   fontSize: 12.5,
                 ),
@@ -752,7 +759,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                     ? 'Scheduled for ${audit.scheduledDate!.day}/${audit.scheduledDate!.month}/${audit.scheduledDate!.year} — check back then.'
                     : 'This audit isn\'t open for changes yet — check back later.',
                 style: TextStyle(
-                  color: AppColors.amber,
+                  color: AppColors.readable(context, AppColors.amber),
                   fontWeight: FontWeight.w600,
                   fontSize: 12.5,
                 ),
@@ -778,7 +785,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                   Text(
                     'Select a representative auditee before you can start scoring this audit.',
                     style: TextStyle(
-                      color: AppColors.red,
+                      color: AppColors.readable(context, AppColors.red),
                       fontWeight: FontWeight.w600,
                       fontSize: 12.5,
                     ),
@@ -834,7 +841,9 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                     TextButton(
                       style: TextButton.styleFrom(
                         padding: EdgeInsets.zero,
-                        minimumSize: Size.zero,
+                        // 48x44 hit area — Size.zero made this a 44x17 target
+                        // right next to the scoring controls.
+                        minimumSize: const Size(48, 44),
                         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       ),
                       onPressed: _settingRepresentative
@@ -869,7 +878,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
             Text(
               '$openNcCount NC${openNcCount == 1 ? '' : 's'} still open',
               style: TextStyle(
-                color: AppColors.red,
+                color: AppColors.readable(context, AppColors.red),
                 fontWeight: FontWeight.w600,
                 fontSize: 12.5,
               ),

@@ -51,11 +51,23 @@ void main() async {
   // notifications being the only thing lost by skipping it.
   try {
     await NotificationBootstrap.init().timeout(const Duration(seconds: 5));
-    // Own try/catch internally (Firebase project not set up yet degrades
-    // to "no push", never a crash — see FcmService's own doc comment) —
-    // called here regardless so [consumeLaunchPayload] below has a chance
-    // to actually resolve once it IS set up.
+  } catch (e, st) {
+    debugPrint(
+      'NotificationBootstrap.init failed, continuing without it: $e\n$st',
+    );
+  }
+  // Its own try/catch, NOT part of the block above: FCM has nothing to do
+  // with the local-notification plugin, so a failed or timed-out local init
+  // (a hung iOS platform-channel reply, an OEM blocking the foreground
+  // service) must not also skip push setup for the whole launch. Firebase
+  // not being set up yet still degrades to "no push", never a crash — see
+  // FcmService's own doc comment.
+  try {
     await FcmService.init().timeout(const Duration(seconds: 5));
+  } catch (e, st) {
+    debugPrint('FcmService.init failed, continuing without push: $e\n$st');
+  }
+  try {
     // Timeouts guard against a hung platform-channel reply (seen on iOS
     // with flutter_local_notifications' getNotificationAppLaunchDetails
     // under the newer implicit-engine registration) — without them, an
@@ -65,9 +77,7 @@ void main() async {
         await LocalNotifications.consumeLaunchPayload().timeout(const Duration(seconds: 3)) ??
         await FcmService.consumeLaunchPayload().timeout(const Duration(seconds: 3));
   } catch (e, st) {
-    debugPrint(
-      'NotificationBootstrap.init failed, continuing without it: $e\n$st',
-    );
+    debugPrint('Reading the notification launch payload failed, continuing without it: $e\n$st');
   }
   runApp(const InternalAuditApp());
 }

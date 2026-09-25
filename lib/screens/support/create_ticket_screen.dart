@@ -139,15 +139,21 @@ class _CreateTicketScreenState extends State<CreateTicketScreen> {
                         borderRadius: BorderRadius.circular(10),
                         child: Image.file(_attachments[index], width: 84, height: 84, fit: BoxFit.cover),
                       ),
+                      // 8px padding around the 20px badge: a 36px tap target
+                      // instead of a bare 20px one.
                       Positioned(
-                        top: 2,
-                        right: 2,
+                        top: 0,
+                        right: 0,
                         child: InkWell(
                           onTap: () => setState(() => _attachments.removeAt(index)),
-                          child: const CircleAvatar(
-                            radius: 10,
-                            backgroundColor: Colors.black54,
-                            child: Icon(Icons.close, size: 14, color: Colors.white),
+                          customBorder: const CircleBorder(),
+                          child: const Padding(
+                            padding: EdgeInsets.all(8),
+                            child: CircleAvatar(
+                              radius: 10,
+                              backgroundColor: Colors.black54,
+                              child: Icon(Icons.close, size: 14, color: Colors.white),
+                            ),
                           ),
                         ),
                       ),

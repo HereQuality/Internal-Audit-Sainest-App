@@ -324,12 +324,15 @@ class _NcStatusFilterSheet extends StatelessWidget {
       // every other sheet in this app applies costs nothing and keeps
       // this one consistent if a future revision ever adds a search box.
       padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      child: Container(
+      // Ink, not Container: the sheet's own Material is transparent, so a
+      // decorated Container sat on top of the option rows' InkWell ripple.
+      child: Ink(
         decoration: BoxDecoration(
           color: scheme.surface,
           borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
         ),
-        padding: const EdgeInsets.fromLTRB(0, 20, 0, 12),
+        // + the home-indicator inset, so the last option isn't under it.
+        padding: EdgeInsets.fromLTRB(0, 20, 0, 12 + MediaQuery.paddingOf(context).bottom),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -669,6 +672,9 @@ class _NcCard extends StatelessWidget {
                       ],
                     ),
                   ),
+                  // Without this a long NC title ran straight into the status
+                  // badge with no gap at all.
+                  const SizedBox(width: 8),
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
@@ -704,10 +710,10 @@ class _NcCard extends StatelessWidget {
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Icon(
+                      Icon(
                         Icons.replay_outlined,
                         size: 13,
-                        color: AppColors.red,
+                        color: AppColors.readable(context, AppColors.red),
                       ),
                       const SizedBox(width: 6),
                       Expanded(
@@ -715,8 +721,8 @@ class _NcCard extends StatelessWidget {
                           'Rejected: ${nc.verificationNote}',
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: AppColors.red,
+                          style: TextStyle(
+                            color: AppColors.readable(context, AppColors.red),
                             fontSize: 12.5,
                             fontWeight: FontWeight.w600,
                           ),

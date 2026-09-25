@@ -73,14 +73,17 @@
 	     BGAppRefreshTask only, there is no BGProcessingTask code anywhere in
 	     the app or its pods, and declaring it failed App Store upload with
 	     ITMS-90771 (and invites an App Review 2.5.4 rejection).
-	     "remote-notification" IS the reliable one — required for a
-	     data-only FCM/APNs push (fcm_service.dart sends no `notification`
-	     block, only `data`) to reach didReceiveRemoteNotification while
-	     backgrounded at all; without it iOS just drops a silent push
-	     outright. Needs the Push Notifications capability + an APNs key
-	     uploaded to Firebase too — see NOTIFICATIONS.md's "FCM push setup"
-	     for the Apple Developer Program side of this, which no Info.plist
-	     edit can substitute for. -->
+	     "remote-notification" is the push one. On iOS the server sends an
+	     ALERT push (fcmPush.service.js adds a `notification` block + apns
+	     headers for iOS tokens), which iOS displays by itself even with the
+	     app force-quit — no Dart code has to run for the banner. This mode
+	     is what Firebase's push handling expects and what lets a
+	     content-available push reach the app in the background. It does
+	     NOT replace the Push Notifications capability
+	     (Runner.entitlements -> aps-environment) or the APNs key uploaded
+	     to Firebase — see NOTIFICATIONS.md's "FCM push setup" for the
+	     Apple Developer Program side, which no Info.plist edit can
+	     substitute for. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

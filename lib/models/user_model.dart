@@ -1,41 +1,78 @@
 class UserPreferences {
   final String themeMode;
   final bool showDashboardClock;
-  // Mirrors the web dashboard's own Settings > Notifications > Email
-  // Notifications switch — same server-side preferences.emailNotifications
-  // field (server/models/Employee.js / user.model.js), toggleable from
-  // either platform. Distinct from the phone's own local push-notification
-  // toggle (see SettingsScreen's "Notifications" switch, backed by
-  // NotificationPrefs — phone-only, no server field, since only the phone
-  // actually fires local notifications).
+  // The two account-level notification switches — the SAME server-side
+  // preferences.emailNotifications / preferences.pushNotifications fields
+  // (server/models/Employee.js / user.model.js) the web dashboard's
+  // Settings > Notifications card reads and writes, so flipping either one
+  // on either platform changes it for both. "Push" covers this phone AND
+  // the browser, every notification type including support tickets. A
+  // missing value reads as on, same default the server applies.
   final bool emailNotifications;
-  // Per-type breakdown of the above — same server-side preferences.
-  // emailNotificationTypes field the web dashboard's Settings page reads/
-  // writes (server/models/Employee.js). Keys match the `type` argument
-  // createNotification/notifyAssignees is called with (audit.controller.js
-  // / nc.controller.js / scheduledNotifications.js). A key missing here
-  // (never explicitly turned off) reads as on — see the `!= false` checks
-  // wherever this is consulted, same convention notification.service.js's
-  // own server-side gate uses.
+  final bool pushNotifications;
+  // The per-topic switches under those two masters, keyed by notification
+  // type ('audit_created', 'nc_rejected', ...; the full list is
+  // kNotificationTopics). A key only counts while its master is on. The
+  // server sends every key with its EFFECTIVE value; a key that is missing
+  // (an older server, a partial socket payload) reads as on — see
+  // [emailTypeOn] / [pushTypeOn] — so a payload never has to be complete.
   final Map<String, bool> emailNotificationTypes;
+  final Map<String, bool> pushNotificationTypes;
 
   const UserPreferences({
     this.themeMode = 'light',
     this.showDashboardClock = true,
     this.emailNotifications = true,
+    this.pushNotifications = true,
     this.emailNotificationTypes = const {},
+    this.pushNotificationTypes = const {},
   });
+
+  bool emailTypeOn(String type) => emailNotificationTypes[type] ?? true;
+  bool pushTypeOn(String type) => pushNotificationTypes[type] ?? true;
+
+  /// Reads a `{type: bool}` map off any decoded JSON value. Anything that is
+  /// not a boolean is dropped rather than guessed at, so a malformed entry
+  /// reads as the default (on) instead of throwing mid-parse.
+  static Map<String, bool> parseTypeMap(dynamic raw) {
+    if (raw is! Map) return const {};
+    return {
+      for (final entry in raw.entries)
+        if (entry.value is bool) entry.key.toString(): entry.value as bool,
+    };
+  }
 
   factory UserPreferences.fromJson(Map<String, dynamic>? json) {
     if (json == null) return const UserPreferences();
-    final rawTypes = json['emailNotificationTypes'];
     return UserPreferences(
       themeMode: json['themeMode']?.toString() ?? 'light',
       showDashboardClock: json['showDashboardClock'] as bool? ?? true,
       emailNotifications: json['emailNotifications'] as bool? ?? true,
-      emailNotificationTypes: rawTypes is Map
-          ? rawTypes.map((k, v) => MapEntry(k.toString(), v as bool? ?? true))
-          : const {},
+      pushNotifications: json['pushNotifications'] as bool? ?? true,
+      emailNotificationTypes: parseTypeMap(json['emailNotificationTypes']),
+      pushNotificationTypes: parseTypeMap(json['pushNotificationTypes']),
+    );
+  }
+
+  /// This object with a 'preferences_updated' socket event's payload merged
+  /// in. Whatever the event carries replaces what is held (the two per-topic
+  /// maps key by key, so a partial map never drops the topics it omits); what
+  /// it leaves out — an older server sends only the two masters — keeps its
+  /// value.
+  UserPreferences mergedWithEvent(Map data) {
+    final email = data['emailNotifications'];
+    final push = data['pushNotifications'];
+    final emailTypes = data['emailNotificationTypes'];
+    final pushTypes = data['pushNotificationTypes'];
+    return copyWith(
+      emailNotifications: email is bool ? email : null,
+      pushNotifications: push is bool ? push : null,
+      emailNotificationTypes: emailTypes is Map
+          ? {...emailNotificationTypes, ...parseTypeMap(emailTypes)}
+          : null,
+      pushNotificationTypes: pushTypes is Map
+          ? {...pushNotificationTypes, ...parseTypeMap(pushTypes)}
+          : null,
     );
   }
 
@@ -43,14 +80,18 @@ class UserPreferences {
     String? themeMode,
     bool? showDashboardClock,
     bool? emailNotifications,
+    bool? pushNotifications,
     Map<String, bool>? emailNotificationTypes,
+    Map<String, bool>? pushNotificationTypes,
   }) {
     return UserPreferences(
       themeMode: themeMode ?? this.themeMode,
       showDashboardClock: showDashboardClock ?? this.showDashboardClock,
       emailNotifications: emailNotifications ?? this.emailNotifications,
+      pushNotifications: pushNotifications ?? this.pushNotifications,
       emailNotificationTypes:
           emailNotificationTypes ?? this.emailNotificationTypes,
+      pushNotificationTypes: pushNotificationTypes ?? this.pushNotificationTypes,
     );
   }
 }

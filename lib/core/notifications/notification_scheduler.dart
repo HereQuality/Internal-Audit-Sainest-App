@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show PlatformException;
+import 'package:permission_handler/permission_handler.dart';
 
 import 'background_entrypoints.dart';
 import 'event_poll.dart';
@@ -29,27 +30,66 @@ class NotificationScheduler {
     // Reminders are a nice-to-have; login itself must not be affected.
     try {
       // Requested once here, shared by both paths below — same as the
-      // Settings screen's own toggle-on path, so a fresh login doesn't
+      // Settings screen's own push-switch-on path, so a fresh login doesn't
       // start anything before the user has ever been asked. A denial just
-      // means no reminders; the underlying prefs stay on so re-granting
-      // later (Settings, or the OS Settings screen after a permanent
-      // denial) picks everything back up next login with no rediscovery
-      // needed.
+      // means no alerts on this phone; the account's push switch stays
+      // as it is so re-granting later (Settings, or the OS Settings screen
+      // after a permanent denial) picks everything back up with no
+      // rediscovery needed.
       final granted = await _requestPermissions();
-      // FCM push doesn't depend on the (Android-only) local-poll
-      // foreground-service toggle below — a real server push needs no
-      // persistent foreground service to arrive, so this registers
-      // whenever notification permission is granted, on by default same
-      // as background polling is.
+      // The token is registered whenever OS permission is granted,
+      // regardless of the account's push switch: the server is what
+      // honours that switch (createNotification skips push entirely while
+      // it's off), so a token that's already on file is exactly what lets
+      // switching push ON from the web start reaching this phone
+      // immediately. A real server push also needs no persistent
+      // foreground service to arrive.
       if (granted) await FcmService.registerToken();
-      // On by default — see NotificationPrefs.readBackgroundPollingEnabled.
-      if (granted && await NotificationPrefs.readBackgroundPollingEnabled()) {
+      // The local poll is the Android fallback net behind FCM and obeys the
+      // same switches as everything else — AuthProvider mirrors the
+      // account's master value (NotificationPrefs.readPushEnabled, on by
+      // default) and its per-topic values just before calling this; the
+      // polls themselves then check each topic before showing anything.
+      if (granted && await NotificationPrefs.readPushEnabled()) {
         await startBackgroundPolling();
         await pollAndNotifyOverdueNcs();
         await pollAndNotifyEvents();
       }
     } catch (e, st) {
       debugPrint('NotificationScheduler.onLoggedIn failed: $e\n$st');
+    }
+  }
+
+  /// The account's master push switch changed — from this phone's own Settings or
+  /// from the web, via the 'preferences_updated' socket event or a resume
+  /// refetch (AuthProvider forwards all three). Keeps the SharedPreferences
+  /// mirror in step and starts/stops the Android polling fallback to match.
+  /// Never prompts for OS permission: asking belongs to the Settings
+  /// switch, inside the user's own tap. Also safe to call repeatedly — a
+  /// service that's already running (or already stopped) is left alone.
+  static Future<void> onPushPreferenceChanged(bool enabled) async {
+    try {
+      await NotificationPrefs.setPushEnabled(enabled);
+      if (!enabled) {
+        await stopBackgroundPolling();
+      } else if (await Permission.notification.isGranted) {
+        await startBackgroundPolling();
+      }
+    } catch (e, st) {
+      debugPrint('NotificationScheduler.onPushPreferenceChanged failed: $e\n$st');
+    }
+  }
+
+  /// The account's per-topic push values changed (or were re-read). Keeps
+  /// the SharedPreferences copy the local banner paths read in step — see
+  /// NotificationPrefs.setPushTypes. Nothing to start or stop: a topic
+  /// switch never turns the polling fallback on or off, only what a tick is
+  /// allowed to show.
+  static Future<void> onPushTypesChanged(Map<String, bool> types) async {
+    try {
+      await NotificationPrefs.setPushTypes(types);
+    } catch (e, st) {
+      debugPrint('NotificationScheduler.onPushTypesChanged failed: $e\n$st');
     }
   }
 

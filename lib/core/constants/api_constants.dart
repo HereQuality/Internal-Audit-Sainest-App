@@ -124,6 +124,9 @@ class ApiConstants {
   // deviceToken.routes.js, the phone counterpart of the web app's own
   // POST/DELETE /push/subscribe.
   static const deviceTokenRegister = '/device-tokens/register';
+  // Sends a real test push to the caller's own phones and reports, per
+  // device, whether Firebase accepted it (Settings > Send a test notification).
+  static const deviceTokenTest = '/device-tokens/test';
 
   // Maintenance mode — public, no auth required (see server/routes/
   // maintenance.routes.js). MaintenanceProvider polls this.
@@ -149,4 +152,8 @@ class ApiConstants {
   static String ticketById(String id) => '/tickets/$id';
   static String ticketReply(String id) => '/tickets/$id/reply';
   static String ticketRead(String id) => '/tickets/$id/read';
+  // The raiser's answer to a "please confirm" request — POST { action:
+  // 'Accept' | 'Reject', reason? } (ticket.controller.js#verifyTicket).
+  // Accept closes the ticket, Reject sends it back to In Progress.
+  static String ticketVerify(String id) => '/tickets/$id/verify';
 }

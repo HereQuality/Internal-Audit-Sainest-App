@@ -6,11 +6,22 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
 
 import 'event_poll.dart';
+import 'notification_prefs.dart';
 import 'overdue_poll.dart';
 
-Future<void> _pollAll() async {
+/// One full tick. Each poll refreshes the push-switch mirror (the master
+/// switch and the per-topic values) from the server before showing anything
+/// (see event_poll.dart#refreshPushGate) and gates every banner by its own
+/// topic, so the master value read afterwards is as fresh as the network
+/// allows. Returns false once the MASTER push switch is off, so the
+/// foreground service can shut itself down instead of idling — and holding
+/// its persistent notification — for something the account has switched
+/// off. A single topic being off never stops it: the other topics still
+/// need it.
+Future<bool> _pollAll() async {
   await pollAndNotifyOverdueNcs();
   await pollAndNotifyEvents();
+  return NotificationPrefs.readPushEnabled();
 }
 
 /// How often the foreground service polls for overdue NCs while it's alive.
@@ -22,7 +33,8 @@ const Duration kPollInterval = Duration(minutes: 15);
 /// differently from a bare background process), does one immediate poll on
 /// (re)start so a freshly-started service doesn't wait a full kPollInterval
 /// before the user sees anything, then polls again every kPollInterval for
-/// as long as the service stays alive.
+/// as long as the service stays alive — which ends on its own the first
+/// tick that finds the account's master push switch off (see [_pollAll]).
 @pragma('vm:entry-point')
 void backgroundServiceOnStart(ServiceInstance service) async {
   DartPluginRegistrant.ensureInitialized();
@@ -35,8 +47,15 @@ void backgroundServiceOnStart(ServiceInstance service) async {
     );
   }
 
-  await _pollAll();
-  Timer.periodic(kPollInterval, (_) => _pollAll());
+  if (!await _pollAll()) {
+    service.stopSelf();
+    return;
+  }
+  Timer.periodic(kPollInterval, (timer) async {
+    if (await _pollAll()) return;
+    timer.cancel();
+    service.stopSelf();
+  });
 
   service.on('stopService').listen((_) => service.stopSelf());
 }
