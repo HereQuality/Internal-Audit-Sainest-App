@@ -25,19 +25,56 @@ class AppColors {
       ? Color.lerp(color, Colors.white, 0.3)!
       : color;
 
-  // Matches web's Components/Common/AuditStatusBadge.jsx#AUDIT_STATUS_COLORS
-  // — 'Draft'/'Not Started'/'In Progress'/'Completed'/'Skipped' are the
-  // only stored+derived statuses an audit ever actually has (see server/
-  // utils/auditStatus.js#deriveAuditStatus); everything else (e.g. legacy
-  // 'Scheduled') falls back to slate rather than silently reusing blue.
+  // The lifecycle statuses' own tokens. The shared 500/600-level tokens above
+  // are tuned for icons and fills: as 12px badge text on their own 12% tint
+  // they measure 2.9:1 (green) / 2.8:1 (amber) on the light theme, and even
+  // blue/red/slate only reach ~3.7-4.0 on the real light card. These eight
+  // sit in the narrow lightness band where the badge text clears 4.5:1 on
+  // BOTH themes — light as-is, dark after [readable]'s 30% lightening (a
+  // darker token would pass light and fail dark, a lighter one the reverse) —
+  // so the badges are AA-readable everywhere without a per-theme palette.
+  // test/audit_status_test.dart holds them to that.
+  static const _notStarted = Color(0xFF546173); // slate
+  static const _inProgress = Color(0xFF1555E0); // blue
+  static const _overdue = Color(0xFFAF352C); // red
+  static const _delayed = Color(0xFFAA4109); // orange
+  static const _onTime = Color(0xFF126E34); // green
+  static const _ncResponse = Color(0xFF855800); // amber
+  static const _ncVerification = Color(0xFF7632EC); // violet
+  static const _totalClosed = Color(0xFF0C6E66); // teal
+
+  // The unified audit-status vocabulary the server sends as `displayStatus`
+  // (server/utils/auditLifecycleStatus.js), on the palette the status
+  // contract suggests:
+  //   Not Started slate · In Progress blue · Overdue red · Delayed Completed
+  //   orange · On-Time Completed green · NC Response Pending amber ·
+  //   NC Verification Pending violet · Total Closed teal.
+  // 'Draft'/'Skipped' keep their old colours, and the legacy stored
+  // 'Completed' (an older server that sends no displayStatus) keeps green.
+  // 'On-Time Completed'/'Delayed Completed' are never a displayStatus — they
+  // colour the timeliness pill, the dashboard tiles and the filter chips.
+  // Anything else the server invents later falls to neutral slate and is
+  // shown with its own text, rather than borrowing another status's colour.
   static Color forAuditStatus(String status) {
     switch (status) {
       case 'Draft':
         return slate;
       case 'Not Started':
-        return blue;
+        return _notStarted;
       case 'In Progress':
-        return const Color(0xFF0EA5E9); // sky-500, matches web's "In Progress"
+        return _inProgress;
+      case 'Overdue':
+        return _overdue;
+      case 'Delayed Completed':
+        return _delayed;
+      case 'On-Time Completed':
+        return _onTime;
+      case 'NC Response Pending':
+        return _ncResponse;
+      case 'NC Verification Pending':
+        return _ncVerification;
+      case 'Total Closed':
+        return _totalClosed;
       case 'Completed':
         return green;
       case 'Skipped':

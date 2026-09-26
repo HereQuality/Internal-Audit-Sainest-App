@@ -17,23 +17,87 @@ import 'notification_prefs.dart';
 /// app's Dio instance) pattern as overdue_poll.dart — see its own doc
 /// comment for why — called from the same background tick.
 ///
-/// Everything below obeys the account's push switches (Settings > Push
-/// Notifications and the per-topic Push column under "Choose what you get",
-/// the same server-side preferences the web Settings page shares) — see
-/// [refreshPushGate]. A banner is shown only when the master switch AND that
-/// event's topic are on. With one off nothing is shown for it, but the
-/// underlying dedup/seen-state bookkeeping still runs so turning it back on
-/// later doesn't suddenly dump every event that happened while it was off.
+/// Three things decide what a tick may SHOW (see [PollPlan]), and none of
+/// them ever stops the bookkeeping (seen ids, last statuses, notified dates),
+/// so a banner that was held back is never dumped later:
+/// - the account's push switches ([refreshPushGate]): the master AND the
+///   event's own topic;
+/// - whether the server already announces the event: the server pushes audit
+///   assigned and NC raised/approved/rejected/overdue itself, so while it can
+///   push to this phone (NotificationPrefs.readFcmPushReady) the poll only
+///   keeps its bookkeeping for them — a banner from here would be a second
+///   one — and it is the fallback for a phone the server can't reach. Even
+///   then, an event whose server banner this phone already drew (socket, FCM)
+///   is skipped (NotificationPrefs.consumeServerEvent). "Audit starting" /
+///   "Audit due" are different: no server job sends them, so the poll is
+///   their only source;
+/// - whether push was just switched back ON after a stretch OFF: the first
+///   tick then only records what happened meanwhile ([PollPlan.catchUp]).
+///
+/// It fetches only the signed-in person's OWN items (`employeeIds=<self>`,
+/// like the app's own screens): without the parameter the server answers with
+/// the whole reporting hierarchy — a manager's team, a SuperAdmin's whole
+/// organisation — and every one of those would read as "assigned to you".
 Future<void> pollAndNotifyEvents() async {
   final token = await NotificationPrefs.readToken();
-  if (token == null || token.isEmpty)
+  if (token == null || token.isEmpty) {
     return; // logged out — nothing to poll for
+  }
+  final self = await pollSelfScope();
+  if (self == null) return;
 
   await LocalNotifications.init();
 
   final gate = await refreshPushGate(token);
-  await _pollAudits(token, gate);
-  await _pollNcs(token, gate);
+  final plan = await PollPlan.read(NotificationPrefs.pollEvents, gate);
+  final audits = await _pollAudits(token, self, plan);
+  final ncs = await _pollNcs(token, self, plan);
+  // Only a tick that saw BOTH lists has recorded everything there was.
+  if (plan.catchUp && audits && ncs) {
+    await NotificationPrefs.clearPollSuspended(NotificationPrefs.pollEvents);
+  }
+}
+
+/// The query that scopes a poll request to the signed-in person, or null when
+/// there is no known person: falling back to the unscoped request would
+/// silently widen it to the team / the organisation (see above), so a poll
+/// without an id does not run. A SuperAdmin's id is a users-collection id no
+/// audit or NC refers to, so their scoped lists are simply empty.
+Future<Map<String, String>?> pollSelfScope() async {
+  final userId = await NotificationPrefs.readUserId();
+  if (userId == null || userId.isEmpty) return null;
+  return {'employeeIds': userId};
+}
+
+/// What one poll tick may show, worked out once up front.
+class PollPlan {
+  const PollPlan({required this.gate, this.serverPushes = false, this.catchUp = false});
+
+  /// The account's push switches, read once for the tick.
+  final PushGate gate;
+
+  /// The server can push to this phone (FCM registered, `pushReady`): it
+  /// announces the events it pushes, so the poll only keeps its bookkeeping
+  /// for them.
+  final bool serverPushes;
+
+  /// The first tick with push ON after a stretch OFF — nothing polled while
+  /// it was off, so this tick only records.
+  final bool catchUp;
+
+  static Future<PollPlan> read(String poll, PushGate gate) async => PollPlan(
+    gate: gate,
+    serverPushes: await NotificationPrefs.readFcmPushReady(),
+    catchUp: gate.enabled && await NotificationPrefs.readPollSuspended(poll),
+  );
+
+  /// A banner only this phone can produce (audit_reminder).
+  bool showsLocal(String type) => !catchUp && gate.allows(type);
+
+  /// A banner for an event the server ALSO pushes: shown only when the
+  /// topic(s) allow it, this isn't a catch-up tick, and the server can't be
+  /// relied on to have told the person.
+  bool showsFallback({required bool topicOn}) => !catchUp && !serverPushes && topicOn;
 }
 
 /// The one guard every poll opens with: re-reads the account's push switches
@@ -45,7 +109,7 @@ Future<void> pollAndNotifyEvents() async {
 /// map) the last mirrored values stand — a tick must never flip to a guess.
 /// Returns what this tick may show.
 Future<PushGate> refreshPushGate(String token) async {
-  final body = await _getJson(ApiConstants.mePreferences, token);
+  final body = await pollGetJson(ApiConstants.mePreferences, token);
   final data = body?['data'];
   if (data is Map) {
     final pushOn = data['pushNotifications'];
@@ -58,8 +122,21 @@ Future<PushGate> refreshPushGate(String token) async {
   return NotificationPrefs.readPushGate();
 }
 
-Future<Map<String, dynamic>?> _getJson(String path, String token) async {
-  final uri = Uri.parse('${ApiConstants.baseUrl}$path');
+/// One authenticated GET for a poll (package:http, see above). Null on any
+/// failure — offline, a non-200, an unreadable body — so a tick that can't
+/// read simply does nothing and the next one retries. A 401/403 is different
+/// in kind: the mirrored session token itself was refused (it expired, or the
+/// account was blocked), which no later tick can fix — that is recorded
+/// (NotificationPrefs.markSessionRejected) so the Android foreground service
+/// can stop instead of waking every 15 minutes to do nothing; the next login
+/// brings a new token and needs no reset.
+Future<Map<String, dynamic>?> pollGetJson(
+  String path,
+  String token, {
+  Map<String, String>? query,
+}) async {
+  final base = Uri.parse('${ApiConstants.baseUrl}$path');
+  final uri = query == null ? base : base.replace(queryParameters: query);
   http.Response res;
   try {
     res = await http
@@ -67,6 +144,12 @@ Future<Map<String, dynamic>?> _getJson(String path, String token) async {
         .timeout(const Duration(seconds: 25));
   } catch (_) {
     return null; // offline/unreachable this tick — the next tick will retry.
+  }
+  if (res.statusCode == 401 || res.statusCode == 403) {
+    try {
+      await NotificationPrefs.markSessionRejected(token);
+    } catch (_) {}
+    return null;
   }
   if (res.statusCode != 200) return null;
   try {
@@ -91,9 +174,10 @@ String _eventBody(String title, String location, String verb, DateTime? date) {
   return parts.isEmpty ? title : '$title — ${parts.join(' · ')}';
 }
 
-Future<void> _pollAudits(String token, PushGate gate) async {
-  final body = await _getJson(ApiConstants.myAudits, token);
-  if (body == null) return;
+/// True once the list was read and everything in it recorded.
+Future<bool> _pollAudits(String token, Map<String, String> self, PollPlan plan) async {
+  final body = await pollGetJson(ApiConstants.myAudits, token, query: self);
+  if (body == null) return false;
   final audits = (body['data'] as List? ?? []).whereType<Map>().toList();
 
   // Gates the very first poll ever on this device from announcing every
@@ -111,9 +195,9 @@ Future<void> _pollAudits(String token, PushGate gate) async {
   // topics on. With either off the server's own push, which does know which
   // it is and follows the exact switch, stays the only alert.
   final announceAssigned =
-      gate.allows(NotificationTypes.auditCreated) &&
-      gate.allows(NotificationTypes.auditReassigned);
-  final announceReminders = gate.allows(NotificationTypes.auditReminder);
+      plan.gate.allows(NotificationTypes.auditCreated) &&
+      plan.gate.allows(NotificationTypes.auditReassigned);
+  final announceReminders = plan.showsLocal(NotificationTypes.auditReminder);
 
   final newSeenIds = <String>[];
   final newNotifiedDates = <String>[];
@@ -136,7 +220,18 @@ Future<void> _pollAudits(String token, PushGate gate) async {
 
     if (!seenIds.contains(id)) {
       newSeenIds.add(id);
-      if (baselineSeeded && announceAssigned) {
+      // Asked first, so the ledger entry is used up whichever way the banner
+      // goes: a "new audit" the server's own banner already announced on this
+      // phone (socket / FCM) is not announced again. Not on the very first
+      // poll, which announces nothing and may list hundreds of audits.
+      final serverTold =
+          baselineSeeded &&
+          await NotificationPrefs.consumeServerEvent(const [
+            NotificationTypes.auditCreated,
+            NotificationTypes.auditReassigned,
+            NotificationTypes.auditSeriesCreated,
+          ], id);
+      if (baselineSeeded && plan.showsFallback(topicOn: announceAssigned) && !serverTold) {
         await LocalNotifications.showAuditAssigned(
           id: 'assigned:$id'.hashCode & 0x7fffffff,
           title: 'New audit assigned',
@@ -150,8 +245,9 @@ Future<void> _pollAudits(String token, PushGate gate) async {
     }
 
     final status = audit['status']?.toString();
-    if (status == 'Completed' || status == 'Draft' || status == 'Skipped')
+    if (status == 'Completed' || status == 'Draft' || status == 'Skipped') {
       continue;
+    }
 
     // Dedup bookkeeping (newNotifiedDates) always runs once a date
     // qualifies, regardless of baselineSeeded/the push switches — otherwise
@@ -195,16 +291,20 @@ Future<void> _pollAudits(String token, PushGate gate) async {
     }
   }
 
-  if (newSeenIds.isNotEmpty)
+  if (newSeenIds.isNotEmpty) {
     await NotificationPrefs.addSeenAuditIds(newSeenIds);
-  if (newNotifiedDates.isNotEmpty)
+  }
+  if (newNotifiedDates.isNotEmpty) {
     await NotificationPrefs.addNotifiedAuditDates(newNotifiedDates);
+  }
   if (!baselineSeeded) await NotificationPrefs.setAuditBaselineSeeded();
+  return true;
 }
 
-Future<void> _pollNcs(String token, PushGate gate) async {
-  final body = await _getJson(ApiConstants.ncsMine, token);
-  if (body == null) return;
+/// True once the list was read and everything in it recorded.
+Future<bool> _pollNcs(String token, Map<String, String> self, PollPlan plan) async {
+  final body = await pollGetJson(ApiConstants.ncsMine, token, query: self);
+  if (body == null) return false;
   final ncs = (body['data'] as List? ?? []).whereType<Map>().toList();
 
   final baselineSeeded = await NotificationPrefs.readNcBaselineSeeded();
@@ -225,7 +325,11 @@ Future<void> _pollNcs(String token, PushGate gate) async {
 
     if (!seenIds.contains(id)) {
       newSeenIds.add(id);
-      if (baselineSeeded && gate.allows(NotificationTypes.ncRaised)) {
+      final serverTold =
+          baselineSeeded && await NotificationPrefs.consumeServerEvent(const [NotificationTypes.ncRaised], id);
+      if (baselineSeeded &&
+          plan.showsFallback(topicOn: plan.gate.allows(NotificationTypes.ncRaised)) &&
+          !serverTold) {
         await LocalNotifications.showNewNc(
           id: 'raised:$id'.hashCode & 0x7fffffff,
           title: 'New NC raised against you',
@@ -246,7 +350,8 @@ Future<void> _pollNcs(String token, PushGate gate) async {
         // and must stay quiet with approvals off instead of falling through
         // to a "rejected" banner.
         if (status == 'Closed') {
-          if (gate.allows(NotificationTypes.ncApproved)) {
+          final serverTold = await NotificationPrefs.consumeServerEvent(const [NotificationTypes.ncApproved], id);
+          if (plan.showsFallback(topicOn: plan.gate.allows(NotificationTypes.ncApproved)) && !serverTold) {
             await LocalNotifications.showNcApproved(
               id: 'approved:$id'.hashCode & 0x7fffffff,
               title: 'NC response approved',
@@ -258,7 +363,8 @@ Future<void> _pollNcs(String token, PushGate gate) async {
             );
           }
         } else if (reopenCount > prevReopen) {
-          if (gate.allows(NotificationTypes.ncRejected)) {
+          final serverTold = await NotificationPrefs.consumeServerEvent(const [NotificationTypes.ncRejected], id);
+          if (plan.showsFallback(topicOn: plan.gate.allows(NotificationTypes.ncRejected)) && !serverTold) {
             await LocalNotifications.showNcRejected(
               id: 'rejected:$id'.hashCode & 0x7fffffff,
               title: 'NC response rejected',
@@ -276,7 +382,9 @@ Future<void> _pollNcs(String token, PushGate gate) async {
   }
 
   if (newSeenIds.isNotEmpty) await NotificationPrefs.addSeenNcIds(newSeenIds);
-  if (statusUpdates.isNotEmpty)
+  if (statusUpdates.isNotEmpty) {
     await NotificationPrefs.mergeNcLastStatus(statusUpdates);
+  }
   if (!baselineSeeded) await NotificationPrefs.setNcBaselineSeeded();
+  return true;
 }

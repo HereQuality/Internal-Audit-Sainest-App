@@ -70,6 +70,41 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   List<EmployeeOption> auditeeCandidates = [];
   List<LocationOption> allLocations = [];
 
+  // Bumped on logout — see resetForLogout. Every fetch below remembers the
+  // value it started under and, once it has changed, neither writes its
+  // answer, nor its error, nor flips its loading flag: all of that belongs to
+  // the account that left, and the next one may already have a request of its
+  // own on the wire.
+  int _epoch = 0;
+
+  /// Empties every list and the open audit, and puts the filters back to
+  /// their defaults — call on logout, without refetching. Every list here is
+  /// the previous account's audits (titles, locations, people); a shared
+  /// phone's next login must not show them while its own fetch is in flight,
+  /// and a fetch that was already on the wire for the previous account drops
+  /// its answer ([_epoch]). The self id goes too: a SuperAdmin never gets one
+  /// set (main.dart's _RootGate), so it would otherwise keep filtering by the
+  /// previous employee.
+  @override
+  void resetForLogout() {
+    _epoch++;
+    _selfEmployeeId = null;
+    audits = [];
+    auditsAtMyLocation = [];
+    reportAudits = [];
+    activeAudit = null;
+    auditeeCandidates = [];
+    allLocations = [];
+    errorMessage = null;
+    detailError = null;
+    reportsError = null;
+    isLoading = false;
+    isLoadingDetail = false;
+    isLoadingReports = false;
+    isLoadingAtMyLocation = false;
+    super.resetForLogout();
+  }
+
   bool _listening = false;
   // Stored so stopListening removes exactly this closure — Notifications
   // Provider and NcProvider also register their own 'new_notification'
@@ -122,8 +157,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       notifyListeners();
       return;
     }
+    final epoch = _epoch;
     try {
       final res = await _dio.get(ApiConstants.employeesByLocation(locationIds));
+      if (epoch != _epoch) return;
       auditeeCandidates = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => EmployeeOption.fromJson(Map<String, dynamic>.from(e)))
@@ -145,8 +182,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // while the audit is still "Draft" — which an Instant Audit always is.
 
   Future<void> fetchAllLocations() async {
+    final epoch = _epoch;
     try {
       final res = await _dio.get(ApiConstants.locations);
+      if (epoch != _epoch) return;
       allLocations = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => LocationOption.fromJson(Map<String, dynamic>.from(e)))
@@ -324,6 +363,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   Future<void> fetchMyAudits() async {
+    final epoch = _epoch;
     isLoading = true;
     errorMessage = null;
     notifyListeners();
@@ -332,19 +372,24 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.myAudits,
         queryParameters: filterParams,
       );
+      if (epoch != _epoch) return;
       final list = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
       audits = list;
     } on DioException catch (e) {
-      errorMessage = extractErrorMessage(
-        e,
-        fallback: 'Could not load your audits.',
-      );
+      if (epoch == _epoch) {
+        errorMessage = extractErrorMessage(
+          e,
+          fallback: 'Could not load your audits.',
+        );
+      }
     } finally {
-      isLoading = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoading = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -353,7 +398,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     required String title,
     required String description,
     required DateTime targetDate,
-    String? auditeeEmployeeId,
+    // Always the auditor's explicit pick from the audited location's people
+    // — an NC is never raised against the raiser by default.
+    required String auditeeEmployeeId,
     String? severity,
   }) async {
     try {
@@ -364,7 +411,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           'title': title,
           'description': description,
           'targetDate': targetDate.toIso8601String(),
-          'auditeeEmployeeId': ?auditeeEmployeeId,
+          'auditeeEmployeeId': auditeeEmployeeId,
           'severity': ?severity,
         },
       );
@@ -383,22 +430,28 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // (SuperAdmin, this audit's own auditors/auditee/planner, or their
   // hierarchy scope), not by anything client-side.
   Future<void> fetchAuditDetail(String auditId) async {
+    final epoch = _epoch;
     isLoadingDetail = true;
     detailError = null;
     notifyListeners();
     try {
       final res = await _dio.get(ApiConstants.auditById(auditId));
+      if (epoch != _epoch) return;
       activeAudit = AuditDetailModel.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
     } on DioException catch (e) {
-      detailError = extractErrorMessage(
-        e,
-        fallback: 'Could not load this audit.',
-      );
+      if (epoch == _epoch) {
+        detailError = extractErrorMessage(
+          e,
+          fallback: 'Could not load this audit.',
+        );
+      }
     } finally {
-      isLoadingDetail = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingDetail = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -440,6 +493,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   List<AuditModel> reportAudits = [];
 
   Future<void> fetchReportAudits() async {
+    final epoch = _epoch;
     isLoadingReports = true;
     reportsError = null;
     notifyListeners();
@@ -459,6 +513,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
             ? {'employeeIds': selfEmployeeId}
             : null,
       );
+      if (epoch != _epoch) return;
       final list = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
@@ -473,13 +528,17 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       });
       reportAudits = list;
     } on DioException catch (e) {
-      reportsError = extractErrorMessage(
-        e,
-        fallback: 'Could not load your audits.',
-      );
+      if (epoch == _epoch) {
+        reportsError = extractErrorMessage(
+          e,
+          fallback: 'Could not load your audits.',
+        );
+      }
     } finally {
-      isLoadingReports = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingReports = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -505,6 +564,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   Future<void> fetchAuditsAtMyLocation() async {
+    final epoch = _epoch;
     isLoadingAtMyLocation = true;
     notifyListeners();
     try {
@@ -517,6 +577,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.auditsAtMyLocation,
         queryParameters: _placeAndTypeParams,
       );
+      if (epoch != _epoch) return;
       auditsAtMyLocation = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
@@ -526,8 +587,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       // above — worst case the calendar just shows NC dots with no blue
       // "audit visit" markers layered on top.
     } finally {
-      isLoadingAtMyLocation = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingAtMyLocation = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -557,14 +620,16 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// least one zone, on purpose — "the whole point of a whole-batch report
   /// is every zone side by side"). Each zone in the response is shaped
   /// exactly like GET /audits/:id's own `data`, so AuditDetailModel.fromJson
-  /// parses it unchanged.
-  Future<List<AuditDetailModel>> fetchBatchReport(String batchId) async {
+  /// parses it unchanged. Returns the zones together with the response's
+  /// batch-level `displayStatus`/`timeliness` (the one status the combined
+  /// PDF prints — see BatchReport.statusLabel) instead of the bare zone list
+  /// this used to, which threw that aggregate away.
+  Future<BatchReport> fetchBatchReport(String batchId) async {
     final res = await _dio.get(ApiConstants.auditBatchReport(batchId));
-    final zones = (res.data['data']?['zones'] as List? ?? [])
-        .whereType<Map>()
-        .map((z) => AuditDetailModel.fromJson(Map<String, dynamic>.from(z)))
-        .toList();
-    return zones;
+    final data = res.data['data'];
+    return BatchReport.fromJson(
+      data is Map ? Map<String, dynamic>.from(data) : const {},
+    );
   }
 
   /// Uploads evidence photos for one checkpoint right away — independent
@@ -832,7 +897,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   /// The "select representative auditee" step, asked once before an
-  /// assigned auditor starts scoring a non-Self audit (see
+  /// assigned auditor starts scoring (see
   /// audit_detail_screen.dart's gating logic in _load) — now multi-select,
   /// at least one required. Writes to the same audit-level auditeeIds
   /// field the NC-raise picker's default falls back to (via auditeeIds[0]

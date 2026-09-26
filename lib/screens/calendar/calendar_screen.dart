@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_date_range.dart';
+import '../../core/utils/audit_status.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/dashboard_provider.dart';
 import '../../providers/filter_options_provider.dart';
@@ -29,16 +30,21 @@ import '../nc/nc_review_screen.dart';
 ///
 ///   - Non-Conformance (red) — NcProvider.raisedAgainstMe, one dot per
 ///     NcModel#targetDate, tap to respond (still "Raised") or review.
-///   - Audit (amber) / Completed (green) — AuditsProvider.audits (this
-///     employee's own, as auditor), split by AuditModel#status, expanded
-///     across every day in AuditModel#scheduledDate..scheduledEndDate via
-///     daysInAuditRange.
+///   - Audit (coloured by status: Not Started slate, In Progress blue,
+///     Overdue red, NC Response Pending amber, NC Verification Pending
+///     violet, Total Closed teal) — AuditsProvider.audits (this employee's
+///     own, as auditor), coloured and labelled by AuditModel#displayLabel,
+///     expanded across every day in AuditModel#scheduledDate..
+///     scheduledEndDate via daysInAuditRange. Note red and blue are also
+///     the Non-Conformance / Audit at Your Location layers' colours; the
+///     day list under the grid names each event's status, which is what
+///     tells them apart.
 ///   - Audit at Your Location (blue) — AuditsProvider.auditsAtMyLocation,
 ///     someone ELSE scheduled to audit one of this employee's own
 ///     locations. Deduped against `audits` above (same id showing as both
 ///     "mine" and "at my location" — this employee audits their own
-///     location plenty) so nothing plots twice, once amber/green and once
-///     blue — mirrors Calendar.jsx's own myAuditIds/isOthers filter.
+///     location plenty) so nothing plots twice, once as a status dot and
+///     once blue — mirrors Calendar.jsx's own myAuditIds/isOthers filter.
 ///
 /// The Filters button in this screen's AppBar is the same shared filter
 /// state every other audit surface uses (providers/audit_filter_scope.dart)
@@ -272,10 +278,20 @@ class _CalendarScreenState extends State<CalendarScreen> {
                               (day) => CalendarEvent(
                                 date: day,
                                 title: a.title,
-                                subtitle: a.status,
-                                color: a.status == 'Completed'
-                                    ? AppColors.green
-                                    : AppColors.amber,
+                                // Label and dot colour both follow the
+                                // audit's unified status (Overdue red,
+                                // NC Response Pending amber, ...), not the
+                                // old two-way Completed-green / else-amber
+                                // split that could not tell an overdue
+                                // audit from one due next week.
+                                subtitle: a.displayLabel,
+                                // readable(): the status tokens are tuned as
+                                // text on a light tint; as a bare dot on the
+                                // dark theme they would sink into the grid.
+                                color: AppColors.readable(
+                                  context,
+                                  AppColors.forAuditStatus(a.displayLabel),
+                                ),
                                 onTap: () => Navigator.of(context).push(
                                   MaterialPageRoute(
                                     builder: (_) =>
@@ -286,7 +302,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                             ),
                           ),
                       // The blue layer answers a different question from
-                      // the amber/green one, and the filters reach it
+                      // the status-coloured one, and the filters reach it
                       // differently on purpose: AuditsProvider.refetch
                       // ForFilters re-runs this list with the location and
                       // audit-type params but NOT employeeIds, because
@@ -294,7 +310,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       // caller's own location membership (see audit.
                       // controller.js#getAuditsAtMyLocation) — an
                       // employeeIds there would mean nothing. So a people
-                      // filter narrows the amber/green layer while blue
+                      // filter narrows the status-coloured layer while blue
                       // stays put, which is exactly right: "who is coming
                       // to audit my location" was never a question about
                       // the people you filtered to.
@@ -302,7 +318,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                       // The dedupe below still holds under filters, and
                       // note what it now does: myAuditIds is the FILTERED
                       // set, so an audit of mine that the current people
-                      // filter excludes drops out of amber/green and
+                      // filter excludes drops out of the status dots and
                       // reappears here in blue. That is the honest answer
                       // — under a filter that isn't about me, that audit
                       // genuinely is "someone else's audit at my
@@ -484,14 +500,29 @@ class _ActiveFilterBar extends StatelessWidget {
 class _CalendarLegendEntry {
   final String label;
   final Color color;
-  const _CalendarLegendEntry(this.label, this.color);
+  // An audit-status dot: drawn through AppColors.readable, exactly like the
+  // events it labels (see the audit events above).
+  final bool isStatus;
+  const _CalendarLegendEntry(this.label, this.color, {this.isStatus = false});
 }
 
-const _legendEntries = [
-  _CalendarLegendEntry('Non-Conformance', AppColors.red),
-  _CalendarLegendEntry('Audit', AppColors.amber),
-  _CalendarLegendEntry('Completed', AppColors.green),
-  _CalendarLegendEntry('Audit at Your Location', AppColors.blue),
+// One dot per audit status an event can actually be drawn in. Delayed /
+// On-Time Completed are absent on purpose: they are a timeliness, never a
+// displayStatus (a finished audit is Total Closed or in an NC stage), so no
+// event ever takes their colour. Built from AppColors.forAuditStatus so the
+// legend cannot drift from the dots.
+final _legendEntries = [
+  const _CalendarLegendEntry('Non-Conformance', AppColors.red),
+  for (final status in const [
+    AuditStatus.notStarted,
+    AuditStatus.inProgress,
+    AuditStatus.overdue,
+    AuditStatus.ncResponsePending,
+    AuditStatus.ncVerificationPending,
+    AuditStatus.totalClosed,
+  ])
+    _CalendarLegendEntry(status, AppColors.forAuditStatus(status), isStatus: true),
+  const _CalendarLegendEntry('Audit at Your Location', AppColors.blue),
 ];
 
 /// Same dot+label row as the web calendar's own legend (Calendar.jsx) —
@@ -525,7 +556,9 @@ class _CalendarLegend extends StatelessWidget {
                   margin: const EdgeInsets.only(right: 5),
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: e.color,
+                    color: e.isStatus
+                        ? AppColors.readable(context, e.color)
+                        : e.color,
                   ),
                 ),
                 Text(

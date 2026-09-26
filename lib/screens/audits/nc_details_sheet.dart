@@ -15,8 +15,9 @@ import '../../models/nc_model.dart';
 /// ───────────────────────────────────────
 /// The popup a checkpoint's "Raise NC" pick opens to collect what the
 /// server needs before it'll create the linked NC (audit.controller.js#
-/// scoreParameter): who it's against (skipped for Self Audit — always
-/// resolves to the auditor themselves), a due date, a flag, plus the
+/// scoreParameter): who it's against (always an explicit pick from the
+/// audited location's people — the caller excludes the acting auditor, an
+/// NC is never raised against the raiser), a due date, a flag, plus the
 /// remark that's shared with the checkpoint's own text field. Same shape
 /// as the standalone raise_nc_sheet.dart's freeform flow, just scoped to
 /// one specific checkpoint instead of a blank NC.
@@ -45,18 +46,19 @@ enum NcSheetMode {
 }
 
 class NcDetailsResult {
-  final String? auditeeEmployeeId;
+  // Always set: the sheet's picker is required, so a result only ever comes
+  // back with a real person chosen.
+  final String auditeeEmployeeId;
   final DateTime targetDate;
   final String remark;
   final String severity;
 
-  const NcDetailsResult({this.auditeeEmployeeId, required this.targetDate, required this.remark, required this.severity});
+  const NcDetailsResult({required this.auditeeEmployeeId, required this.targetDate, required this.remark, required this.severity});
 }
 
 Future<NcDetailsResult?> showNcDetailsSheet(
   BuildContext context, {
   required List<EmployeeOption> employees,
-  required bool isSelfAudit,
   String? initialAuditeeId,
   // The current auditee's display name — ONLY meaningful (and only ever
   // passed) alongside `initialAuditeeId` in edit mode. See its use below:
@@ -80,7 +82,6 @@ Future<NcDetailsResult?> showNcDetailsSheet(
     backgroundColor: Colors.transparent,
     builder: (_) => _NcDetailsSheet(
       employees: employees,
-      isSelfAudit: isSelfAudit,
       initialAuditeeId: initialAuditeeId,
       initialAuditeeName: initialAuditeeName,
       initialTargetDate: initialTargetDate,
@@ -93,7 +94,6 @@ Future<NcDetailsResult?> showNcDetailsSheet(
 
 class _NcDetailsSheet extends StatefulWidget {
   final List<EmployeeOption> employees;
-  final bool isSelfAudit;
   final String? initialAuditeeId;
   final String? initialAuditeeName;
   final DateTime? initialTargetDate;
@@ -103,7 +103,6 @@ class _NcDetailsSheet extends StatefulWidget {
 
   const _NcDetailsSheet({
     required this.employees,
-    required this.isSelfAudit,
     this.initialAuditeeId,
     this.initialAuditeeName,
     this.initialTargetDate,
@@ -193,11 +192,15 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
   void _submit() {
     setState(() => _dateTouched = true);
     final formOk = _formKey.currentState?.validate() ?? false;
-    if (!formOk || _targetDate == null) {
+    // The picker's own validator already rejects an empty pick (and an empty
+    // list, which leaves nothing to pick) — the null check here is what lets
+    // the result carry a non-null auditee.
+    final auditeeId = _auditeeEmployeeId;
+    if (!formOk || _targetDate == null || auditeeId == null) {
       return;
     }
     Navigator.of(context).pop(NcDetailsResult(
-      auditeeEmployeeId: widget.isSelfAudit ? null : _auditeeEmployeeId,
+      auditeeEmployeeId: auditeeId,
       targetDate: _targetDate!,
       // Edit mode never renders the Remark field (updateNC wouldn't accept
       // it — see NcSheetMode.edit), so this hands back exactly what came
@@ -284,49 +287,52 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline),
                 ),
                 const SizedBox(height: 16),
-                if (!widget.isSelfAudit) ...[
-                  DropdownButtonFormField<String>(
-                    initialValue: pickable.any((e) => e.id == _auditeeEmployeeId) ? _auditeeEmployeeId : null,
-                    decoration: InputDecoration(
-                      labelText: _isEdit ? 'NC is against' : 'Raise NC against',
-                      prefixIcon: const Icon(Icons.person_outline),
-                    ),
-                    isExpanded: true,
-                    items: pickable
-                        .map((e) => DropdownMenuItem(
-                              value: e.id,
-                              // Flags the synthetic current-auditee entry
-                              // (see `currentAuditeeMissing` above) so it
-                              // doesn't read as just another ordinary
-                              // pickable name — this person isn't offered
-                              // by the normal location-scoped list, they're
-                              // shown because they're who it's against
-                              // right now.
-                              child: Text(
-                                currentAuditeeMissing && e.id == widget.initialAuditeeId
-                                    ? '${e.name} (not at this location)'
-                                    : e.name,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ))
-                        .toList(),
-                    onChanged: (v) => setState(() => _auditeeEmployeeId = v),
-                    // Re-validates once the user has touched the picker, so the
-                    // "Pick who this NC is against" error clears the moment they do
-                    // (it used to stay under a correctly filled-in name).
-                    autovalidateMode: AutovalidateMode.onUserInteraction,
-                    validator: (v) => v == null ? 'Pick who this NC is against' : null,
+                DropdownButtonFormField<String>(
+                  initialValue: pickable.any((e) => e.id == _auditeeEmployeeId) ? _auditeeEmployeeId : null,
+                  decoration: InputDecoration(
+                    labelText: _isEdit ? 'NC is against' : 'Raise NC against',
+                    prefixIcon: const Icon(Icons.person_outline),
                   ),
-                  if (pickable.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 6),
-                      child: Text(
-                        'No one available to pick from your hierarchy.',
-                        style: TextStyle(color: scheme.outline, fontSize: 11.5),
-                      ),
+                  isExpanded: true,
+                  items: pickable
+                      .map((e) => DropdownMenuItem(
+                            value: e.id,
+                            // Flags the synthetic current-auditee entry
+                            // (see `currentAuditeeMissing` above) so it
+                            // doesn't read as just another ordinary
+                            // pickable name — this person isn't offered
+                            // by the normal location-scoped list, they're
+                            // shown because they're who it's against
+                            // right now.
+                            child: Text(
+                              currentAuditeeMissing && e.id == widget.initialAuditeeId
+                                  ? '${e.name} (not at this location)'
+                                  : e.name,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ))
+                      .toList(),
+                  onChanged: (v) => setState(() => _auditeeEmployeeId = v),
+                  // Re-validates once the user has touched the picker, so the
+                  // "Pick who this NC is against" error clears the moment they do
+                  // (it used to stay under a correctly filled-in name).
+                  autovalidateMode: AutovalidateMode.onUserInteraction,
+                  validator: (v) => v == null ? 'Pick who this NC is against' : null,
+                ),
+                // The list is the audited location's people minus the acting
+                // auditor — say so when that leaves nobody, or the required
+                // picker just looks broken. Saving is blocked meanwhile (the
+                // button below is disabled): an NC always needs an
+                // "against" person.
+                if (pickable.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      "No one else is tagged to this audit's location.",
+                      style: TextStyle(color: scheme.outline, fontSize: 11.5),
                     ),
-                  const SizedBox(height: 12),
-                ],
+                  ),
+                const SizedBox(height: 12),
                 InkWell(
                   onTap: _pickDate,
                   borderRadius: BorderRadius.circular(12),
@@ -361,7 +367,7 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                 ],
                 const SizedBox(height: 20),
                 ElevatedButton(
-                  onPressed: _submit,
+                  onPressed: pickable.isEmpty ? null : _submit,
                   child: Text(_isEdit ? 'Save Changes' : 'Save & Raise NC'),
                 ),
               ],
@@ -372,19 +378,13 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
     );
   }
 
-  // Four distinct one-liners rather than one generic sentence: a Self
-  // Audit has no auditee to pick at all (the server resolves it to the
-  // auditor themselves), and in edit mode the auditee CAN still be
-  // reassigned — nc.controller.js#updateNC notifies whoever it moves to —
-  // which is worth saying out loud before someone changes it by accident.
+  // Two distinct one-liners rather than one generic sentence: in edit mode
+  // the auditee CAN still be reassigned — nc.controller.js#updateNC
+  // notifies whoever it moves to — which is worth saying out loud before
+  // someone changes it by accident.
   String _introLine() {
-    if (_isEdit) {
-      return widget.isSelfAudit
-          ? 'Self Audit — only the due date and flag can change.'
-          : 'Change who this is against, when it\'s due, or how it\'s flagged.';
-    }
-    return widget.isSelfAudit
-        ? 'Self Audit — this NC will be raised against you.'
+    return _isEdit
+        ? 'Change who this is against, when it\'s due, or how it\'s flagged.'
         : 'Pick who this is against and by when it should be closed.';
   }
 }

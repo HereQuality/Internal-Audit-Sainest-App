@@ -31,21 +31,52 @@ class TicketsProvider extends ChangeNotifier {
   // resurrect a ticket whose screen is already gone).
   int _detailSeq = 0;
 
+  // Bumped on logout — see resetForLogout. Every request below remembers the
+  // value it started under and, once it has changed, writes nothing when it
+  // lands (answer, error or loading flag): the next account may already have a
+  // request of its own on the wire.
+  int _epoch = 0;
+
+  /// Back to empty — call on logout, without refetching. This provider is one
+  /// process-lifetime instance, so without it the next person to sign in on
+  /// the same phone would open onto the previous account's support tickets,
+  /// and a request already on the wire for that account would put them back.
+  /// Socket rooms and listeners are left to the screens that own them (their
+  /// dispose closes them), so those can still detach cleanly afterwards.
+  void resetForLogout() {
+    _epoch++;
+    _detailSeq++;
+    tickets = [];
+    activeTicket = null;
+    listError = null;
+    detailError = null;
+    isLoadingList = false;
+    isLoadingDetail = false;
+    isSendingReply = false;
+    notifyListeners();
+  }
+
   Future<void> fetchTickets() async {
+    final epoch = _epoch;
     isLoadingList = true;
     listError = null;
     notifyListeners();
     try {
       final res = await _dio.get(ApiConstants.tickets);
+      if (epoch != _epoch) return;
       tickets = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => TicketModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
     } on DioException catch (e) {
-      listError = extractErrorMessage(e, fallback: 'Could not load your tickets.');
+      if (epoch == _epoch) {
+        listError = extractErrorMessage(e, fallback: 'Could not load your tickets.');
+      }
     } finally {
-      isLoadingList = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingList = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -55,6 +86,7 @@ class TicketsProvider extends ChangeNotifier {
     required String priority,
     List<File> attachments = const [],
   }) async {
+    final epoch = _epoch;
     try {
       // Files go in via form.files below, not fromMap — a Dart map
       // literal silently collapses duplicate 'attachments' keys to the
@@ -70,8 +102,11 @@ class TicketsProvider extends ChangeNotifier {
       }
       final res = await _dio.post(ApiConstants.tickets, data: form);
       final created = TicketModel.fromJson(Map<String, dynamic>.from(res.data['data']));
-      tickets = [created, ...tickets];
-      notifyListeners();
+      // Created on the server all the same; it just isn't this account's list.
+      if (epoch == _epoch) {
+        tickets = [created, ...tickets];
+        notifyListeners();
+      }
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not create the ticket.');
@@ -99,6 +134,7 @@ class TicketsProvider extends ChangeNotifier {
   }
 
   Future<String?> reply({required String ticketId, required String message, List<File> attachments = const []}) async {
+    final epoch = _epoch;
     isSendingReply = true;
     notifyListeners();
     try {
@@ -107,15 +143,17 @@ class TicketsProvider extends ChangeNotifier {
         form.files.add(MapEntry('attachments', await MultipartFile.fromFile(file.path, filename: file.path.split('/').last)));
       }
       final res = await _dio.post(ApiConstants.ticketReply(ticketId), data: form);
-      if (_joinedTicketRoom == ticketId) {
+      if (epoch == _epoch && _joinedTicketRoom == ticketId) {
         activeTicket = TicketModel.fromJson(Map<String, dynamic>.from(res.data['data']));
       }
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not send your reply.');
     } finally {
-      isSendingReply = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isSendingReply = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -125,6 +163,7 @@ class TicketsProvider extends ChangeNotifier {
   /// the open ticket and the list have been refreshed — else an error
   /// message, same contract as [reply].
   Future<String?> verifyTicket(String id, String action, {String? reason}) async {
+    final epoch = _epoch;
     try {
       await _dio.post(
         ApiConstants.ticketVerify(id),
@@ -133,6 +172,9 @@ class TicketsProvider extends ChangeNotifier {
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not update this ticket.');
     }
+    // The account that asked has since left: refreshing now would fetch for
+    // whoever signed in next.
+    if (epoch != _epoch) return null;
     // Both fetches swallow their own network errors, so a refresh that
     // fails never reads as a failed verify — the server's ticket_updated
     // broadcast refreshes both screens again anyway.

@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/theme/app_colors.dart';
+import '../../core/utils/audit_status.dart';
 import '../../models/audit_model.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/auth_provider.dart';
@@ -52,24 +54,23 @@ import '../dashboard/dashboard_screen.dart' show DashboardFilterBar;
 /// RefreshIndicator -> fetchMyAudits(), and the `initialStatusFilter`
 /// prop AppShell passes when a dashboard stat tile jumps here.
 
-// "All" plus the statuses actually worth a dedicated chip. Skipped is
-// already excluded server-side (audit.controller.js#notSkipped); Draft is
-// deliberately left off too — this row is for triaging ACTIVE work
-// ("what's not started, what's in progress, what's done"), and a Draft
-// (not-yet-scheduled/incomplete-setup) audit doesn't fit that question.
-// It still shows up under "All", just with no chip of its own to isolate
-// it — the same "Complete Setup" row on the web Schedule Audit page is
-// where a planner actually deals with drafts, not this triage list.
+// "All" plus the eight lifecycle statuses (Not Started / In Progress /
+// Overdue / Delayed Completed / On-Time Completed / NC Response Pending / NC
+// Verification Pending / Total Closed) — core/utils/audit_status.dart's
+// auditStatusFilterOptions, which also decides what each chip matches (the
+// two "Completed" chips by the audit's timeliness, the rest by the status
+// its badge shows). Skipped is already excluded server-side
+// (audit.controller.js#notSkipped); Draft is deliberately left off too —
+// this row is for triaging ACTIVE work, and a Draft (not-yet-scheduled/
+// incomplete-setup) audit doesn't fit that question. It still shows up under
+// "All", just with no chip of its own to isolate it — the same "Complete
+// Setup" row on the web Schedule Audit page is where a planner actually
+// deals with drafts, not this triage list.
 // Filtered client-side over the one fetched list rather than a re-fetch
 // per tap, since a single auditor's own audit list is small enough that
 // round-tripping the server for every filter change would just be
-// perceptible lag for no benefit.
-const _statusFilters = [
-  'All',
-  'Not Started',
-  'In Progress',
-  'Completed',
-];
+// perceptible lag for no benefit (the app never sends `?status=`).
+const _statusFilters = auditStatusFilterOptions;
 
 // Which way the "Today" pill would take you — also its visibility, since
 // "you are already at Today" is exactly when it should not be on screen.
@@ -82,7 +83,7 @@ const double _jumpThreshold = 80;
 
 class MyAuditsScreen extends StatefulWidget {
   // Pre-applies one of _statusFilters below — set by AppShell when a
-  // dashboard stat tile is tapped (see DashboardScreen's _StatsGrid),
+  // dashboard stat tile is tapped (see DashboardScreen's AuditStatsGrid),
   // remounted under a fresh key each time so this always takes effect
   // even when the tile tapped is the same filter already showing.
   final String? initialStatusFilter;
@@ -336,7 +337,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
         (_statusFilter == 'All' && query.isEmpty)
         ? provider.audits
         : provider.audits.where((a) {
-            if (_statusFilter != 'All' && a.status != _statusFilter) {
+            if (!auditMatchesStatusFilter(a, _statusFilter)) {
               return false;
             }
             return query.isEmpty || _matchesSearch(a, query);
@@ -423,6 +424,11 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
           StatusFilterChipRow(
             options: _statusFilters,
             selected: _statusFilter,
+            // readable(): the raw status tokens are dark by design (badge
+            // text on a light tint) and would sink into a dark-theme chip.
+            dotColorFor: (o) => o == 'All'
+                ? null
+                : AppColors.readable(context, AppColors.forAuditStatus(o)),
             onSelected: (v) => setState(() => _statusFilter = v),
           ),
         if (agenda != null)
@@ -522,12 +528,12 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
           icon: searching ? Icons.search_off : Icons.filter_alt_off_outlined,
           title: searching
               ? 'No audits match "$searchTerm"'
-              : 'No $_statusFilter audits',
+              : auditStatusEmptyTitle(_statusFilter),
           // Both narrowings active at once is the case most likely to
           // read as "the search is broken" — name the other one so the
           // user knows there is a second thing hiding results.
           subtitle: searching && _statusFilter != 'All'
-              ? 'Also filtered to $_statusFilter audits.'
+              ? 'Also filtered to "$_statusFilter".'
               : null,
           action: searching
               ? OutlinedButton.icon(

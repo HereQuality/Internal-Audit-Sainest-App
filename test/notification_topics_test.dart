@@ -8,15 +8,19 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
+import 'package:internal_audit_app/core/constants/api_constants.dart';
 import 'package:internal_audit_app/core/network/dio_client.dart';
 import 'package:internal_audit_app/core/notifications/event_poll.dart';
+import 'package:internal_audit_app/core/notifications/fcm_service.dart';
 import 'package:internal_audit_app/core/notifications/notification_prefs.dart';
 import 'package:internal_audit_app/core/notifications/overdue_poll.dart';
+import 'package:internal_audit_app/core/notifications/push_check.dart' show PushRegistration;
 import 'package:internal_audit_app/models/user_model.dart';
 import 'package:internal_audit_app/providers/auth_provider.dart';
 import 'package:internal_audit_app/providers/profile_provider.dart';
 import 'package:internal_audit_app/providers/theme_provider.dart';
 import 'package:internal_audit_app/screens/profile/settings_screen.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -36,6 +40,15 @@ class _FakeServer implements HttpClientAdapter {
   final List<Map<String, dynamic>> puts = [];
   Completer<void>? hold;
   bool refuse = false;
+
+  // The phone's own push registration: POST /device-tokens/register (answered
+  // by registerStatus/registerBody, and held while registerHold is set) and
+  // the test push, POST /device-tokens/test (its bodies are kept).
+  int registerStatus = 200;
+  Map<String, dynamic> registerBody = {'isOk': true, 'pushReady': true};
+  Completer<void>? registerHold;
+  Map<String, dynamic> testBody = _testAnswer(ok: true);
+  final List<Map<String, dynamic>> tests = [];
 
   Map<String, dynamic> get payload => {
     'emailNotifications': emailMaster,
@@ -61,6 +74,14 @@ class _FakeServer implements HttpClientAdapter {
     Stream<Uint8List>? requestStream,
     Future<void>? cancelFuture,
   ) async {
+    if (options.method == 'POST' && options.path == ApiConstants.deviceTokenRegister) {
+      await registerHold?.future;
+      return _json(registerBody, registerStatus);
+    }
+    if (options.method == 'POST' && options.path == ApiConstants.deviceTokenTest) {
+      tests.add(Map<String, dynamic>.from(options.data as Map));
+      return _json(testBody, 200);
+    }
     if (options.method == 'PUT') {
       final body = Map<String, dynamic>.from(options.data as Map);
       puts.add(body);
@@ -77,6 +98,25 @@ class _FakeServer implements HttpClientAdapter {
   @override
   void close({bool force = false}) {}
 }
+
+/// The server's answer to a test push aimed at this phone's token: one row.
+Map<String, dynamic> _testAnswer({required bool ok, String? code, String? hint}) => {
+  'isOk': true,
+  'data': {
+    'sent': ok ? 1 : 0,
+    'failed': ok ? 0 : 1,
+    'results': [
+      {
+        'tokenId': 'row-1',
+        'platform': 'android',
+        'ok': ok,
+        'code': ok ? null : code,
+        'hint': ?hint,
+      },
+    ],
+    'serverProjects': ['proj-server'],
+  },
+};
 
 UserModel _user() => const UserModel(
   id: 'u1',
@@ -370,6 +410,287 @@ void main() {
     });
   });
 
+  // The line under the Push switch: "Active" only when the OS permission, this
+  // phone's registration and the server can all deliver — and each way it can
+  // not, said as what it is.
+  group('Push status line', () {
+    const permissionsChannel = MethodChannel('flutter.baseflow.com/permissions/methods');
+    // What the fake OS answers: permission_handler's status (0 denied, 1
+    // granted, 4 permanently denied) and whether Android would still show its
+    // dialog (the "rationale" answer).
+    late int osStatus;
+    late bool osCanAsk;
+    late Object? osRationaleError;
+    late List<String> osCalls;
+
+    setUp(() {
+      osStatus = 1;
+      osCanAsk = false;
+      osRationaleError = null;
+      osCalls = [];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(permissionsChannel, (call) async {
+            osCalls.add(call.method);
+            switch (call.method) {
+              case 'checkPermissionStatus':
+                return osStatus;
+              case 'shouldShowRequestPermissionRationale':
+                final error = osRationaleError;
+                if (error != null) throw error;
+                return osCanAsk;
+              case 'requestPermissions':
+                return {Permission.notification.value: osStatus};
+              case 'openAppSettings':
+                return true;
+            }
+            return null;
+          });
+      // A signed-in phone: the session mirror is what lets a registration run.
+      SharedPreferences.setMockInitialValues({'bg_auth_token': 'jwt'});
+      FcmService.debugReset();
+      FcmService.postRetryPause = Duration.zero;
+      FcmService.retryDelays = const [];
+      FcmService.getFcmToken = () async => 'tok-1';
+    });
+
+    tearDown(FcmService.debugReset);
+
+    // Firebase "configured" and this phone's registration attempted once, the
+    // way the login does it (outside the widget's fake clock).
+    Future<void> registerPhone(WidgetTester tester) async {
+      FcmService.debugSetInitialized(true);
+      await tester.runAsync(FcmService.registerToken);
+    }
+
+    testWidgets('a build without Firebase never claims to be active', (tester) async {
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text("Phone push isn't available in this build"), findsOneWidget);
+    });
+
+    testWidgets('permission allowed, token registered, server able to send: active', (tester) async {
+      await registerPhone(tester);
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsOneWidget);
+      expect(find.text('Send a test notification'), findsOneWidget);
+    });
+
+    testWidgets('registered but the server cannot send: says so, without the server\'s internals', (tester) async {
+      server.registerBody = {
+        'isOk': true,
+        'pushReady': false,
+        'problem': 'No credentials for Firebase project "internal-audit-c7c2b" (FIREBASE_SERVICE_ACCOUNT_PATH).',
+      };
+      await registerPhone(tester);
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text("Registered, but the server can't send to this phone"), findsOneWidget);
+      expect(find.textContaining('Send a test notification'), findsWidgets);
+      expect(find.textContaining('internal-audit-c7c2b'), findsNothing);
+
+      // The reason itself is one tap away, in the test's own dialog.
+      await tester.tap(find.text('Send a test notification'));
+      await tester.pumpAndSettle();
+      expect(find.text("The server can't push to this phone"), findsOneWidget);
+      expect(find.textContaining('internal-audit-c7c2b'), findsOneWidget);
+      expect(server.tests, isEmpty, reason: 'nothing to send while the server cannot');
+    });
+
+    testWidgets('a registration that keeps failing: not registered, with a Try again that works', (tester) async {
+      server.registerStatus = 503;
+      await registerPhone(tester);
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text("This phone isn't registered for push yet"), findsOneWidget);
+      expect(find.text('Try again'), findsOneWidget);
+
+      server.registerStatus = 200; // the connection is back
+      await tester.tap(find.text('Try again'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Active on this phone'), findsOneWidget);
+      expect(find.text('Try again'), findsNothing);
+    });
+
+    testWidgets('opening Settings retries a registration that ran out of retries', (tester) async {
+      server.registerStatus = 503;
+      await registerPhone(tester); // the login-time attempt: gone, no retry left
+      expect(FcmService.registrationState, PushRegistration.notRegistered);
+
+      server.registerStatus = 200; // the connection is back, nobody tapped anything
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsOneWidget);
+      expect(find.text('Try again'), findsNothing);
+    });
+
+    testWidgets('Try again shows an attempt under way at once, then the result', (tester) async {
+      server.registerStatus = 503;
+      SharedPreferences.setMockInitialValues({}); // opening Settings starts no attempt of its own
+      await registerPhone(tester);
+      await openSettings(tester);
+      expect(find.text('Try again'), findsOneWidget);
+
+      SharedPreferences.setMockInitialValues({'bg_auth_token': 'jwt'});
+      server
+        ..registerStatus = 200
+        ..registerHold = Completer<void>();
+      await tester.tap(find.text('Try again'));
+      await tester.pump();
+      expect(find.text('Registering this phone for push…'), findsOneWidget);
+      expect(find.text('Try again'), findsNothing);
+
+      server.registerHold!.complete();
+      await tester.pumpAndSettle();
+      expect(find.text('Active on this phone'), findsOneWidget);
+    });
+
+    testWidgets('the two-line status lines fit a 320 wide phone', (tester) async {
+      server.registerStatus = 503;
+      await registerPhone(tester);
+      await openSettings(tester, width: 320);
+      expect(find.text('Try again'), findsOneWidget); // text + hint + a button
+      expect(tester.takeException(), isNull);
+
+      // Pumping a fresh tree (and a fresh look at the registration) with a
+      // server that cannot send: text + hint, no button.
+      await tester.pumpWidget(const SizedBox());
+      FcmService.debugReset();
+      FcmService.debugSetInitialized(true);
+      FcmService.postRetryPause = Duration.zero;
+      FcmService.retryDelays = const [];
+      FcmService.getFcmToken = () async => 'tok-1';
+      server
+        ..registerStatus = 200
+        ..registerBody = {'isOk': true, 'pushReady': false, 'problem': 'x'};
+      await tester.runAsync(FcmService.registerToken);
+      await openSettings(tester, width: 320);
+      expect(find.text("Registered, but the server can't send to this phone"), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('a registration waiting for its retry reads as registering, not active', (tester) async {
+      SharedPreferences.setMockInitialValues({}); // no session: opening Settings starts no attempt of its own
+      server.registerStatus = 503;
+      FcmService.retryDelays = const [Duration(minutes: 10)];
+      await registerPhone(tester);
+      expect(FcmService.debugRetryScheduled, isTrue);
+      await openSettings(tester);
+
+      expect(find.text('Registering this phone for push…'), findsOneWidget);
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text('Try again'), findsNothing);
+    });
+
+    testWidgets('follows a registration that finishes while the screen is open', (tester) async {
+      server.registerHold = Completer<void>();
+      FcmService.debugSetInitialized(true);
+      await tester.runAsync(() async {
+        unawaited(FcmService.registerToken());
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      });
+      await openSettings(tester);
+      expect(find.text('Registering this phone for push…'), findsOneWidget);
+
+      server.registerHold!.complete();
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 50)));
+      await tester.pump(const Duration(seconds: 3)); // the screen looks again every couple of seconds
+      await tester.pumpAndSettle();
+
+      expect(find.text('Registering this phone for push…'), findsNothing);
+      expect(find.text('Active on this phone'), findsOneWidget);
+    });
+
+    testWidgets('a test push that cannot be delivered takes "Active" away, a good one gives it back', (tester) async {
+      await registerPhone(tester);
+      await openSettings(tester);
+      expect(find.text('Active on this phone'), findsOneWidget);
+
+      server.testBody = _testAnswer(ok: false, code: 'messaging/third-party-auth-error', hint: 'APNs key missing');
+      await tester.tap(find.text('Send a test notification'));
+      await tester.pumpAndSettle();
+      expect(find.text("The server couldn't deliver the test"), findsOneWidget);
+      expect(server.tests.single, {'token': 'tok-1'}, reason: 'the test is aimed at this phone alone');
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text("Registered, but the server can't send to this phone"), findsOneWidget);
+
+      server.testBody = _testAnswer(ok: true);
+      await tester.tap(find.text('Send a test notification'));
+      await tester.pumpAndSettle();
+      expect(find.text('Test notification sent'), findsOneWidget);
+      await tester.tap(find.text('OK'));
+      await tester.pumpAndSettle();
+      expect(find.text('Active on this phone'), findsOneWidget);
+    });
+
+    testWidgets('a permission the OS refuses outranks a working registration', (tester) async {
+      osStatus = 4; // permanently denied
+      await registerPhone(tester);
+      await openSettings(tester);
+
+      expect(find.text('Active on this phone'), findsNothing);
+      expect(find.text('Blocked in system settings'), findsOneWidget);
+      expect(find.text('Open settings'), findsOneWidget);
+      expect(find.text('Send a test notification'), findsNothing);
+    });
+
+    // permission_handler on Android below 13 reports "denied" for
+    // notifications switched off in the system settings, and its request()
+    // cannot show anything there — an "Allow" would do nothing.
+    testWidgets('Android 12 and below, notifications blocked in system settings: Open settings, not Allow', (tester) async {
+      osStatus = 0; // denied
+      osCanAsk = false; // and no dialog to show
+      await openSettings(tester);
+
+      expect(find.text('Blocked in system settings'), findsOneWidget);
+      expect(find.text('Allow'), findsNothing);
+      expect(find.text('Not allowed on this phone yet'), findsNothing);
+
+      await tester.tap(find.text('Open settings'));
+      await tester.pumpAndSettle();
+      expect(osCalls, contains('openAppSettings'));
+    });
+
+    testWidgets('a permission the OS can still ask for keeps its Allow button', (tester) async {
+      osStatus = 0; // denied once on Android 13+: the dialog can come up again
+      osCanAsk = true;
+      await openSettings(tester);
+
+      expect(find.text('Not allowed on this phone yet'), findsOneWidget);
+      expect(find.text('Allow'), findsOneWidget);
+      expect(find.text('Open settings'), findsNothing);
+    });
+
+    testWidgets('when the OS cannot say whether it can ask, Allow stays', (tester) async {
+      osStatus = 0;
+      osRationaleError = PlatformException(code: 'no-activity');
+      await openSettings(tester);
+
+      expect(find.text('Allow'), findsOneWidget);
+      expect(find.text('Blocked in system settings'), findsNothing);
+    });
+
+    testWidgets('Allow asks the OS and the line follows the answer', (tester) async {
+      osStatus = 0;
+      osCanAsk = true;
+      await openSettings(tester);
+
+      osStatus = 1; // the user taps "Allow" in the system dialog
+      await tester.tap(find.text('Allow'));
+      await tester.pumpAndSettle();
+
+      expect(osCalls, contains('requestPermissions'));
+      expect(find.text('Not allowed on this phone yet'), findsNothing);
+      expect(find.text('Send a test notification'), findsOneWidget);
+    });
+  });
+
   group('Local banners obey the topic switches', () {
     final shown = <String>[];
 
@@ -429,7 +750,9 @@ void main() {
       'pushNotificationTypes': types,
     };
 
-    setUp(() => SharedPreferences.setMockInitialValues({'bg_auth_token': 'tok'}));
+    // The polls fetch only the signed-in person's own items, so they need
+    // the mirrored user id along with the token.
+    setUp(() => SharedPreferences.setMockInitialValues({'bg_auth_token': 'tok', 'bg_user_id': 'u1'}));
 
     test('new audit assigned needs both assignment topics, and the tick refreshes the mirror', () async {
       await tick(preferences: prefs(), audits: [audit('a1')]); // baseline

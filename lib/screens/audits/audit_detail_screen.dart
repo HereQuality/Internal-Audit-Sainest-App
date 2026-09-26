@@ -164,7 +164,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     }
     // Prompt for the mandatory "select representative auditee" gate as
     // soon as the screen opens, before the assigned auditor can start
-    // scoring a non-Self audit that hasn't had one set yet. Runs last,
+    // scoring an audit that hasn't had one set yet. Runs last,
     // after auditeeCandidates is this audit's own zone(s) pool built
     // above. Dismissing this prompt doesn't skip the requirement — see
     // _needsRepresentative, which keeps the checklist read-only and
@@ -335,14 +335,12 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   bool _isPrimaryAuditor(AuditDetailModel audit, String? myId) =>
       myId != null && audit.auditorIds.contains(myId);
 
-  // The hard gate this screen enforces: a non-Self audit's assigned
-  // auditor can't score anything (or Submit/Final Submit) until at least
-  // one representative auditee is set — see _buildBody's `interactive` and
-  // `_buildActions` below, both of which fold this in. Self Audits never
-  // need one (the auditor is the auditee), and there's nothing to gate
-  // once the audit is no longer active for scoring anyway.
+  // The hard gate this screen enforces: an audit's assigned auditor can't
+  // score anything (or Submit/Final Submit) until at least one
+  // representative auditee is set — see _buildBody's `interactive` and
+  // `_buildActions` below, both of which fold this in. There's nothing to
+  // gate once the audit is no longer active for scoring anyway.
   bool _needsRepresentative(AuditDetailModel audit, String? myId) =>
-      !audit.isSelfAudit &&
       audit.auditeeIds.isEmpty &&
       _isPrimaryAuditor(audit, myId) &&
       _isActiveForScoring(audit);
@@ -493,13 +491,26 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     return 'Location';
   }
 
-  // The "raise NC against" pool, narrowed to just the active location's
-  // own members for a per-location audit — the checkpoint being scored
-  // right now only makes sense to raise against someone actually at that
-  // location, not the auditor's whole hierarchy. Falls back to the full
-  // hierarchy when there's no location to filter by (whole-audit mode) or
-  // nobody there has a locationIds match yet, so the picker is never left
-  // with nothing selectable.
+  // The NC "raise against" pool: the audited location's people
+  // (AuditsProvider.auditeeCandidates) minus the acting auditor themself —
+  // an NC always goes to someone at the audited location, never back to
+  // whoever is raising it (same as the web's ncAuditeeOptions in
+  // AuditReportDetail.jsx). Every NC-raise picker on this screen is fed from
+  // this; the representative picker (_promptForRepresentative) keeps the
+  // full, unfiltered list. When it comes back empty the sheets say "No one
+  // else is tagged to this audit's location." and block raising.
+  List<EmployeeOption> _ncAuditeeOptions(
+    List<EmployeeOption> all,
+    String? myId,
+  ) => myId == null ? all : all.where((e) => e.id != myId).toList();
+
+  // The "raise NC against" pool (already minus the auditor, see
+  // _ncAuditeeOptions), narrowed to just the active location's own members
+  // for a per-location audit — the checkpoint being scored right now only
+  // makes sense to raise against someone actually at that location, not
+  // the auditor's whole hierarchy. Falls back to the audit's other tagged
+  // locations' people when there's no location to filter by (whole-audit
+  // mode) or nobody else there has a locationIds match yet.
   List<EmployeeOption> _employeesForNc(
     AuditDetailModel audit,
     List<EmployeeOption> all,
@@ -669,8 +680,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                   context,
                   auditId: audit.id,
                   auditTitle: audit.title,
-                  isSelfAudit: audit.isSelfAudit,
-                  employees: provider.auditeeCandidates,
+                  employees: _ncAuditeeOptions(provider.auditeeCandidates, myId),
                 ),
               ),
           ],
@@ -684,7 +694,12 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                 icon: Icons.assignment_outlined,
                 title: 'Audit not found',
               )
-            : _buildBody(context, audit, myId, provider.auditeeCandidates),
+            : _buildBody(
+                context,
+                audit,
+                myId,
+                _ncAuditeeOptions(provider.auditeeCandidates, myId),
+              ),
       ),
     );
   }
@@ -837,7 +852,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                   // this is just exposing that as a UI action instead of
                   // it only ever being reachable via the once-per-audit
                   // auto-prompt in _load.
-                  if (isPrimary && !audit.isSelfAudit && activeForScoring)
+                  if (isPrimary && activeForScoring)
                     TextButton(
                       style: TextButton.styleFrom(
                         padding: EdgeInsets.zero,
@@ -1148,7 +1163,6 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                           : (node.weight != null && node.weight! > 0)
                           ? node.weight!
                           : 1,
-                      isSelfAudit: audit.isSelfAudit,
                       employees: _employeesForNc(audit, employees),
                       linkedNc: node.ncId != null
                           ? audit.ncsById[node.ncId]

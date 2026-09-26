@@ -43,19 +43,25 @@ DateTime monthOnly(DateTime d) => DateTime(d.year, d.month);
 // comparison would get wrong).
 int _monthOrdinal(DateTime d) => d.year * 12 + d.month;
 
-/// An audit nobody has wrapped up whose DUE date is already behind us —
-/// the same rule the dashboard's own overdue mini-list uses
-/// (widgets/today_audits_section.dart#_overdueAudits: `scheduledEndDate ??
-/// scheduledDate`) and the server's own plan-bucket derivation
-/// (server/utils/auditStatus.js#derivePlanBucket: `scheduledEndDate ||
-/// scheduledDate`). There is no server-side plan-bucket endpoint backing
-/// this on mobile, so every surface that judges overdue-ness has to derive
-/// it client-side identically, or the same audit reads "overdue" on one
-/// screen and "in progress, on schedule" on another.
+/// Whether the agenda should flag this audit as overdue — the server's
+/// verdict ('Overdue' displayStatus: not completed, now past the end of its
+/// due day; utils/auditLifecycleStatus.js) whenever the row carries one, so
+/// the red border / pill here, the dashboard's Overdue tile and the Overdue
+/// filter chip can never disagree about the same audit.
 ///
-/// This deliberately does NOT read the same field the BUCKETING below
-/// groups by. Bucketing groups by `scheduledDate` (the period START) only
-/// — see buildAuditAgenda's own comment on why a multi-day audit still
+/// Only for an older server / cached row with no displayStatus does it fall
+/// back to deriving it: an audit nobody has wrapped up whose DUE date is
+/// already behind us — `scheduledEndDate ?? scheduledDate`, the same fields
+/// the server's plan-bucket derivation (server/utils/auditStatus.js#
+/// derivePlanBucket) reads, and the same rule the dashboard's overdue
+/// mini-list falls back to (widgets/today_audits_section.dart#
+/// _overdueAudits). Every surface that judges overdue-ness has to agree, or
+/// the same audit reads "overdue" on one screen and "in progress, on
+/// schedule" on another.
+///
+/// The fallback deliberately does NOT read the same field the BUCKETING
+/// below groups by. Bucketing groups by `scheduledDate` (the period START)
+/// only — see buildAuditAgenda's own comment on why a multi-day audit still
 /// gets exactly one bucket instead of being spread across every day it
 /// spans — so a still-live multi-day audit that started days ago can
 /// legitimately sit in a past month's group. That's fine on its own; what
@@ -63,6 +69,10 @@ int _monthOrdinal(DateTime d) => d.year * 12 + d.month;
 /// it's still within its own end date, which is what reading
 /// `scheduledDate` here instead of the due date used to do.
 bool isAuditOverdue(AuditModel audit, DateTime today) {
+  final display = audit.displayStatus;
+  if (display != null) {
+    return display == 'Overdue';
+  }
   if (audit.status == 'Completed' || audit.status == 'Skipped') {
     return false;
   }
@@ -468,14 +478,17 @@ class AgendaEntry {
     return first == last ? first : '$first – $last';
   }
 
-  /// "2 Not Started, 1 Completed" — a collapsed series has no single
+  /// "2 Not Started, 1 Total Closed" — a collapsed series has no single
   /// status to show a badge for, so the badge column becomes a tally.
   /// Same substitution the web app makes (pages/AuditorDashboard.jsx#
-  /// seriesStatusSummary).
+  /// seriesStatusSummary). Counted by each occurrence's display label (the
+  /// server's unified status, the raw status for an older server) — the
+  /// labels the expanded cards' own badges show, so the tally and the rows
+  /// under it use the same words.
   String get statusSummary {
     final counts = <String, int>{};
     for (final o in occurrences) {
-      counts[o.status] = (counts[o.status] ?? 0) + 1;
+      counts[o.displayLabel] = (counts[o.displayLabel] ?? 0) + 1;
     }
     return counts.entries.map((e) => '${e.value} ${e.key}').join(', ');
   }
@@ -1261,6 +1274,12 @@ class AgendaAuditCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final overdue = isAuditOverdue(audit, today);
+    // The status badge already reads "Overdue" (in red) when the server
+    // sent a displayStatus, so a second Overdue pill would just repeat it;
+    // it only earns its place next to an older server's badge, which says
+    // "In Progress" for an overdue audit.
+    final showOverduePill = overdue && audit.displayStatus == null;
+    final hasTimeliness = TimelinessPill.shortLabel(audit.timeliness) != null;
     // The right-hand meta slot: the date when it adds something, else
     // whichever of auditor / audit type this audit actually has. Never
     // blank-but-present — an empty slot with an icon reads as a loading
@@ -1279,9 +1298,9 @@ class AgendaAuditCard extends StatelessWidget {
     return Card(
       // Overdue gets a red-tinted border rather than a red fill: the card
       // still has to read as a normal card in a list of them, it just has
-      // to be findable at a glance while triaging. The Overdue pill next
-      // to the status badge carries the same signal for anyone who can't
-      // rely on colour alone.
+      // to be findable at a glance while triaging. The word "Overdue" (the
+      // status badge, or the pill beside an older server's badge) carries
+      // the same signal for anyone who can't rely on colour alone.
       shape: overdue
           ? RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(16),
@@ -1314,8 +1333,8 @@ class AgendaAuditCard extends StatelessWidget {
                   ),
                   const SizedBox(width: 8),
                   StatusBadge(
-                    label: audit.status,
-                    color: AppColors.forAuditStatus(audit.status),
+                    label: audit.displayLabel,
+                    color: AppColors.forAuditStatus(audit.displayLabel),
                   ),
                 ],
               ),
@@ -1331,7 +1350,9 @@ class AgendaAuditCard extends StatelessWidget {
                       ?.copyWith(color: scheme.outline),
                 ),
               ],
-              if (audit.auditType != null || overdue) ...[
+              if (audit.auditType != null ||
+                  showOverduePill ||
+                  hasTimeliness) ...[
                 const SizedBox(height: 8),
                 Wrap(
                   spacing: 6,
@@ -1359,7 +1380,11 @@ class AgendaAuditCard extends StatelessWidget {
                           ),
                         ),
                       ),
-                    if (overdue) const _OverduePill(),
+                    if (showOverduePill) const _OverduePill(),
+                    // On-Time / Delayed for a finished audit — beside the
+                    // badge's NC stage, not instead of it.
+                    if (hasTimeliness)
+                      TimelinessPill(timeliness: audit.timeliness),
                   ],
                 ),
               ],

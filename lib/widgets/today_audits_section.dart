@@ -35,17 +35,30 @@ List<AuditModel> _todaysAudits(List<AuditModel> audits) {
 // Distinct from "today's" above: an audit spanning several days stays in
 // this list every day it's actively being worked, not just the day it
 // started.
-List<AuditModel> _inProgressAudits(List<AuditModel> audits) =>
-    audits.where((a) => a.status == 'In Progress').toList();
+//
+// Follows the server's displayStatus, whose 'In Progress' EXCLUDES overdue
+// audits (they are 'Overdue' there). The raw `status` used to be the test,
+// and it says 'In Progress' for an overdue open audit too — so the same card
+// appeared here and again under Overdue. Older server / cached data (no
+// displayStatus): the raw status, as before.
+List<AuditModel> _inProgressAudits(List<AuditModel> audits) => audits
+    .where((a) => a.displayStatus != null
+        ? a.displayStatus == 'In Progress'
+        : a.status == 'In Progress')
+    .toList();
 
-// Past its own scheduled window and still not wrapped up — mirrors the
-// simple "not Completed/Skipped and the due date has passed" rule (no
-// server-side plan-bucket endpoint backs this list yet, unlike the web
-// app's derivePlanBucket, so it's derived client-side from the same
-// scheduledDate/scheduledEndDate fields the Today section already reads).
+// Past its own due date and still not wrapped up — the server's 'Overdue'
+// displayStatus (auditLifecycleStatus.js: not completed, now past the end of
+// the due day), so this list, the dashboard's Overdue tile and the Overdue
+// chip all agree. Only when displayStatus is absent (older server / cached
+// data) is it derived client-side, by the simple "not Completed/Skipped and
+// the due date has passed" rule from the same scheduledDate/scheduledEndDate
+// fields the Today section already reads.
 List<AuditModel> _overdueAudits(List<AuditModel> audits) {
   final today = _dayOnly(DateTime.now());
   return audits.where((a) {
+    final display = a.displayStatus;
+    if (display != null) return display == 'Overdue';
     if (a.status == 'Completed' || a.status == 'Skipped') return false;
     final due = a.scheduledEndDate ?? a.scheduledDate;
     if (due == null) return false;
@@ -194,7 +207,7 @@ class _AuditListCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final statusColor = AppColors.forAuditStatus(audit.status);
+    final statusColor = AppColors.forAuditStatus(audit.displayLabel);
     return Card(
       elevation: 0,
       color: scheme.surface,
@@ -216,7 +229,9 @@ class _AuditListCard extends StatelessWidget {
                 width: 4,
                 height: 40,
                 margin: const EdgeInsets.only(top: 2, right: 12),
-                decoration: BoxDecoration(color: statusColor, borderRadius: BorderRadius.circular(2)),
+                // readable(): the raw token is dark by design (badge text
+                // on a light tint) and would sink into the dark theme's card.
+                decoration: BoxDecoration(color: AppColors.readable(context, statusColor), borderRadius: BorderRadius.circular(2)),
               ),
               Expanded(
                 child: Column(
@@ -249,7 +264,7 @@ class _AuditListCard extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 8),
-              StatusBadge(label: audit.status, color: statusColor),
+              StatusBadge(label: audit.displayLabel, color: statusColor),
             ],
           ),
         ),

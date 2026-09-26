@@ -18,7 +18,16 @@ import 'package:flutter/material.dart';
 /// half of the fix; `shrinkWrap`/`compact` below (widget-level, not
 /// ChipThemeData fields) remove the hidden tap-target padding so there's
 /// nothing left to be off-center.
-class StatusFilterChipRow extends StatelessWidget {
+///
+/// The row can be longer than the screen (the audit lists now carry all
+/// eight lifecycle statuses), so the SELECTED chip is scrolled into view
+/// whenever it is picked from outside the row — a dashboard tile jumping
+/// straight to "NC Verification Pending" must not land on a list whose
+/// highlighted chip is off the right edge. That is why the chips are laid
+/// out in a plain scrolling Row (one GlobalKey each, all built up front — a
+/// filter row is a handful of chips) instead of a lazy ListView, whose
+/// off-screen chips have no context to scroll to.
+class StatusFilterChipRow extends StatefulWidget {
   final List<String> options;
   final String selected;
   final ValueChanged<String> onSelected;
@@ -27,35 +36,102 @@ class StatusFilterChipRow extends StatelessWidget {
   /// denser secondary picker like AuditDetailScreen's per-location chips.
   final double height;
 
+  /// Optional colour per option — draws a small dot on the chip so a status
+  /// chip carries the same colour as its badge everywhere else. Null (or a
+  /// null return) leaves that chip plain. The dot gives way to the check
+  /// mark while its chip is selected.
+  final Color? Function(String option)? dotColorFor;
+
   const StatusFilterChipRow({
     super.key,
     required this.options,
     required this.selected,
     required this.onSelected,
     this.height = 44,
+    this.dotColorFor,
   });
+
+  @override
+  State<StatusFilterChipRow> createState() => _StatusFilterChipRowState();
+}
+
+class _StatusFilterChipRowState extends State<StatusFilterChipRow> {
+  // One key per POSITION (not per label), so a caller that ever repeats a
+  // label cannot end up with two widgets sharing a GlobalKey.
+  final List<GlobalKey> _keys = [];
+
+  GlobalKey _keyAt(int i) {
+    while (_keys.length <= i) {
+      _keys.add(GlobalKey(debugLabel: 'chip-${_keys.length}'));
+    }
+    return _keys[i];
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _revealSelected();
+  }
+
+  @override
+  void didUpdateWidget(StatusFilterChipRow old) {
+    super.didUpdateWidget(old);
+    if (old.selected != widget.selected) _revealSelected();
+  }
+
+  // Post-frame: the chip has to be laid out before it can be scrolled to.
+  void _revealSelected() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final i = widget.options.indexOf(widget.selected);
+      final ctx = i < 0 || i >= _keys.length ? null : _keys[i].currentContext;
+      if (ctx == null) return;
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: height,
-      child: ListView.separated(
+      height: widget.height,
+      child: SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        itemCount: options.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (_, i) {
-          final label = options[i];
-          return Center(
-            child: ChoiceChip(
-              label: Text(label),
-              selected: selected == label,
-              onSelected: (_) => onSelected(label),
-              materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              visualDensity: VisualDensity.compact,
-            ),
-          );
-        },
+        child: Row(
+          children: [
+            for (int i = 0; i < widget.options.length; i++) ...[
+              if (i > 0) const SizedBox(width: 8),
+              _chip(i),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _chip(int index) {
+    final label = widget.options[index];
+    final dot = widget.dotColorFor?.call(label);
+    return Center(
+      key: _keyAt(index),
+      child: ChoiceChip(
+        label: Text(label),
+        avatar: dot == null
+            ? null
+            : Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
+              ),
+        selected: widget.selected == label,
+        onSelected: (_) => widget.onSelected(label),
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
       ),
     );
   }

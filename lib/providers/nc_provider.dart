@@ -38,13 +38,32 @@ class NcProvider extends ChangeNotifier {
     return Future.wait([fetchRaisedByMe(), fetchAgainstMe()]);
   }
 
-  /// Back to the Me default, without refetching — call on logout. See
-  /// AuditFilterScope.resetForLogout's doc for why this matters on a
+  // Bumped on logout: a fetch already on the wire for the previous account
+  // finds the number changed when it lands and drops its answer — its error
+  // and its loading flag too — instead of putting that account's NCs back
+  // after the reset or ending the next account's own loading state.
+  int _epoch = 0;
+
+  /// Back to the Me default and empty, without refetching — call on logout.
+  /// See AuditFilterScope.resetForLogout's doc for why this matters on a
   /// shared device: every provider here is a single, process-lifetime
   /// instance, so without this the NEXT person to log in would inherit
-  /// whichever scope the PREVIOUS account left this on.
+  /// whichever scope the PREVIOUS account left this on — and see that
+  /// account's NC lists until their own fetch lands. The self id goes too: a
+  /// SuperAdmin never gets one set (main.dart's _RootGate), so it would
+  /// otherwise keep filtering by the previous employee.
   void resetForLogout() {
+    _epoch++;
     isTeamScope = false;
+    _selfEmployeeId = null;
+    raisedByMe = [];
+    raisedAgainstMe = [];
+    activeNc = null;
+    raisedError = null;
+    mineError = null;
+    isLoadingRaised = false;
+    isLoadingMine = false;
+    isLoadingDetail = false;
     notifyListeners();
   }
 
@@ -91,6 +110,7 @@ class NcProvider extends ChangeNotifier {
   }
 
   Future<void> fetchRaisedByMe() async {
+    final epoch = _epoch;
     isLoadingRaised = true;
     raisedError = null;
     notifyListeners();
@@ -99,22 +119,28 @@ class NcProvider extends ChangeNotifier {
         ApiConstants.ncsRaised,
         queryParameters: _scopeParams,
       );
+      if (epoch != _epoch) return;
       raisedByMe = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => NcModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
     } on DioException catch (e) {
-      raisedError = extractErrorMessage(
-        e,
-        fallback: 'Could not load raised NCs.',
-      );
+      if (epoch == _epoch) {
+        raisedError = extractErrorMessage(
+          e,
+          fallback: 'Could not load raised NCs.',
+        );
+      }
     } finally {
-      isLoadingRaised = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingRaised = false;
+        notifyListeners();
+      }
     }
   }
 
   Future<void> fetchAgainstMe() async {
+    final epoch = _epoch;
     isLoadingMine = true;
     mineError = null;
     notifyListeners();
@@ -123,15 +149,20 @@ class NcProvider extends ChangeNotifier {
         ApiConstants.ncsMine,
         queryParameters: _scopeParams,
       );
+      if (epoch != _epoch) return;
       raisedAgainstMe = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => NcModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
     } on DioException catch (e) {
-      mineError = extractErrorMessage(e, fallback: 'Could not load your NCs.');
+      if (epoch == _epoch) {
+        mineError = extractErrorMessage(e, fallback: 'Could not load your NCs.');
+      }
     } finally {
-      isLoadingMine = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingMine = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -145,10 +176,13 @@ class NcProvider extends ChangeNotifier {
   /// notification's referenceId (nc.controller.js's nc_raised/nc_approved/
   /// nc_rejected types) into a full NcModel to navigate to (see
   /// notifications_screen.dart). Returns null on failure — the caller
-  /// falls back to just leaving the notification marked read.
+  /// falls back to just leaving the notification marked read — which is also
+  /// what an answer that outlived its account gets: null, and no state written.
   Future<NcModel?> fetchById(String id) async {
+    final epoch = _epoch;
     try {
       final res = await _dio.get(ApiConstants.ncDetail(id));
+      if (epoch != _epoch) return null;
       final nc = NcModel.fromJson(Map<String, dynamic>.from(res.data['data']));
       activeNc = nc;
       notifyListeners();

@@ -111,6 +111,167 @@ void main() {
     expect(check.lines.first, 'messaging/internal-error');
   });
 
+  group('a test aimed at this phone\'s own token', () {
+    test('speaks for the one row the server answered with', () {
+      final check = describePushTestResponse(
+        _body(results: [
+          {'platform': 'ios', 'ok': true, 'code': null},
+        ]),
+        platform: 'ios',
+        thisPhoneOnly: true,
+      );
+
+      expect(check.ok, isTrue);
+    });
+
+    test('a row of another platform is not this phone', () {
+      final check = describePushTestResponse(
+        _body(results: [
+          {'platform': 'android', 'ok': true, 'code': null},
+        ]),
+        platform: 'ios',
+        thisPhoneOnly: true,
+      );
+
+      expect(check.ok, isFalse);
+      expect(check.title, contains("isn't registered"));
+    });
+
+    test('no row at all means the server has no registration for this phone', () {
+      final check = describePushTestResponse(_body(), platform: 'android', thisPhoneOnly: true);
+
+      expect(check.ok, isFalse);
+      expect(check.title, contains("isn't registered"));
+    });
+
+    test('a failed send is a failure', () {
+      final check = describePushTestResponse(
+        _body(results: [
+          {'platform': 'android', 'ok': false, 'code': 'messaging/third-party-auth-error'},
+        ]),
+        platform: 'android',
+        thisPhoneOnly: true,
+      );
+
+      expect(check.ok, isFalse);
+      expect(check.lines.first, 'messaging/third-party-auth-error');
+    });
+
+    test('a server that ignored the token cannot let a second phone of this platform vouch', () {
+      final results = [
+        {'platform': 'android', 'ok': false, 'code': 'messaging/invalid-argument'},
+        {'platform': 'android', 'ok': true, 'code': null},
+      ];
+
+      // Without the token the old rule stands (any phone of this platform)...
+      expect(describePushTestResponse(_body(results: results), platform: 'android').ok, isTrue);
+      // ...with it, one failure among several unattributable rows is a failure.
+      final check = describePushTestResponse(
+        _body(results: results),
+        platform: 'android',
+        thisPhoneOnly: true,
+      );
+      expect(check.ok, isFalse);
+      expect(check.lines.first, contains('cannot say which one is this phone'));
+      expect(check.lines, contains('messaging/invalid-argument'));
+    });
+
+    test('several phones that all got it are delivered whichever one is ours', () {
+      final check = describePushTestResponse(
+        _body(results: [
+          {'platform': 'android', 'ok': true, 'code': null},
+          {'platform': 'android', 'ok': true, 'code': null},
+        ]),
+        platform: 'android',
+        thisPhoneOnly: true,
+      );
+
+      expect(check.ok, isTrue);
+    });
+
+    test('an older server\'s other-platform rows are still ignored', () {
+      final check = describePushTestResponse(
+        _body(results: [
+          {'platform': 'ios', 'ok': false, 'code': 'messaging/third-party-auth-error'},
+          {'platform': 'android', 'ok': true, 'code': null},
+        ]),
+        platform: 'android',
+        thisPhoneOnly: true,
+      );
+
+      expect(check.ok, isTrue);
+    });
+  });
+
+  group('pushTestDelivered', () {
+    test('null when the answer says nothing about this phone', () {
+      expect(pushTestDelivered(_body(), platform: 'ios', thisPhoneOnly: true), isNull);
+      expect(
+        pushTestDelivered(
+          _body(results: [
+            {'platform': 'android', 'ok': true, 'code': null},
+          ]),
+          platform: 'ios',
+        ),
+        isNull,
+      );
+      expect(pushTestDelivered({}, platform: 'ios'), isNull);
+    });
+
+    test('true or false for the row that speaks for this phone', () {
+      bool? delivered(bool ok, {bool thisPhoneOnly = true}) => pushTestDelivered(
+        _body(results: [
+          {'platform': 'android', 'ok': ok, 'code': ok ? null : 'x'},
+        ]),
+        platform: 'android',
+        thisPhoneOnly: thisPhoneOnly,
+      );
+
+      expect(delivered(true), isTrue);
+      expect(delivered(false), isFalse);
+      expect(delivered(false, thisPhoneOnly: false), isFalse);
+    });
+  });
+
+  group('resolvePushBadge', () {
+    PushBadge badge(PushPermission permission, PushRegistration registration) =>
+        resolvePushBadge(permission: permission, registration: registration);
+
+    test('active needs the permission AND a registered token AND a server that can send', () {
+      expect(badge(PushPermission.granted, PushRegistration.registered), PushBadge.active);
+
+      for (final registration in PushRegistration.values) {
+        if (registration == PushRegistration.registered) continue;
+        expect(
+          badge(PushPermission.granted, registration),
+          isNot(PushBadge.active),
+          reason: registration.name,
+        );
+      }
+      for (final permission in [PushPermission.notAsked, PushPermission.blocked]) {
+        expect(
+          badge(permission, PushRegistration.registered),
+          isNot(PushBadge.active),
+          reason: permission.name,
+        );
+      }
+    });
+
+    test('each granted-permission state has its own badge', () {
+      expect(badge(PushPermission.granted, PushRegistration.notSetUp), PushBadge.notSetUp);
+      expect(badge(PushPermission.granted, PushRegistration.registering), PushBadge.registering);
+      expect(badge(PushPermission.granted, PushRegistration.cannotDeliver), PushBadge.cannotDeliver);
+      expect(badge(PushPermission.granted, PushRegistration.notRegistered), PushBadge.notRegistered);
+    });
+
+    test('the permission is what the line reports first, whatever the registration', () {
+      for (final registration in PushRegistration.values) {
+        expect(badge(PushPermission.notAsked, registration), PushBadge.notAllowed);
+        expect(badge(PushPermission.blocked, registration), PushBadge.blocked);
+      }
+    });
+  });
+
   test('tolerates a malformed body', () {
     expect(describePushTestResponse({}, platform: 'ios').ok, isFalse);
     expect(describePushTestResponse({'data': 'x'}, platform: 'ios').ok, isFalse);

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:internal_audit_app/models/audit_detail_model.dart';
+import 'package:internal_audit_app/models/employee_option.dart';
 import 'package:internal_audit_app/models/nc_model.dart';
 import 'package:internal_audit_app/screens/audits/checkpoint_card.dart';
 import 'package:internal_audit_app/screens/audits/nc_details_sheet.dart';
@@ -94,10 +95,15 @@ void main() {
     expect(find.text('Observation'), findsNothing);
   }
 
+  // Someone at the audited location other than the acting auditor — the
+  // pool the NC pickers are always fed with (the auditor is never in it, and
+  // the picker is never skipped: an NC is always raised against a person).
+  const ravi = EmployeeOption(id: 'emp2', name: 'Ravi K');
+
   group('NC details sheet (raise a checkpoint NC / edit an NC)', () {
     testWidgets('labels the field Flag, never Severity, and offers Major/Minor only', (tester) async {
       await pumpAndOpen(tester, (context) {
-        showNcDetailsSheet(context, employees: const [], isSelfAudit: true, initialRemark: '');
+        showNcDetailsSheet(context, employees: const [ravi], initialRemark: '');
       });
 
       expect(find.text('Flag'), findsOneWidget);
@@ -110,8 +116,8 @@ void main() {
       await pumpAndOpen(tester, (context) async {
         result = await showNcDetailsSheet(
           context,
-          employees: const [],
-          isSelfAudit: true,
+          employees: const [ravi],
+          initialAuditeeId: 'emp2',
           initialRemark: 'kept',
           initialSeverity: 'Observation',
           initialTargetDate: DateTime(2030, 1, 15),
@@ -134,8 +140,8 @@ void main() {
       await pumpAndOpen(tester, (context) async {
         result = await showNcDetailsSheet(
           context,
-          employees: const [],
-          isSelfAudit: true,
+          employees: const [ravi],
+          initialAuditeeId: 'emp2',
           initialRemark: '',
           initialSeverity: 'Major',
           initialTargetDate: DateTime(2030, 1, 15),
@@ -147,13 +153,51 @@ void main() {
       await tester.tap(find.text('Save Changes'));
       await tester.pumpAndSettle();
       expect(result!.severity, 'Major');
+      expect(result!.auditeeEmployeeId, 'emp2');
+    });
+
+    testWidgets('always asks who the NC is against — the picker is there, and saving needs a pick', (tester) async {
+      NcDetailsResult? result;
+      await pumpAndOpen(tester, (context) async {
+        result = await showNcDetailsSheet(
+          context,
+          employees: const [ravi],
+          initialRemark: 'kept',
+          initialTargetDate: DateTime(2030, 1, 15),
+        );
+      });
+
+      expect(find.text('Raise NC against'), findsOneWidget);
+      expect(find.textContaining('Self Audit'), findsNothing);
+      expect(find.text("No one else is tagged to this audit's location."), findsNothing);
+
+      // Nothing picked — nothing is defaulted (least of all to the auditor),
+      // so Save is refused and the sheet stays open.
+      await tester.ensureVisible(find.text('Save & Raise NC'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save & Raise NC'));
+      await tester.pumpAndSettle();
+      expect(find.text('Pick who this NC is against'), findsOneWidget);
+      expect(result, isNull);
+      expect(find.text('Save & Raise NC'), findsOneWidget);
+    });
+
+    testWidgets('with nobody else at the location it says so and blocks raising', (tester) async {
+      await pumpAndOpen(tester, (context) {
+        showNcDetailsSheet(context, employees: const [], initialRemark: '');
+      });
+
+      expect(find.text('Raise NC against'), findsOneWidget);
+      expect(find.text("No one else is tagged to this audit's location."), findsOneWidget);
+      final save = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Save & Raise NC'));
+      expect(save.onPressed, isNull);
     });
   });
 
   group('Raise Non-Conformance sheet (freeform NC)', () {
     testWidgets('labels the field Flag, never Severity, and offers Major/Minor only', (tester) async {
       await pumpAndOpen(tester, (context) {
-        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP', isSelfAudit: true);
+        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP', employees: const [ravi]);
       });
 
       expect(find.text('Flag'), findsOneWidget);
@@ -161,6 +205,29 @@ void main() {
       // Defaults to Minor.
       expect(find.text('Minor'), findsOneWidget);
       await expectFlagMenuIsMajorMinorOnly(tester);
+    });
+
+    testWidgets('always shows the Raise NC against picker; raising is enabled when someone can be picked', (tester) async {
+      await pumpAndOpen(tester, (context) {
+        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP', employees: const [ravi]);
+      });
+
+      expect(find.text('Raise NC against'), findsOneWidget);
+      expect(find.textContaining('Self Audit'), findsNothing);
+      expect(find.text("No one else is tagged to this audit's location."), findsNothing);
+      final raise = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Raise NC'));
+      expect(raise.onPressed, isNotNull);
+    });
+
+    testWidgets('with nobody else at the location it says so and blocks raising', (tester) async {
+      await pumpAndOpen(tester, (context) {
+        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP');
+      });
+
+      expect(find.text('Raise NC against'), findsOneWidget);
+      expect(find.text("No one else is tagged to this audit's location."), findsOneWidget);
+      final raise = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Raise NC'));
+      expect(raise.onPressed, isNull);
     });
   });
 

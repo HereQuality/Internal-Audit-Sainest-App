@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/network/dio_client.dart';
 import '../../core/theme/app_colors.dart';
+import '../../core/utils/audit_status.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
@@ -20,8 +21,9 @@ import '../audits/audit_detail_screen.dart';
 
 /// Profile -> Reports (titled "Final Report" to match the web app) — every
 /// audit this employee can see, same GET /audits/mine list AuditsProvider.
-/// fetchReportAudits wraps, narrowed by the same status chips MyAudits
-/// Screen uses (my_audits_screen.dart's `_statusFilters`) plus a search box
+/// fetchReportAudits wraps, narrowed by status chips (the same lifecycle
+/// statuses MyAuditsScreen's chips use, plus "Completed" — see
+/// `_statusFilters`) plus a search box
 /// and a completed/scheduled-date range filter, mirroring the web app's
 /// Final Report page (client/src/pages/CompletedAudits.jsx) and its own
 /// search + DateRangeFilter. Each card is downloadable as a real PDF
@@ -60,18 +62,38 @@ class ReportsScreen extends StatefulWidget {
   State<ReportsScreen> createState() => _ReportsScreenState();
 }
 
-// Same list (and same "fetch once, filter locally" reasoning) as
-// my_audits_screen.dart's own _statusFilters — kept as its own copy since
-// that one is file-private. Deliberately WITHOUT 'Draft', unlike that
-// copy: Reports is "download a report", and a Draft-status audit (which,
-// per AuditDetailModel.isInstant's own doc comment, is also where every
-// Instant Audit lives for its whole build-and-score life, not just
-// genuinely-unstarted ones) has no finished report to hand out — a filter
-// chip whose result is either nothing or a half-built one doesn't belong
-// on this screen the way it does on My Audits' own "what do I still have
-// to work on" list. Still reachable via 'All' if one somehow shows up
-// here, just not surfaced as its own one-tap chip.
-const _statusFilters = ['All', 'Not Started', 'In Progress', 'Completed'];
+// Same "fetch once, filter locally" reasoning — and same matching rules
+// (core/utils/audit_status.dart#auditMatchesStatusFilter) — as
+// my_audits_screen.dart's own chips, in this screen's own order:
+//   * 'Completed' (the DEFAULT, and this screen's pre-existing behaviour) is
+//     every audit whose auditor has finished it — matched on the RAW stored
+//     status, whatever its NC stage — so the Final Report list keeps showing
+//     exactly the audits that have a final report. It sits right after 'All'
+//     so the selected default chip is on screen when the row first paints.
+//   * the two timeliness chips and the NC-stage chips narrow within it;
+//   * Not Started / In Progress / Overdue are the unfinished stages, kept
+//     from the old chip row (with Overdue new).
+// Deliberately WITHOUT 'Draft', unlike MyAuditsScreen's own list: Reports
+// is "download a report", and a Draft-status audit (which, per
+// AuditDetailModel.isInstant's own doc comment, is also where every Instant
+// Audit lives for its whole build-and-score life, not just genuinely-
+// unstarted ones) has no finished report to hand out — a filter chip whose
+// result is either nothing or a half-built one doesn't belong on this
+// screen the way it does on My Audits' own "what do I still have to work
+// on" list. Still reachable via 'All' if one somehow shows up here, just
+// not surfaced as its own one-tap chip.
+const _statusFilters = [
+  'All',
+  AuditStatus.completed,
+  AuditStatus.delayedCompleted,
+  AuditStatus.onTimeCompleted,
+  AuditStatus.ncResponsePending,
+  AuditStatus.ncVerificationPending,
+  AuditStatus.totalClosed,
+  AuditStatus.notStarted,
+  AuditStatus.inProgress,
+  AuditStatus.overdue,
+];
 
 class _ReportsScreenState extends State<ReportsScreen> {
   // Which row's PDF is currently generating — gates that one row's download
@@ -85,8 +107,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
   final Set<String> _expandedBatchIds = {};
   // Defaults to Completed — this screen's pre-existing behavior and the
   // web Final Report page's own default view — the other stages
-  // (mirroring MyAuditsScreen's status chips) are one tap away.
-  String _statusFilter = 'Completed';
+  // (mirroring MyAuditsScreen's status chips) are one tap away. This is the
+  // raw stored-Completed gate (see _statusFilters), not a display status.
+  String _statusFilter = AuditStatus.completed;
   final TextEditingController _searchController = TextEditingController();
   String _search = '';
   // Inclusive day-precision bounds, same convention as the web page's own
@@ -204,8 +227,14 @@ class _ReportsScreenState extends State<ReportsScreen> {
     final provider = context.read<AuditsProvider>();
     try {
       List<AuditDetailModel> zones;
+      // The batch aggregate the combined PDF prints as its Status — from the
+      // batch report response itself; null on the per-member fallback below,
+      // where buildCombinedReportPdf reads it off the zones instead.
+      String? batchStatus;
       try {
-        zones = await provider.fetchBatchReport(batchId);
+        final report = await provider.fetchBatchReport(batchId);
+        zones = report.zones;
+        batchStatus = report.statusLabel;
       } on DioException {
         // Used to only fall back here on a 403 (no "Final Report"/"Schedule
         // Audit" menu grant) and rethrow anything else — but a combined
@@ -225,7 +254,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
         }
       }
       if (zones.isEmpty) throw Exception('Could not load this report.');
-      final bytes = await buildCombinedReportPdf(zones);
+      final bytes = await buildCombinedReportPdf(
+        zones,
+        batchStatus: batchStatus,
+      );
       await Printing.sharePdf(
         bytes: bytes,
         filename: '${_sanitizedFileName(title)}-combined.pdf',
@@ -257,7 +289,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
         provider.reportAudits.isEmpty &&
         !showError;
     final filtered = provider.reportAudits
-        .where((a) => _statusFilter == 'All' || a.status == _statusFilter)
+        .where((a) => auditMatchesStatusFilter(a, _statusFilter))
         .where(_matchesSearch)
         .where(_matchesDateRange)
         .toList();
@@ -314,6 +346,11 @@ class _ReportsScreenState extends State<ReportsScreen> {
             StatusFilterChipRow(
               options: _statusFilters,
               selected: _statusFilter,
+              // 'Completed' (any finished audit) has no colour of its own
+              // in the new palette, so it stays a plain chip.
+              dotColorFor: (o) => o == 'All' || o == AuditStatus.completed
+                  ? null
+                  : AppColors.readable(context, AppColors.forAuditStatus(o)),
               onSelected: (v) => setState(() => _statusFilter = v),
             ),
           ],
@@ -356,7 +393,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                         icon: Icons.filter_alt_off_outlined,
                         title: hasActiveTextOrDateFilter
                             ? 'No audits match your filters'
-                            : 'No $_statusFilter audits',
+                            : auditStatusEmptyTitle(_statusFilter),
                       ),
                     )
                   else
@@ -642,6 +679,18 @@ class _ReportCard extends StatelessWidget {
                             ),
                           ),
                         ],
+                        // On-Time / Delayed for a finished audit, beside the
+                        // NC-stage badge on the right rather than instead of
+                        // it. Under the left column's text (not the badge
+                        // column) so the right column keeps its two rows.
+                        if (TimelinessPill.shortLabel(audit.timeliness) !=
+                            null) ...[
+                          const SizedBox(height: 4),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TimelinessPill(timeliness: audit.timeliness),
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -649,8 +698,8 @@ class _ReportCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.end,
                     children: [
                       StatusBadge(
-                        label: audit.status,
-                        color: AppColors.forAuditStatus(audit.status),
+                        label: audit.displayLabel,
+                        color: AppColors.forAuditStatus(audit.displayLabel),
                       ),
                       const SizedBox(height: 4),
                       _scoreBadge(context, audit.scorePercentage),
@@ -734,13 +783,12 @@ class _BatchReportCard extends StatelessWidget {
     return max > 0 ? (achieved / max * 100) : null;
   }
 
-  // Same rule as the web Final Report table's own groupStatusLabel: one
-  // status badge for the whole group when every zone agrees, else "Mixed"
-  // rather than picking one zone's status to stand in for the rest.
-  String get _groupStatus {
-    final first = members.first.status;
-    return members.every((m) => m.status == first) ? first : 'Mixed';
-  }
+  // The batch's ONE status — the server's aggregate over every zone of the
+  // batch (batchDisplayStatus: the final status appears only once every zone
+  // is done), which replaces the old "all zones agree, else Mixed" guess
+  // over just this employee's own zones. See auditGroupStatus for the
+  // older-server fallback.
+  String get _groupStatus => auditGroupStatus(members);
 
   @override
   Widget build(BuildContext context) {
@@ -774,54 +822,96 @@ class _BatchReportCard extends StatelessWidget {
                               ),
                             ),
                             const SizedBox(height: 4),
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: scheme.primary.withValues(alpha: 0.1),
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    Icons.layers_outlined,
-                                    size: 12,
-                                    color: scheme.primary,
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 4,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 2,
                                   ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    '${members.length} locations',
-                                    style: TextStyle(
-                                      color: scheme.primary,
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 11.5,
+                                  decoration: BoxDecoration(
+                                    color: scheme.primary.withValues(
+                                      alpha: 0.1,
                                     ),
+                                    borderRadius: BorderRadius.circular(999),
                                   ),
-                                ],
-                              ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.layers_outlined,
+                                        size: 12,
+                                        color: scheme.primary,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      // Flexible: the status badge beside
+                                      // this column can now be ~150px wide
+                                      // ("NC Verification Pending"), and at
+                                      // a large text size the chip must
+                                      // give way rather than overflow.
+                                      Flexible(
+                                        child: Text(
+                                          '${members.length} locations',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            color: scheme.primary,
+                                            fontWeight: FontWeight.w700,
+                                            fontSize: 11.5,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                // The whole batch's On-Time / Delayed —
+                                // set by the server only once every zone is
+                                // completed (batchTimeliness), so it never
+                                // shows for a batch still in progress.
+                                TimelinessPill(
+                                  timeliness: auditGroupTimeliness(members),
+                                ),
+                              ],
                             ),
                           ],
                         ),
                       ),
-                      StatusBadge(
-                        label: _groupStatus,
-                        color: AppColors.forAuditStatus(_groupStatus),
-                      ),
-                      const SizedBox(width: 6),
-                      _scoreBadge(context, _combinedPercentage),
-                      const SizedBox(width: 4),
-                      // Combined — spans every zone in this batch, not
-                      // just one member (see onDownloadCombined).
-                      _PdfIconButton(
-                        isDownloading: isDownloadingCombined,
-                        onPressed: onDownloadCombined,
-                      ),
-                      Icon(
-                        isExpanded ? Icons.expand_less : Icons.expand_more,
-                        color: scheme.outline,
+                      // The status badge sits ABOVE the score/PDF/chevron
+                      // cluster rather than in the same row: a lifecycle
+                      // status can be "NC Verification Pending" (~150px),
+                      // which in one row left the title and the "N
+                      // locations" chip about 50px on a phone.
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          StatusBadge(
+                            label: _groupStatus,
+                            color: AppColors.forAuditStatus(_groupStatus),
+                          ),
+                          const SizedBox(height: 4),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _scoreBadge(context, _combinedPercentage),
+                              const SizedBox(width: 4),
+                              // Combined — spans every zone in this batch,
+                              // not just one member (see onDownloadCombined).
+                              _PdfIconButton(
+                                isDownloading: isDownloadingCombined,
+                                onPressed: onDownloadCombined,
+                              ),
+                              Icon(
+                                isExpanded
+                                    ? Icons.expand_less
+                                    : Icons.expand_more,
+                                color: scheme.outline,
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -866,20 +956,40 @@ class _BatchReportCard extends StatelessWidget {
                               color: scheme.outline,
                             ),
                             const SizedBox(width: 4),
+                            // The zone's status goes UNDER its name (with
+                            // its On-Time / Delayed pill), not beside it:
+                            // "NC Verification Pending" next to a score and
+                            // a PDF button left the name a few characters.
                             Expanded(
-                              child: Text(
-                                m.location.isNotEmpty ? m.location : m.title,
-                                style: TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 13,
-                                  color: scheme.onSurface,
-                                ),
-                                overflow: TextOverflow.ellipsis,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    m.location.isNotEmpty ? m.location : m.title,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 13,
+                                      color: scheme.onSurface,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Wrap(
+                                    spacing: 6,
+                                    runSpacing: 4,
+                                    crossAxisAlignment: WrapCrossAlignment.center,
+                                    children: [
+                                      StatusBadge(
+                                        label: m.displayLabel,
+                                        color: AppColors.forAuditStatus(
+                                          m.displayLabel,
+                                        ),
+                                      ),
+                                      TimelinessPill(timeliness: m.timeliness),
+                                    ],
+                                  ),
+                                ],
                               ),
-                            ),
-                            StatusBadge(
-                              label: m.status,
-                              color: AppColors.forAuditStatus(m.status),
                             ),
                             const SizedBox(width: 6),
                             _scoreBadge(context, m.scorePercentage),
@@ -1039,34 +1149,61 @@ class _PerLocationReportCardState extends State<_PerLocationReportCard> {
                                 color: scheme.primary,
                               ),
                               const SizedBox(width: 4),
-                              Text(
-                                '${audit.locationCount} zones',
-                                style: TextStyle(
-                                  color: scheme.primary,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 11.5,
+                              // Flexible for the same reason as the batch
+                              // card's "N locations" chip.
+                              Flexible(
+                                child: Text(
+                                  '${audit.locationCount} zones',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: scheme.primary,
+                                    fontWeight: FontWeight.w700,
+                                    fontSize: 11.5,
+                                  ),
                                 ),
                               ),
                             ],
                           ),
                         ),
+                        if (TimelinessPill.shortLabel(audit.timeliness) !=
+                            null) ...[
+                          const SizedBox(height: 4),
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TimelinessPill(timeliness: audit.timeliness),
+                          ),
+                        ],
                       ],
                     ),
                   ),
-                  StatusBadge(
-                    label: audit.status,
-                    color: AppColors.forAuditStatus(audit.status),
-                  ),
-                  const SizedBox(width: 6),
-                  _scoreBadge(context, audit.scorePercentage),
-                  const SizedBox(width: 4),
-                  _PdfIconButton(
-                    isDownloading: widget.isDownloading,
-                    onPressed: widget.onDownload,
-                  ),
-                  Icon(
-                    _expanded ? Icons.expand_less : Icons.expand_more,
-                    color: scheme.outline,
+                  // Badge above the score/PDF/chevron cluster, not in the
+                  // same row — see _BatchReportCard's header for why (a
+                  // lifecycle status can be "NC Verification Pending").
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      StatusBadge(
+                        label: audit.displayLabel,
+                        color: AppColors.forAuditStatus(audit.displayLabel),
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _scoreBadge(context, audit.scorePercentage),
+                          const SizedBox(width: 4),
+                          _PdfIconButton(
+                            isDownloading: widget.isDownloading,
+                            onPressed: widget.onDownload,
+                          ),
+                          Icon(
+                            _expanded ? Icons.expand_less : Icons.expand_more,
+                            color: scheme.outline,
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
                 ],
               ),

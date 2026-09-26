@@ -3,15 +3,16 @@ import 'package:flutter/material.dart';
 import '../../models/employee_option.dart';
 
 /// The "select representative auditee" step — a hard gate before an
-/// assigned auditor can start scoring a non-Self audit (see
+/// assigned auditor can start scoring (see
 /// audit_detail_screen.dart's `_needsRepresentative`: the checklist stays
 /// read-only and Submit/Final Submit stay hidden until this is set). Picks
 /// one or more people from every member of the audit's location(s) — the
-/// same pool the "raise NC against" picker uses (AuditsProvider.
+/// pool the "raise NC against" picker is built from (AuditsProvider.
 /// auditeeCandidates, purely location-scoped, no manager-hierarchy or
-/// audit-type narrowing) — as a default for who findings get raised
+/// audit-type narrowing; that picker additionally drops the acting auditor,
+/// this one keeps the full list) — as a default for who findings get raised
 /// against; it does not restrict the per-NC picker, which still offers
-/// everyone at those locations. Multi-select (was a single-choice
+/// everyone else at those locations. Multi-select (was a single-choice
 /// dropdown) — a location can genuinely have more than one accountable
 /// representative, and there's no reason to force picking just one when
 /// the underlying field (models/Audit.js#auditeeIds) already supports a

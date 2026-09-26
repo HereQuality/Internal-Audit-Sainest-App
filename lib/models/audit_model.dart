@@ -58,11 +58,64 @@ String? _nonEmpty(dynamic v) {
   return s.isEmpty ? null : s;
 }
 
+// Server-computed per-audit NC tally (audit.controller.js attaches it next
+// to `displayStatus`) — what "NC Response Pending" / "NC Verification
+// Pending" were decided from. Carried for display/debugging only: the app
+// never re-derives a status from it (status contract, client rule 1).
+class AuditNcSummary {
+  final int total;
+  final int responsePending;
+  final int verificationPending;
+  final int closed;
+
+  const AuditNcSummary({
+    this.total = 0,
+    this.responsePending = 0,
+    this.verificationPending = 0,
+    this.closed = 0,
+  });
+
+  // null (not an all-zero summary) for an absent / non-object field, so an
+  // older server that never sends it is distinguishable from "0 NCs".
+  static AuditNcSummary? tryParse(dynamic json) {
+    if (json is! Map) return null;
+    int asInt(dynamic v) => v is num ? v.toInt() : int.tryParse(v?.toString() ?? '') ?? 0;
+    return AuditNcSummary(
+      total: asInt(json['total']),
+      responsePending: asInt(json['responsePending']),
+      verificationPending: asInt(json['verificationPending']),
+      closed: asInt(json['closed']),
+    );
+  }
+}
+
 class AuditModel {
   final String id;
   final String title;
   final String scope;
-  final String status; // Scheduled | In Progress | Completed
+  // The stored/derived status (Draft | Not Started | In Progress | Completed |
+  // Skipped) — what every permission/gating check reads (can score, final
+  // report, edit). NEVER use it as the label: see [displayLabel].
+  final String status;
+  // The unified lifecycle status the owner asked every screen to show —
+  // Not Started / In Progress / Overdue / NC Response Pending / NC
+  // Verification Pending / Total Closed (+ Draft / Skipped) — computed
+  // server-side (utils/auditLifecycleStatus.js), never derived here. Null
+  // from an older server or cached data: [displayLabel] falls back to
+  // `status` then.
+  final String? displayStatus;
+  // "On-Time Completed" | "Delayed Completed", only for a stored-Completed
+  // audit (null otherwise). These two are never a [displayStatus]: they are
+  // the small secondary pill next to a completed audit's badge and the
+  // "completed on time / late" filter + dashboard tile.
+  final String? timeliness;
+  final AuditNcSummary? ncSummary;
+  // Same vocabulary as [displayStatus], aggregated over EVERY sibling of
+  // this audit's scheduleBatchId (the one status a multi-zone batch's parent
+  // row shows); null for a non-batch audit. [batchTimeliness] is set only
+  // once the whole batch is completed (Delayed if any zone was late).
+  final String? batchDisplayStatus;
+  final String? batchTimeliness;
   final DateTime? scheduledDate;
   final DateTime? scheduledEndDate;
   final DateTime? completedDate;
@@ -125,11 +178,28 @@ class AuditModel {
   final int? occurrenceCount;
   bool get isRecurring => seriesId != null && seriesId!.isNotEmpty;
 
+  /// What a badge/tile/filter/PDF prints for this audit: the server's
+  /// unified [displayStatus], else the raw [status] (older server, cached
+  /// data). Every label the user reads goes through this; every behavioural
+  /// gate keeps reading [status].
+  String get displayLabel => displayStatus ?? status;
+
+  /// The status a multi-zone batch's parent row shows — [batchDisplayStatus]
+  /// (aggregated over ALL zones, so it can differ from this one zone's own),
+  /// else this audit's own [displayLabel] for a non-batch audit / older
+  /// server.
+  String get batchLabel => batchDisplayStatus ?? displayLabel;
+
   const AuditModel({
     required this.id,
     required this.title,
     required this.scope,
     required this.status,
+    this.displayStatus,
+    this.timeliness,
+    this.ncSummary,
+    this.batchDisplayStatus,
+    this.batchTimeliness,
     this.scheduledDate,
     this.scheduledEndDate,
     this.completedDate,
@@ -159,6 +229,11 @@ class AuditModel {
       title: json['title']?.toString() ?? 'Untitled Audit',
       scope: json['scope']?.toString() ?? '',
       status: json['status']?.toString() ?? 'Scheduled',
+      displayStatus: _nonEmpty(json['displayStatus']),
+      timeliness: _nonEmpty(json['timeliness']),
+      ncSummary: AuditNcSummary.tryParse(json['ncSummary']),
+      batchDisplayStatus: _nonEmpty(json['batchDisplayStatus']),
+      batchTimeliness: _nonEmpty(json['batchTimeliness']),
       scheduledDate: _localDate(json['scheduledDate']),
       scheduledEndDate: _localDate(json['scheduledEndDate']),
       completedDate: _localDate(json['completedDate']),
@@ -195,6 +270,48 @@ class AuditorStats {
   final int inProgress;
   final int ncPending;
   final int completed;
+  // The unified-status tallies behind the dashboard's tiles (server/
+  // controllers/audit.controller.js#getAuditorStats). Named for the status
+  // they count, NOT for their JSON keys: `assigned` there means Not Started
+  // (and would read as a clone of [assignedAudits], the total, here), and
+  // `ongoing` means In Progress WITHOUT the overdue ones (which [inProgress]
+  // above still includes).
+  //   notStarted/ongoing/overdue — by the audit's own date window;
+  //   delayed/onTimeCompleted    — stored-Completed audits by timeliness,
+  //                                whatever their NC stage;
+  //   ncResponsePending/ncVerificationPending/totalClosed — completed
+  //                                audits by their NC stage.
+  // An audit can therefore sit in a timeliness tile AND an NC tile at once —
+  // intended (status contract, "Stats").
+  final int notStarted;
+  final int ongoing;
+  final int overdue;
+  final int delayed;
+  final int onTimeCompleted;
+  final int ncResponsePending;
+  final int ncVerificationPending;
+  final int totalClosed;
+  // Whether the server sent the three NC-stage tallies above at all. Those are
+  // the newest keys: an older server sends the timeliness tallies (delayed /
+  // onTimeCompleted) but not these, and showing them as 0 would put
+  // "On-Time + Delayed = 12" next to "NC Response + Verification + Closed =
+  // 0" — the two sides are the same set of audits (every audit its auditor
+  // has completed) and must agree, so the dashboard hides the NC-stage tiles
+  // rather than print zeros it does not know.
+  final bool hasNcStageCounts;
+  // Member audit ids per tile, same names as the counts above. The app's
+  // tile taps route through the client-side status filter today (see
+  // MyAuditsScreen), so nothing reads these yet — parsed so a tile can pass
+  // them back as `ids=` (the web dashboard's pattern) without another model
+  // change.
+  final List<String> notStartedIds;
+  final List<String> ongoingIds;
+  final List<String> overdueIds;
+  final List<String> delayedIds;
+  final List<String> onTimeCompletedIds;
+  final List<String> ncResponsePendingIds;
+  final List<String> ncVerificationPendingIds;
+  final List<String> totalClosedIds;
   // This auditor's own ATS/OTC — based on THEIR audits' Start/Due/Completed
   // dates (server/controllers/audit.controller.js#getAuditorStats ->
   // computeAuditAtsScore/computeAuditOtcRate), same fields the web app's
@@ -210,17 +327,86 @@ class AuditorStats {
     this.inProgress = 0,
     this.ncPending = 0,
     this.completed = 0,
+    this.notStarted = 0,
+    this.ongoing = 0,
+    this.overdue = 0,
+    this.delayed = 0,
+    this.onTimeCompleted = 0,
+    this.ncResponsePending = 0,
+    this.ncVerificationPending = 0,
+    this.totalClosed = 0,
+    this.hasNcStageCounts = true,
+    this.notStartedIds = const [],
+    this.ongoingIds = const [],
+    this.overdueIds = const [],
+    this.delayedIds = const [],
+    this.onTimeCompletedIds = const [],
+    this.ncResponsePendingIds = const [],
+    this.ncVerificationPendingIds = const [],
+    this.totalClosedIds = const [],
     this.auditAtsScore,
     this.auditOtcScore,
   });
 
+  /// The tally for one status label of the unified vocabulary (0 for a label
+  /// that has no tile, e.g. Draft/Skipped) — lets the dashboard build its
+  /// tiles from the label list instead of repeating a field per tile.
+  int countFor(String status) => switch (status) {
+    'Not Started' => notStarted,
+    'In Progress' => ongoing,
+    'Overdue' => overdue,
+    'Delayed Completed' => delayed,
+    'On-Time Completed' => onTimeCompleted,
+    'NC Response Pending' => ncResponsePending,
+    'NC Verification Pending' => ncVerificationPending,
+    'Total Closed' => totalClosed,
+    _ => 0,
+  };
+
+  /// [countFor]'s member ids (empty for a label with no tile).
+  List<String> idsFor(String status) => switch (status) {
+    'Not Started' => notStartedIds,
+    'In Progress' => ongoingIds,
+    'Overdue' => overdueIds,
+    'Delayed Completed' => delayedIds,
+    'On-Time Completed' => onTimeCompletedIds,
+    'NC Response Pending' => ncResponsePendingIds,
+    'NC Verification Pending' => ncVerificationPendingIds,
+    'Total Closed' => totalClosedIds,
+    _ => const [],
+  };
+
   factory AuditorStats.fromJson(Map<String, dynamic> json) {
     int asInt(dynamic v) => v is num ? v.toInt() : int.tryParse(v?.toString() ?? '') ?? 0;
+    List<String> asIds(dynamic v) => v is List ? v.map((e) => e.toString()).toList() : const [];
     return AuditorStats(
       assignedAudits: asInt(json['assignedAudits']),
       inProgress: asInt(json['inProgress']),
       ncPending: asInt(json['ncPending']),
       completed: asInt(json['completed']),
+      notStarted: asInt(json['assigned']),
+      // `inProgress` only as a fallback for a server too old to send
+      // `ongoing` at all: it over-counts (it includes overdue), but a tile
+      // reading 0 next to a non-empty list is the worse lie.
+      ongoing: asInt(json.containsKey('ongoing') ? json['ongoing'] : json['inProgress']),
+      overdue: asInt(json['overdue']),
+      delayed: asInt(json['delayed']),
+      onTimeCompleted: asInt(json['onTimeCompleted']),
+      ncResponsePending: asInt(json['ncResponsePending']),
+      ncVerificationPending: asInt(json['ncVerificationPending']),
+      totalClosed: asInt(json['totalClosed']),
+      hasNcStageCounts:
+          json.containsKey('ncResponsePending') &&
+          json.containsKey('ncVerificationPending') &&
+          json.containsKey('totalClosed'),
+      notStartedIds: asIds(json['assignedIds']),
+      ongoingIds: asIds(json['ongoingIds']),
+      overdueIds: asIds(json['overdueIds']),
+      delayedIds: asIds(json['delayedIds']),
+      onTimeCompletedIds: asIds(json['onTimeCompletedIds']),
+      ncResponsePendingIds: asIds(json['ncResponsePendingIds']),
+      ncVerificationPendingIds: asIds(json['ncVerificationPendingIds']),
+      totalClosedIds: asIds(json['totalClosedIds']),
       auditAtsScore: (json['auditAtsScore'] as num?)?.toDouble(),
       auditOtcScore: (json['auditOtcScore'] as num?)?.toDouble(),
     );

@@ -80,12 +80,34 @@
              background_entrypoints.dart — the runtime call's type must be a
              subset of what's declared here. On start it posts the
              persistent "Watching for overdue NCs" notification and polls
-             every 15 minutes for as long as it stays alive
-             (backgroundServiceOnStart in background_entrypoints.dart). -->
+             every 15 minutes until nobody is signed in, push is switched
+             off, or kServiceMaxRuntime has passed (backgroundServiceOnStart
+             in background_entrypoints.dart) — Android 15+ ends a dataSync
+             service that runs ~6 h in the background by killing the whole
+             app, and the plugin has no Service.onTimeout to react to that,
+             so the service stops itself first and is restarted the next
+             time the app is in the foreground. -->
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+        <!-- The plugin's BootReceiver restarts BackgroundService on
+             BOOT_COMPLETED, QUICKBOOT_POWERON and MY_PACKAGE_REPLACED
+             (every reboot and every app update) with no check that anyone
+             is signed in or push is on, so a signed-out phone grew a
+             permanent "Watching for overdue NCs" notification. Android 15+
+             also forbids a BOOT_COMPLETED receiver from starting a dataSync
+             foreground service — an uncaught exception there. Removed here
+             rather than only via autoStartOnBoot: false in
+             background_entrypoints.dart, because that flag is persisted
+             natively and only rewritten when the app next launches, i.e.
+             after the update's own broadcast has already fired. The app
+             starts the service itself: at login, when push is switched
+             on, and whenever it returns to the foreground. Real delivery
+             after a reboot is FCM's job and needs no service. -->
+        <receiver
+            android:name="id.flutter.flutter_background_service.BootReceiver"
+            tools:node="remove" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

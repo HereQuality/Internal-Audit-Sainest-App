@@ -1,3 +1,4 @@
+import 'audit_model.dart' show AuditNcSummary;
 import 'nc_model.dart';
 
 /// Full-detail audit — the scoring workspace's own model, separate from
@@ -222,12 +223,21 @@ class AuditDetailModel {
   final String id;
   final String title;
   final String scope;
+  // Stored/derived status — what the scoring/edit gates read (see
+  // AuditModel.status). The label to PRINT is [displayLabel].
   final String status;
+  // Unified lifecycle status + completed-audit timeliness + NC tally, and
+  // the same aggregate for a multi-zone batch — all server-computed, all
+  // null from an older server (see AuditModel's fields of the same names).
+  final String? displayStatus;
+  final String? timeliness;
+  final AuditNcSummary? ncSummary;
+  final String? batchDisplayStatus;
+  final String? batchTimeliness;
   final String scoringSystem; // "normal" | "weightage"
   final String structureMode; // "same" | "per-location"
   final String distributionMode; // "whole" | "location" | "parameter" — legacy, unused by new audits
   final bool isDistributed; // legacy, unused by new audits
-  final bool isSelfAudit;
   final DateTime? scheduledDate;
   // true when scheduledDate is still in the future — scoring/evidence
   // upload is server-blocked until then (audit.controller.js's
@@ -242,9 +252,8 @@ class AuditDetailModel {
   // Set via the mandatory "select representative auditee" step (see
   // AuditsProvider.setAuditRepresentative) — a default for who this
   // location's findings are raised against, not a hard restriction (the
-  // per-NC picker still offers every location member). Null for a
-  // Self Audit (never asked/needed) or an audit not yet gated through
-  // that step.
+  // per-NC picker still offers every location member). Null for an audit
+  // not yet gated through that step.
   final String? auditeeId;
   final String? auditeeName;
   // The representative picker now allows more than one — these are the
@@ -292,11 +301,15 @@ class AuditDetailModel {
     required this.title,
     required this.scope,
     required this.status,
+    this.displayStatus,
+    this.timeliness,
+    this.ncSummary,
+    this.batchDisplayStatus,
+    this.batchTimeliness,
     required this.scoringSystem,
     required this.structureMode,
     required this.distributionMode,
     required this.isDistributed,
-    this.isSelfAudit = false,
     this.scheduledDate,
     this.scheduledInFuture = false,
     this.isInstant = false,
@@ -324,6 +337,10 @@ class AuditDetailModel {
 
   int get openNcCount => ncs.where((n) => n.status != 'Closed').length;
 
+  /// What the header badge / PDF prints: the unified [displayStatus], else
+  /// the raw [status] (older server). Gates keep reading [status].
+  String get displayLabel => displayStatus ?? status;
+
   // Fast lookup for checkpoint_card.dart — every leaf's ncId (see
   // ParameterNode.ncId) maps 1:1 onto one of these full NC documents.
   Map<String, NcModel> get ncsById => {for (final n in ncs) n.id: n};
@@ -335,11 +352,15 @@ class AuditDetailModel {
       title: json['title']?.toString() ?? 'Untitled Audit',
       scope: json['scope']?.toString() ?? '',
       status: json['status']?.toString() ?? 'Not Started',
+      displayStatus: _nonEmptyString(json['displayStatus']),
+      timeliness: _nonEmptyString(json['timeliness']),
+      ncSummary: AuditNcSummary.tryParse(json['ncSummary']),
+      batchDisplayStatus: _nonEmptyString(json['batchDisplayStatus']),
+      batchTimeliness: _nonEmptyString(json['batchTimeliness']),
       scoringSystem: json['scoringSystem']?.toString() ?? 'normal',
       structureMode: json['structureMode']?.toString() ?? 'same',
       distributionMode: json['distributionMode']?.toString() ?? 'whole',
       isDistributed: json['isDistributed'] as bool? ?? false,
-      isSelfAudit: json['isSelfAudit'] as bool? ?? false,
       scheduledDate: json['scheduledDate'] != null ? DateTime.tryParse(json['scheduledDate'].toString()) : null,
       scheduledInFuture: json['scheduledInFuture'] as bool? ?? false,
       isInstant: json['isInstant'] as bool? ?? false,
@@ -391,4 +412,51 @@ class AuditDetailModel {
       accessLevel: json['accessLevel']?.toString() ?? 'full',
     );
   }
+}
+
+// null for an absent field AND a blank string, so "no status from the
+// server" is one falsy case for the `?? status` fallbacks.
+String? _nonEmptyString(dynamic v) {
+  final s = v?.toString().trim();
+  return s == null || s.isEmpty ? null : s;
+}
+
+/// The one status a multi-zone batch's combined report prints: the batch
+/// report response's own aggregate [aggregate] when the caller has it, else
+/// what the zones carry (`batchDisplayStatus` is the same aggregate stamped
+/// on every zone), else — an older server, or zones fetched one at a time —
+/// the first zone's own label, i.e. the old behaviour.
+String batchStatusOf(List<AuditDetailModel> zones, {String? aggregate}) {
+  if (aggregate != null && aggregate.isNotEmpty) return aggregate;
+  for (final z in zones) {
+    final b = z.batchDisplayStatus;
+    if (b != null && b.isNotEmpty) return b;
+  }
+  return zones.isEmpty ? '' : zones.first.displayLabel;
+}
+
+/// GET /audits/batch/:batchId/report — every zone of a batch plus the
+/// batch-level fields the combined PDF needs on top of them.
+class BatchReport {
+  final List<AuditDetailModel> zones;
+  // The batch aggregate (same vocabulary as AuditDetailModel.displayStatus)
+  // and its timeliness — top-level on the response, null from an older
+  // server. The response's own `status` ("Completed" | "Mixed") is a
+  // different, coarser thing and deliberately not read here.
+  final String? displayStatus;
+  final String? timeliness;
+
+  const BatchReport({required this.zones, this.displayStatus, this.timeliness});
+
+  factory BatchReport.fromJson(Map<String, dynamic> json) => BatchReport(
+    zones: (json['zones'] as List? ?? [])
+        .whereType<Map>()
+        .map((z) => AuditDetailModel.fromJson(Map<String, dynamic>.from(z)))
+        .toList(),
+    displayStatus: _nonEmptyString(json['displayStatus']),
+    timeliness: _nonEmptyString(json['timeliness']),
+  );
+
+  /// The status label for the whole batch — see [batchStatusOf].
+  String get statusLabel => batchStatusOf(zones, aggregate: displayStatus);
 }

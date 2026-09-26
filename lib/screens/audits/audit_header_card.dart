@@ -42,7 +42,19 @@ class AuditHeaderCard extends StatelessWidget {
                 child: Text(audit.title, style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
               ),
               const SizedBox(width: 8),
-              StatusBadge(label: audit.status, color: AppColors.forAuditStatus(audit.status)),
+              // The unified lifecycle status (audit.displayLabel), not the raw
+              // status the scoring gates read; a finished audit also gets its
+              // On-Time / Delayed pill under the badge.
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  StatusBadge(label: audit.displayLabel, color: AppColors.forAuditStatus(audit.displayLabel)),
+                  if (TimelinessPill.shortLabel(audit.timeliness) != null) ...[
+                    const SizedBox(height: 4),
+                    TimelinessPill(timeliness: audit.timeliness),
+                  ],
+                ],
+              ),
             ],
           ),
           if (auditors.isNotEmpty) ...[

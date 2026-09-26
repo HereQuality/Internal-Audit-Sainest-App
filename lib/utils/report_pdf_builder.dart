@@ -408,18 +408,20 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
       reportTitle: audit.title,
       headerFields: [
         ('Auditor', audit.auditorNames.isNotEmpty ? audit.auditorNames.join(', ') : '—'),
-        // Skipped entirely for a self-audit, same as the web's own
-        // headerFields (there's no separate auditee to name).
-        if (!audit.isSelfAudit)
-          (
-            'Auditee',
-            audit.auditeeNames.isNotEmpty
-                ? audit.auditeeNames.join(', ')
-                : ((audit.auditeeName ?? '').isNotEmpty ? audit.auditeeName! : '—'),
-          ),
+        (
+          'Auditee',
+          audit.auditeeNames.isNotEmpty
+              ? audit.auditeeNames.join(', ')
+              : ((audit.auditeeName ?? '').isNotEmpty ? audit.auditeeName! : '—'),
+        ),
         ('Start Date', _fmtDate(audit.scheduledDate)),
         ('End Date', _fmtDate(audit.scheduledEndDate ?? audit.completedDate)),
-        ('Status', audit.status),
+        // The unified lifecycle status the app shows everywhere (e.g.
+        // "NC Response Pending"), not the raw stored one — while
+        // isFinalReport below keeps reading the raw status: whether this is
+        // a FINAL report is about the audit being completed, not about its
+        // NC stage.
+        ('Status', audit.displayLabel),
         ('Scoring', audit.scoringSystem == 'weightage' ? 'Weightage Average' : 'Normal Average'),
       ],
       sections: sections,
@@ -446,7 +448,16 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
 /// not just this employee's own) and only falls back to fetching one zone
 /// at a time via fetchAuditReportDetail (this employee's own zones only)
 /// if that request fails.
-Future<Uint8List> buildCombinedReportPdf(List<AuditDetailModel> zones) async {
+///
+/// [batchStatus] is the batch aggregate printed as the Status — the batch
+/// report response's own `displayStatus` (see BatchReport.statusLabel). When
+/// null (the per-zone fallback above never saw that response) it is read off
+/// the zones' `batchDisplayStatus`, else the first zone's own label (older
+/// server) — see batchStatusOf.
+Future<Uint8List> buildCombinedReportPdf(
+  List<AuditDetailModel> zones, {
+  String? batchStatus,
+}) async {
   if (zones.isEmpty) {
     return pw.Document(theme: await loadReportPdfTheme()).save();
   }
@@ -462,11 +473,9 @@ Future<Uint8List> buildCombinedReportPdf(List<AuditDetailModel> zones) async {
 
   for (final zone in zones) {
     auditorNames.addAll(zone.auditorNames);
-    if (!zone.isSelfAudit) {
-      auditeeNames.addAll(zone.auditeeNames);
-      if (zone.auditeeNames.isEmpty && (zone.auditeeName ?? '').isNotEmpty) {
-        auditeeNames.add(zone.auditeeName!);
-      }
+    auditeeNames.addAll(zone.auditeeNames);
+    if (zone.auditeeNames.isEmpty && (zone.auditeeName ?? '').isNotEmpty) {
+      auditeeNames.add(zone.auditeeName!);
     }
     ncsById.addAll(zone.ncsById);
 
@@ -502,7 +511,9 @@ Future<Uint8List> buildCombinedReportPdf(List<AuditDetailModel> zones) async {
         if (auditeeNames.isNotEmpty) ('Auditee', auditeeNames.join(', ')),
         ('Start Date', _fmtDate(minStart)),
         ('End Date', _fmtDate(maxEnd)),
-        ('Status', first.status),
+        // The batch's ONE aggregate status — final only once every zone is
+        // done — while isFinalReport below stays on each zone's raw status.
+        ('Status', batchStatusOf(zones, aggregate: batchStatus)),
         ('Scoring', first.scoringSystem == 'weightage' ? 'Weightage Average' : 'Normal Average'),
       ],
       sections: sections,

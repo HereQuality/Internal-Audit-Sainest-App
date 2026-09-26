@@ -125,7 +125,10 @@ class CheckpointCard extends StatefulWidget {
   final SaveCheckpoint onSave;
   final UploadCheckpointPhotos onUploadPhotos;
   final DeleteEvidencePhoto? onDeletePhoto;
-  final bool isSelfAudit;
+  // Who an NC raised off this checkpoint can be against: the audited
+  // location's people, already minus the acting auditor (see
+  // audit_detail_screen.dart#_ncAuditeeOptions) — this card never offers, or
+  // defaults to, the auditor themselves.
   final List<EmployeeOption> employees;
   // Reports every _saving true/false transition to the parent screen so it
   // can block back-navigation while a save/upload is actually in flight
@@ -154,7 +157,6 @@ class CheckpointCard extends StatefulWidget {
     required this.onSave,
     required this.onUploadPhotos,
     this.onDeletePhoto,
-    this.isSelfAudit = false,
     this.employees = const [],
     this.onSavingChanged,
     this.linkedNc,
@@ -269,15 +271,10 @@ class _CheckpointCardState extends State<CheckpointCard> {
     super.dispose();
   }
 
-  // A fresh NC finding (this checkpoint doesn't already have one raised)
-  // on a non-self-audit needs an explicit "who is this against" pick —
-  // mirrors ParameterScoreCard.jsx's identical condition. Self Audit
-  // always resolves to the auditor themselves server-side, no picker.
-  bool get _needsAuditeePick => _findingType == 'NC' && widget.node.ncId == null && !widget.isSelfAudit;
-
-  // A fresh NC (not yet raised) always needs its own popup filled in —
-  // auditee pick (non-self-audit only) + a due date — before it can save,
-  // regardless of who it's against.
+  // A fresh NC (not yet raised) always needs its own popup filled in — an
+  // explicit "who is this against" pick (never defaulted to the auditor;
+  // mirrors ParameterScoreCard.jsx's identical condition) + a due date —
+  // before it can save.
   bool get _needsNcDetails => _findingType == 'NC' && widget.node.ncId == null;
 
   // What's still needed before this checkpoint can save at all — mirrors
@@ -292,7 +289,9 @@ class _CheckpointCardState extends State<CheckpointCard> {
   String? get _missingFieldHint {
     if (_findingType == null) return null; // nothing picked yet — no nag before they've started
     if (_findingType == 'OFI' && double.tryParse(_scoreController.text.trim()) == null) return 'Enter a score to save';
-    if (_needsAuditeePick && _auditeeEmployeeId == null) return 'Pick who this NC is against';
+    if (_needsNcDetails && _auditeeEmployeeId == null) {
+      return widget.employees.isEmpty ? "No one else is tagged to this audit's location." : 'Pick who this NC is against';
+    }
     if (_needsNcDetails && _targetDate == null) return 'Set a due date for this NC';
     return null;
   }
@@ -332,7 +331,6 @@ class _CheckpointCardState extends State<CheckpointCard> {
       context,
       mode: NcSheetMode.edit,
       employees: widget.employees,
-      isSelfAudit: widget.isSelfAudit,
       // A populated auditee always has an id; the empty-string fallback in
       // NcPersonRef.fromJson (models/nc_model.dart) is what a missing or
       // unpopulated ref decodes to, and handing that over would just match
@@ -374,7 +372,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
   Future<void> _saveNcEdit(NcDetailsResult details) async {
     setState(() => _ncEditSaving = true);
     final error = await widget.onUpdateNc!(
-      auditeeEmployeeId: widget.isSelfAudit ? null : details.auditeeEmployeeId,
+      auditeeEmployeeId: details.auditeeEmployeeId,
       severity: details.severity,
       targetDate: details.targetDate,
     );
@@ -439,7 +437,6 @@ class _CheckpointCardState extends State<CheckpointCard> {
     final result = await showNcDetailsSheet(
       context,
       employees: widget.employees,
-      isSelfAudit: widget.isSelfAudit,
       initialAuditeeId: _auditeeEmployeeId,
       initialTargetDate: _targetDate,
       initialRemark: _remarkController.text,
@@ -544,7 +541,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
       findingType: _findingType!,
       score: score,
       remark: _remarkController.text.trim(),
-      auditeeEmployeeId: _needsAuditeePick ? _auditeeEmployeeId : null,
+      auditeeEmployeeId: _needsNcDetails ? _auditeeEmployeeId : null,
       targetDate: _needsNcDetails ? _targetDate : null,
       severity: _needsNcDetails ? _severity : null,
     );
@@ -914,7 +911,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
             ),
           ),
         ],
-        // Fresh NC — auditee pick (skipped for Self Audit) + due date are
+        // Fresh NC — auditee pick + due date are
         // both collected together in one popup (see nc_details_sheet.dart)
         // instead of an inline dropdown, so the due date has somewhere to
         // live too.
@@ -923,7 +920,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
           _ncDetailsSummary(scheme) ?? OutlinedButton.icon(
             onPressed: _openNcDetailsPopup,
             icon: const Icon(Icons.assignment_outlined, size: 17),
-            label: Text(widget.isSelfAudit ? 'Set NC due date' : 'Set NC auditee & due date'),
+            label: const Text('Set NC auditee & due date'),
           ),
         ],
         const SizedBox(height: 10),
@@ -1086,18 +1083,16 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // button — null while anything's still missing, so the button above
   // stays in place until then.
   Widget? _ncDetailsSummary(ColorScheme scheme) {
-    if (_needsAuditeePick && _auditeeEmployeeId == null) {
+    if (_auditeeEmployeeId == null) {
       return null;
     }
     if (_targetDate == null) {
       return null;
     }
-    final auditeeName = widget.isSelfAudit
-        ? 'You'
-        : widget.employees.firstWhere(
-            (e) => e.id == _auditeeEmployeeId,
-            orElse: () => const EmployeeOption(id: '', name: 'Unknown'),
-          ).name;
+    final auditeeName = widget.employees.firstWhere(
+      (e) => e.id == _auditeeEmployeeId,
+      orElse: () => const EmployeeOption(id: '', name: 'Unknown'),
+    ).name;
     return _ncPanelShell(
       // The whole panel stays tappable — that's how this summary has
       // always reopened the details popup — AND now carries its own
@@ -1176,10 +1171,7 @@ class _CheckpointCardState extends State<CheckpointCard> {
       ),
       facts: _ncFacts(
         scheme,
-        // Self Audit resolves the auditee to the auditor themselves
-        // server-side, so their own name here would read as a stranger's
-        // for no reason.
-        auditee: widget.isSelfAudit ? 'You' : nc.auditee.name,
+        auditee: nc.auditee.name,
         targetDate: nc.targetDate,
         severity: nc.severity,
         closed: nc.status == 'Closed',

@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show kDebugMode, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -30,14 +30,6 @@ import 'widgets/app_loading.dart';
 import 'widgets/app_update/soft_update_overlay.dart';
 import 'widgets/maintenance/maintenance_announcement_host.dart';
 
-// Set once, before runApp, if the app process was NOT already running and
-// got launched BY tapping a notification (cold start) — see
-// LocalNotifications.consumeLaunchPayload's own doc comment for why this
-// can't just navigate immediately here. Null on an ordinary launch, or
-// once _RootGate has already consumed it (see below) so it doesn't
-// re-fire on some later unrelated rebuild.
-String? _pendingLaunchPayload;
-
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Registers notification channels + the background_service isolate entry
@@ -61,24 +53,29 @@ void main() async {
   // (a hung iOS platform-channel reply, an OEM blocking the foreground
   // service) must not also skip push setup for the whole launch. Firebase
   // not being set up yet still degrades to "no push", never a crash — see
-  // FcmService's own doc comment.
+  // FcmService's own doc comment. Giving up on the wait does not stop the
+  // init: it keeps running, and the launch-tap read below waits for it, so a
+  // slow Firebase start does not cost the tap that opened the app.
   try {
     await FcmService.init().timeout(const Duration(seconds: 5));
   } catch (e, st) {
     debugPrint('FcmService.init failed, continuing without push: $e\n$st');
   }
-  try {
-    // Timeouts guard against a hung platform-channel reply (seen on iOS
-    // with flutter_local_notifications' getNotificationAppLaunchDetails
-    // under the newer implicit-engine registration) — without them, an
-    // unresolved await here blocks runApp() forever: no crash, no error,
-    // just the native launch screen staying up indefinitely.
-    _pendingLaunchPayload =
-        await LocalNotifications.consumeLaunchPayload().timeout(const Duration(seconds: 3)) ??
-        await FcmService.consumeLaunchPayload().timeout(const Duration(seconds: 3));
-  } catch (e, st) {
-    debugPrint('Reading the notification launch payload failed, continuing without it: $e\n$st');
-  }
+  // Set if the app process was NOT already running and got launched BY
+  // tapping a notification (cold start) — see LocalNotifications
+  // .consumeLaunchPayload's own doc comment for why this can't just navigate
+  // immediately here. Held (not acted on) until _RootGate can: signed in and
+  // past the update/maintenance gates. Each source is read on its own, with
+  // its own timeout, so a hung platform-channel reply (seen on iOS with
+  // flutter_local_notifications' getNotificationAppLaunchDetails under the
+  // newer implicit-engine registration) neither blocks runApp() forever nor
+  // costs the other source its read.
+  holdNotificationTap(
+    await resolveLaunchPayload(
+      local: LocalNotifications.consumeLaunchPayload,
+      fcm: FcmService.consumeLaunchPayload,
+    ),
+  );
   runApp(const InternalAuditApp());
 }
 
@@ -116,7 +113,7 @@ class InternalAuditApp extends StatelessWidget {
           // onDidReceiveNotificationResponse) navigate from outside any
           // screen's own BuildContext.
           navigatorKey: notificationNavigatorKey,
-          home: const _RootGate(),
+          home: const RootGate(),
           // Debug-only — every screen (login, Update Required, the app
           // itself) gets this same tiny strip showing which server the app
           // is actually talking to. Exists purely because "why isn't the
@@ -160,18 +157,16 @@ class InternalAuditApp extends StatelessWidget {
   }
 }
 
-class _RootGate extends StatefulWidget {
-  const _RootGate();
+// Public only so a test can mount it under its own providers.
+@visibleForTesting
+class RootGate extends StatefulWidget {
+  const RootGate({super.key});
 
   @override
-  State<_RootGate> createState() => _RootGateState();
+  State<RootGate> createState() => _RootGateState();
 }
 
-class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
-  // Consuming _pendingLaunchPayload is one-shot — a rebuild triggered by
-  // anything else (theme change, a later logout/login) must not re-fire
-  // the same cold-start navigation a second time.
-  bool _consumedLaunchPayload = false;
+class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
   // Tracks whether the LAST build was in the maintenance-blocked state, so
   // the forced pop-to-root below (see isBlocked handling) only fires on
   // the actual on-transition edge, not every rebuild while already blocked.
@@ -258,13 +253,25 @@ class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
           // reads these providers until AppShell mounts again on the next
           // login, long after this frame finishes.
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            // Screens pushed over the shell (an audit, an NC, the profile)
+            // would otherwise stay on top of the login screen after a
+            // session that ended on its own (expiry, blocked account) —
+            // showing the previous account's data to whoever is next.
+            Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
             context.read<AuditsProvider>().resetForLogout();
             context.read<DashboardProvider>().resetForLogout();
             context.read<NcProvider>().resetForLogout();
+            context.read<NotificationsProvider>().resetForLogout();
             context.read<FilterOptionsProvider>().resetForLogout();
+            context.read<TicketsProvider>().resetForLogout();
+            // A tap still waiting for its turn was that account's.
+            clearHeldNotificationTap();
           });
         }
         return const SoftUpdateOverlay(child: LoginScreen());
+      case AuthStatus.offline:
+        _wasBlocked = false;
+        return const _ServerUnreachableScreen();
       case AuthStatus.authenticated:
         _wasAuthenticated = true;
         if (!appMode.loaded) return const Scaffold(body: AppLoading());
@@ -337,12 +344,13 @@ class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
         // AppShell (not replacing it) so the back button still lands
         // somewhere real, same as tapping the equivalent in-app
         // notification row would.
-        if (!_consumedLaunchPayload && _pendingLaunchPayload != null) {
-          _consumedLaunchPayload = true;
-          final payload = _pendingLaunchPayload;
-          _pendingLaunchPayload = null;
+        //
+        // Also where a WARM tap that landed on a login / update / maintenance
+        // screen is applied once those clear (see handleLocalNotificationTap).
+        final heldTap = takeHeldNotificationTap();
+        if (heldTap != null) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            handleLocalNotificationTap(payload);
+            handleLocalNotificationTap(heldTap);
           });
         }
 
@@ -357,5 +365,66 @@ class _RootGateState extends State<_RootGate> with WidgetsBindingObserver {
           child: isSuperAdmin ? content : MaintenanceAnnouncementHost(child: content),
         );
     }
+  }
+}
+
+/// Shown while a saved session can't be confirmed because the server can't
+/// be reached (no signal, a timeout, a deploy) — see AuthStatus.offline. Not
+/// the login screen: the session is still good, asking for the password
+/// again would need the very connection that is missing, and dropping it
+/// would sign the person out of push as well. AuthProvider asks again by
+/// itself (backoff, and every time the app comes to the foreground); the
+/// buttons are for the impatient and for anyone who would rather leave.
+class _ServerUnreachableScreen extends StatelessWidget {
+  const _ServerUnreachableScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final auth = context.watch<AuthProvider>();
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Icon(Icons.cloud_off_outlined, size: 48, color: scheme.outline),
+                  const SizedBox(height: 16),
+                  Text(
+                    "Can't reach the server",
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    "You're still signed in. We'll reconnect as soon as the connection is back.",
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.outline),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 24),
+                  ElevatedButton.icon(
+                    onPressed: auth.isBusy ? null : auth.retrySession,
+                    icon: auth.isBusy
+                        ? const SizedBox(height: 16, width: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.refresh, size: 18),
+                    label: const Text('Try again'),
+                  ),
+                  const SizedBox(height: 12),
+                  TextButton(
+                    onPressed: auth.isBusy ? null : () => auth.logout(),
+                    child: const Text('Sign out'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }

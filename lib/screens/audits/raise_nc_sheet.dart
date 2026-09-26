@@ -15,28 +15,30 @@ import '../../providers/nc_provider.dart';
 // comment for why "Observation" isn't a Flag any more and why this is
 // labeled "Flag" below, not "Severity".
 
+// `employees` is the pool an NC can be raised against — the audited
+// location's people MINUS the acting auditor (the caller,
+// audit_detail_screen.dart, does that filtering). An NC is always raised
+// against someone picked from it, never automatically against the auditor.
 Future<void> showRaiseNcSheet(
   BuildContext context, {
   required String auditId,
   required String auditTitle,
-  bool isSelfAudit = false,
   List<EmployeeOption> employees = const [],
 }) {
   return showModalBottomSheet(
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    builder: (_) => _RaiseNcSheet(auditId: auditId, auditTitle: auditTitle, isSelfAudit: isSelfAudit, employees: employees),
+    builder: (_) => _RaiseNcSheet(auditId: auditId, auditTitle: auditTitle, employees: employees),
   );
 }
 
 class _RaiseNcSheet extends StatefulWidget {
   final String auditId;
   final String auditTitle;
-  final bool isSelfAudit;
   final List<EmployeeOption> employees;
 
-  const _RaiseNcSheet({required this.auditId, required this.auditTitle, required this.isSelfAudit, required this.employees});
+  const _RaiseNcSheet({required this.auditId, required this.auditTitle, required this.employees});
 
   @override
   State<_RaiseNcSheet> createState() => _RaiseNcSheetState();
@@ -78,7 +80,8 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
       showErrorSnackBar(context, 'Please choose a target date.');
       return;
     }
-    if (!widget.isSelfAudit && _auditeeEmployeeId == null) {
+    final auditeeEmployeeId = _auditeeEmployeeId;
+    if (auditeeEmployeeId == null) {
       showErrorSnackBar(context, 'Please pick who this NC is against.');
       return;
     }
@@ -88,7 +91,7 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
           title: _titleController.text.trim(),
           description: _descriptionController.text.trim(),
           targetDate: _targetDate!,
-          auditeeEmployeeId: widget.isSelfAudit ? null : _auditeeEmployeeId,
+          auditeeEmployeeId: auditeeEmployeeId,
           severity: _severity,
         );
     if (!mounted) return;
@@ -177,21 +180,32 @@ class _RaiseNcSheetState extends State<_RaiseNcSheet> {
                   items: kNcFlags.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
                   onChanged: (v) => setState(() => _severity = v ?? _severity),
                 ),
-                if (!widget.isSelfAudit) ...[
-                  const SizedBox(height: 12),
-                  DropdownButtonFormField<String>(
-                    initialValue: _auditeeEmployeeId,
-                    decoration: const InputDecoration(labelText: 'Raise NC against', prefixIcon: Icon(Icons.person_outline)),
-                    isExpanded: true,
-                    items: widget.employees
-                        .map((e) => DropdownMenuItem(value: e.id, child: Text(e.name, overflow: TextOverflow.ellipsis)))
-                        .toList(),
-                    onChanged: (v) => setState(() => _auditeeEmployeeId = v),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  initialValue: _auditeeEmployeeId,
+                  decoration: const InputDecoration(labelText: 'Raise NC against', prefixIcon: Icon(Icons.person_outline)),
+                  isExpanded: true,
+                  items: widget.employees
+                      .map((e) => DropdownMenuItem(value: e.id, child: Text(e.name, overflow: TextOverflow.ellipsis)))
+                      .toList(),
+                  onChanged: (v) => setState(() => _auditeeEmployeeId = v),
+                ),
+                // The list is the audited location's people minus the
+                // auditor — say so when that leaves nobody, or the required
+                // picker just looks broken. Raising is blocked meanwhile
+                // (the button below is disabled): an NC always needs a
+                // "against" person.
+                if (widget.employees.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      "No one else is tagged to this audit's location.",
+                      style: TextStyle(color: scheme.outline, fontSize: 11.5),
+                    ),
                   ),
-                ],
                 const SizedBox(height: 20),
                 ElevatedButton(
-                  onPressed: _isSubmitting ? null : _submit,
+                  onPressed: _isSubmitting || widget.employees.isEmpty ? null : _submit,
                   child: _isSubmitting
                       ? const SizedBox(
                           height: 20,

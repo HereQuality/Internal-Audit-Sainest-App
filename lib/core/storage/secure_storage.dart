@@ -13,6 +13,7 @@ class SecureStorage {
   static const _tokenKey = 'auth_token';
   static const _appModeKey = 'app_mode';
   static const _themeModeKey = 'theme_mode';
+  static const _pendingUnregisterKey = 'fcm_pending_unregister';
 
   Future<void> saveToken(String token) => _storage.write(key: _tokenKey, value: token);
 
@@ -35,5 +36,28 @@ class SecureStorage {
 
   Future<String?> readThemeMode() => _storage.read(key: _themeModeKey);
 
-  Future<void> clear() => _storage.deleteAll();
+  /// The push-token unregistration a sign-out could not send (offline), as
+  /// FcmService's JSON note — it carries the signed-out session's JWT, which is
+  /// why it is kept here and not in SharedPreferences. See [clear] for why it
+  /// outlives the sign-out that writes it.
+  Future<void> savePendingUnregister(String note) => _storage.write(key: _pendingUnregisterKey, value: note);
+
+  Future<String?> readPendingUnregister() => _storage.read(key: _pendingUnregisterKey);
+
+  Future<void> clearPendingUnregister() => _storage.delete(key: _pendingUnregisterKey);
+
+  /// Wipes the session and every local hint. The one thing it keeps is the
+  /// pending unregistration: a sign-out writes it and then calls this, and the
+  /// note is exactly what has to survive that wipe (it is dropped by its own
+  /// retry, or after a week).
+  Future<void> clear() async {
+    String? pending;
+    try {
+      pending = await readPendingUnregister();
+    } catch (_) {
+      // Unreadable storage is the case deleteAll below is the recovery for.
+    }
+    await _storage.deleteAll();
+    if (pending != null) await savePendingUnregister(pending);
+  }
 }

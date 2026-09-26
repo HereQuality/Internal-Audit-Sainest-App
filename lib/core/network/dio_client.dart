@@ -4,14 +4,32 @@ import '../constants/api_constants.dart';
 import '../storage/secure_storage.dart';
 
 /// Centralized Dio instance, mirrors the web app's axios interceptor:
-/// attaches the bearer token to every request and reacts to 401s.
+/// attaches the bearer token to every request and reacts to 401s (and to the
+/// 403 a blocked account gets, see [isBlockedAccountResponse]).
 class DioClient {
   DioClient._();
   static final DioClient instance = DioClient._();
 
-  /// Set by AuthProvider on startup; invoked whenever a request comes back
-  /// 401 so the app can clear state and drop back to the login screen.
+  /// Set by AuthProvider on startup; invoked whenever a request that carried
+  /// the CURRENT session's token comes back 401 — or 403 "Your account has been
+  /// blocked." — so the app can tear the session down and drop back to the
+  /// login screen. It is the handler that
+  /// clears the stored token — the interceptor no longer does it first,
+  /// because the teardown still needs that token (see [explicitBearer]).
   void Function()? onUnauthorized;
+
+  static const _explicitAuthKey = 'explicitAuth';
+
+  /// Options for a request that must go out with a bearer token the CALLER
+  /// holds — the sign-out cleanup (FCM unregister) runs when the stored
+  /// token is already gone or already expired, and it is not a signal about
+  /// the session: the interceptors leave both the header and any 401 of such
+  /// a request alone, so it can neither be stripped nor re-enter the logout
+  /// it is part of.
+  static Options explicitBearer(String token) => Options(
+        headers: {'Authorization': 'Bearer $token'},
+        extra: {_explicitAuthKey: true},
+      );
 
   late final Dio dio = _build();
 
@@ -48,6 +66,7 @@ class DioClient {
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (options, handler) async {
+          if (options.extra[_explicitAuthKey] == true) return handler.next(options);
           final token = await SecureStorage.instance.readToken();
           if (token != null && token.isNotEmpty) {
             options.headers['Authorization'] = 'Bearer $token';
@@ -55,16 +74,39 @@ class DioClient {
           handler.next(options);
         },
         onError: (error, handler) async {
-          // Only treat this as a session expiring — and trigger the
-          // logout flow — if the request actually carried a token. A 401
-          // on a request that had none (e.g. FcmService.unregisterToken
-          // firing from within _forceLogout itself, after the token was
-          // already cleared) is expected, not a new logout signal; treating
-          // it as one re-entered _forceLogout and looped forever.
-          final hadToken = error.requestOptions.headers['Authorization'] != null;
-          if (error.response?.statusCode == 401 && hadToken) {
-            await SecureStorage.instance.clear();
-            onUnauthorized?.call();
+          // Only a 401 for a request that carried the token STILL stored ends
+          // the session. A 401 on a request that had none, or one that
+          // carried a token that has since been cleared or replaced (a
+          // sign-out already under way, or a different account signed in
+          // while this request was in flight), says nothing about the
+          // session that exists now — treating it as a logout signal
+          // re-entered the teardown in a loop, and could sign the NEXT
+          // account out. Requests sent with [explicitBearer] never count.
+          //
+          // The one 403 that counts is the blocked account's (see
+          // [isBlockedAccountResponse]): the server answers a blocked person's
+          // every request with it, so without this the phone would stay signed
+          // in with everything failing until the next launch. Any other 403 is
+          // one endpoint saying no to this person and says nothing about the
+          // session.
+          final sent = error.requestOptions.headers['Authorization'];
+          final explicit = error.requestOptions.extra[_explicitAuthKey] == true;
+          final endsSession = error.response?.statusCode == 401 || isBlockedAccountResponse(error.response);
+          if (endsSession && sent != null && !explicit) {
+            String? current;
+            try {
+              current = await SecureStorage.instance.readToken();
+            } catch (_) {
+              // Unreadable storage: nothing to compare against, leave it be.
+            }
+            if (current != null && sent == 'Bearer $current') {
+              final logout = onUnauthorized;
+              if (logout != null) {
+                logout();
+              } else {
+                await SecureStorage.instance.clear();
+              }
+            }
           }
           handler.next(error);
         },
@@ -73,6 +115,20 @@ class DioClient {
 
     return dio;
   }
+}
+
+/// Whether [response] is the server's "this account is blocked" answer:
+/// auth.middleware.js `protect` replies 403 with the message "Your account has
+/// been blocked." to every request of a blocked account. The status alone is
+/// not enough — the same code carries plenty of ordinary refusals (only the
+/// auditor who raised an NC can verify it, a missing menu permission, a role
+/// that may not use the route) that must leave the session alone — so the
+/// server's own wording decides.
+bool isBlockedAccountResponse(Response<dynamic>? response) {
+  if (response?.statusCode != 403) return false;
+  final data = response?.data;
+  final message = data is Map ? data['message'] : null;
+  return message is String && message.toLowerCase().contains('account has been blocked');
 }
 
 /// Pulls a human-readable message out of a DioException / server error body.

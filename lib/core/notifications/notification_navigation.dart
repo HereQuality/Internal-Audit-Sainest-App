@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../providers/app_update_provider.dart';
+import '../../providers/auth_provider.dart';
+import '../../providers/maintenance_provider.dart';
 import '../../providers/nc_provider.dart';
 import '../../screens/audits/audit_detail_screen.dart';
 import '../../screens/nc/nc_response_screen.dart';
@@ -124,22 +127,89 @@ void _openTicket(BuildContext context, String ticketId) {
   }
 }
 
-/// Entry point for a LOCAL (OS-tray) notification tap while the app
-/// process is already alive (foreground or backgrounded-but-not-killed —
-/// see local_notifications.dart's onDidReceiveNotificationResponse). Goes
-/// through notificationNavigatorKey since this callback has no
-/// BuildContext of its own. A no-op if the navigator isn't mounted yet
-/// (shouldn't happen for this path — the process is already running by
-/// definition — but cheap to guard) or the payload doesn't decode to
-/// anything routable. The cold-start case (app was NOT running, launched
-/// BY the tap) is handled separately — see main.dart, which can't use
-/// this path since there's no authenticated app shell mounted yet at the
-/// moment the tap actually happened.
+/// Whether a tap can be acted on right now: signed in, not on the
+/// force-update screen, not blocked by maintenance. Anything else has a gate
+/// on screen, and a record pushed over it is a way past it (or, over the
+/// login screen, a fetch that can only fail).
+bool notificationTapsAllowed({
+  required AuthStatus status,
+  required bool forceUpdateRequired,
+  required bool maintenanceBlocked,
+}) => status == AuthStatus.authenticated && !forceUpdateRequired && !maintenanceBlocked;
+
+bool _tapsAllowedNow(BuildContext context) {
+  final auth = context.read<AuthProvider>();
+  final isSuperAdmin = auth.user?.roleType == 'SuperAdmin';
+  return notificationTapsAllowed(
+    status: auth.status,
+    forceUpdateRequired: context.read<AppUpdateProvider>().isForceUpdateRequired,
+    // Same rule as main.dart's _RootGate: SuperAdmin bypasses maintenance.
+    maintenanceBlocked: context.read<MaintenanceProvider>().status.isActive && !isSuperAdmin,
+  );
+}
+
+// The one tap waiting for the app to be able to act on it — the cold-start
+// tap (there is no signed-in shell yet at the moment it happens) or a warm
+// tap that landed on a login / force-update / maintenance screen. main.dart's
+// _RootGate takes it once the gates are clear. A newer tap replaces it.
+String? _heldTapPayload;
+
+void holdNotificationTap(String? payload) => _heldTapPayload = payload;
+
+/// Hands out the held tap (once), or null.
+String? takeHeldNotificationTap() {
+  final payload = _heldTapPayload;
+  _heldTapPayload = null;
+  return payload;
+}
+
+/// Forgets the held tap — on logout: it belongs to the account that left.
+void clearHeldNotificationTap() => _heldTapPayload = null;
+
+/// The payload of the notification whose tap LAUNCHED the app, from the two
+/// places it can come from: flutter_local_notifications (a local banner — the
+/// Android data-push renderer, the pollers, the socket fallback) and FCM's
+/// getInitialMessage (an iOS alert push drawn by the OS). Each is read on its
+/// own, with its own timeout and its own try/catch: a platform-channel reply
+/// that hangs or throws on one must not cost the other (an iOS push tap is
+/// never a local-notification launch, so losing the FCM read means losing the
+/// tap). Neither may block runApp() for long.
+Future<String?> resolveLaunchPayload({
+  required Future<String?> Function() local,
+  required Future<String?> Function() fcm,
+  Duration timeout = const Duration(seconds: 3),
+}) async {
+  Future<String?> read(Future<String?> Function() source, String name) async {
+    try {
+      return await source().timeout(timeout);
+    } catch (e, st) {
+      debugPrint('Reading the $name launch payload failed, continuing without it: $e\n$st');
+      return null;
+    }
+  }
+
+  final results = await Future.wait([read(local, 'local-notification'), read(fcm, 'FCM')]);
+  return results[0] ?? results[1];
+}
+
+/// Entry point for a notification tap while the app process is already alive
+/// (foreground or backgrounded-but-not-killed — local_notifications.dart's
+/// onDidReceiveNotificationResponse, and FCM's onMessageOpenedApp). Goes
+/// through notificationNavigatorKey since this callback has no BuildContext
+/// of its own. A tap the app can't act on yet — not signed in, the update or
+/// maintenance screen up, no navigator mounted — is HELD and applied once
+/// main.dart's _RootGate has cleared those gates, never pushed over them.
+/// Does nothing if the payload doesn't decode to anything routable. The
+/// cold-start case (app was NOT running, launched BY the tap) is read once
+/// before runApp (see [resolveLaunchPayload]) and held the same way.
 void handleLocalNotificationTap(String? payload) {
   final decoded = decodeNotificationPayload(payload);
   if (decoded == null) return;
   final context = notificationNavigatorKey.currentContext;
-  if (context == null) return;
+  if (context == null || !_tapsAllowedNow(context)) {
+    holdNotificationTap(payload);
+    return;
+  }
   openNotificationTarget(
     context,
     type: decoded.type,

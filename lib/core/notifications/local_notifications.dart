@@ -1,11 +1,11 @@
-import 'dart:io';
-
+import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:timezone/data/latest_all.dart' as tz_data;
 import 'package:timezone/timezone.dart' as tz;
 
 import 'notification_navigation.dart';
+import 'notification_prefs.dart';
 
 /// One shared plugin instance, plain top-level accessible (no DI) — both
 /// the foreground app and any background isolate that calls
@@ -36,6 +36,13 @@ class LocalNotifications {
       'Audit assignments, audit date reminders, and NC status changes.';
 
   static bool _initialized = false;
+  static Future<void>? _pluginReady;
+
+  @visibleForTesting
+  static void debugReset() {
+    _initialized = false;
+    _pluginReady = null;
+  }
 
   /// Checked once at cold start (main.dart, right after init() above) —
   /// if the app process was NOT already running and got launched BY
@@ -51,12 +58,13 @@ class LocalNotifications {
     return details?.notificationResponse?.payload;
   }
 
-  /// Safe to call from the foreground app AND from a background isolate
-  /// (AndroidAlarmManager callback / background_service isolate) — each
-  /// isolate has its own plugin registration, so this must run once per
-  /// isolate, not once per process.
+  /// Everything [init] does, plus the timezone database. Safe to call from
+  /// the foreground app AND from a background isolate (the foreground-service
+  /// isolate) — each isolate has its own plugin registration, so this must
+  /// run once per isolate, not once per process.
   static Future<void> init() async {
     if (_initialized) return;
+    await initLight();
 
     tz_data.initializeTimeZones();
     // Device-local zone, read from the OS (not guessed from DateTime, which
@@ -71,6 +79,32 @@ class LocalNotifications {
       // Unknown/unmapped tz id on this device — fall back to UTC rather than crash.
     }
 
+    _initialized = true;
+  }
+
+  /// The plugin and the Android channels, nothing else — what drawing a
+  /// banner actually needs. Parsing the whole timezone database and asking
+  /// the OS for the local zone (the rest of [init]) is time the FCM
+  /// background isolate cannot spare: it is a cold isolate that exists to
+  /// put one banner on screen, and every millisecond here is latency on a
+  /// push. The two high-importance channels are (re)created here as well —
+  /// the app's own start-up [init] already made them before anyone could be
+  /// signed in to receive a push, and the plugin would also create one on
+  /// first post, so this only pins down that a heads-up channel exists
+  /// before the first banner rather than depending on either. Idempotent
+  /// (an existing channel keeps what the user set on it); concurrent callers
+  /// share one run.
+  static Future<void> initLight() async {
+    final pending = _pluginReady ??= _initPlugin();
+    try {
+      await pending;
+    } catch (_) {
+      _pluginReady = null; // let the next call try again
+      rethrow;
+    }
+  }
+
+  static Future<void> _initPlugin() async {
     const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
     const iosInit = DarwinInitializationSettings(
       requestAlertPermission:
@@ -90,7 +124,7 @@ class LocalNotifications {
           handleLocalNotificationTap(response.payload),
     );
 
-    if (Platform.isAndroid) {
+    if (defaultTargetPlatform == TargetPlatform.android) {
       final androidPlugin = _plugin
           .resolvePlatformSpecificImplementation<
             AndroidFlutterLocalNotificationsPlugin
@@ -112,8 +146,6 @@ class LocalNotifications {
         ),
       );
     }
-
-    _initialized = true;
   }
 
   /// A normal heads-up notification for one overdue NC. `payload` is an
@@ -152,8 +184,18 @@ class LocalNotifications {
   }
 
   /// Shared implementation behind the five event-poll notification types
-  /// below (see event_poll.dart) — all routine "App Updates" channel
-  /// heads-ups, only the id/title/body/payload differ per call site.
+  /// below (see event_poll.dart) and the live/server banners — all routine
+  /// "App Updates" channel heads-ups, only the id/title/body/payload differ
+  /// per call site. Only the light init: this is also the FCM background
+  /// isolate's path, where time to the banner is the whole point.
+  ///
+  /// [alertOnce]: posting again under an id that is still in the tray UPDATES
+  /// that entry, but Android treats the update as a fresh alert (sound,
+  /// vibration, heads-up) unless it is marked only-alert-once. Set for the
+  /// banners that can legitimately be posted twice under one id — the socket
+  /// and FCM both announcing one server notification — and left off for the
+  /// poll banners, whose ids are reused on purpose (an NC rejected a second
+  /// time) and must alert again.
   ///
   /// BigTextStyleInformation (Android only — iOS's presentAlert already
   /// shows the full body with no style needed): without it, Android
@@ -168,8 +210,9 @@ class LocalNotifications {
     required String title,
     required String body,
     required String payload,
+    bool alertOnce = false,
   }) async {
-    await init();
+    await initLight();
     await _plugin.show(
       id,
       title,
@@ -182,6 +225,7 @@ class LocalNotifications {
           importance: Importance.high,
           priority: Priority.high,
           category: AndroidNotificationCategory.status,
+          onlyAlertOnce: alertOnce,
           styleInformation: BigTextStyleInformation(body, contentTitle: title),
         ),
         iOS: const DarwinNotificationDetails(
@@ -235,15 +279,78 @@ class LocalNotifications {
   }) => _showAppEvent(id: id, title: title, body: body, payload: payload);
 
   /// Any live event delivered over the socket's `new_notification` channel
-  /// — title/body come straight from the server's own notification doc, so
-  /// this covers every notification type (NC lifecycle, audit
-  /// reassignment, future ones) without a type-keyed switch here.
+  /// or an FCM data push — title/body come straight from the server's own
+  /// notification doc, so this covers every notification type (NC
+  /// lifecycle, audit reassignment, future ones) without a type-keyed switch
+  /// here. Both routes derive [id] from the same Mongo id, so a repeat lands
+  /// on the same tray entry — silently ([_showAppEvent]'s `alertOnce`).
+  /// Callers that can race each other go through [showServerBanner].
   static Future<void> showLive({
     required int id,
     required String title,
     required String body,
     String? payload,
-  }) => _showAppEvent(id: id, title: title, body: body, payload: payload ?? '');
+  }) => _showAppEvent(id: id, title: title, body: body, payload: payload ?? '', alertOnce: true);
+
+  /// Local-notification id for one server notification. FCM's data
+  /// `notificationId` and the socket `new_notification` payload's `_id` are
+  /// the same Mongo id, and every display route derives its id from it HERE,
+  /// so two banners for one event land on the same tray entry. [fallback] is
+  /// only for a server that doesn't send `notificationId`.
+  static int serverNotificationId({String? notificationId, String? fallback}) {
+    final key = (notificationId != null && notificationId.isNotEmpty)
+        ? notificationId
+        : (fallback ?? '');
+    return key.hashCode & 0x7fffffff;
+  }
+
+  /// The one way a notification that came FROM THE SERVER (a socket event, an
+  /// FCM data push in either isolate) becomes a banner: claimed in the
+  /// shared ledger first (NotificationPrefs.claimBanner), so whichever route
+  /// sees it first draws it and every other stays quiet — and a poll that
+  /// later derives the same event from a list knows it was already
+  /// announced. Returns whether THIS call drew it. If drawing fails the claim
+  /// is given back, so another route can still try, and the error rethrown.
+  static Future<bool> showServerBanner({
+    required String? notificationId,
+    required String type,
+    required String? referenceId,
+    required String title,
+    required String body,
+    String? fallbackKey,
+  }) async {
+    final kind = type.isEmpty ? 'general' : type;
+    final claimed = await NotificationPrefs.claimBanner(
+      notificationId: notificationId,
+      type: kind,
+      referenceId: referenceId,
+    );
+    if (!claimed) return false;
+    try {
+      await showLive(
+        // Without a notification id (a server that predates it) the tray id
+        // comes from the reference, then from [fallbackKey] (FCM's message id).
+        id: serverNotificationId(
+          notificationId: notificationId,
+          fallback: (referenceId != null && referenceId.isNotEmpty) ? referenceId : fallbackKey,
+        ),
+        title: title,
+        body: body,
+        payload: encodeNotificationPayload(
+          type: kind,
+          referenceId: (referenceId == null || referenceId.isEmpty) ? null : referenceId,
+        ),
+      );
+      return true;
+    } catch (_) {
+      await NotificationPrefs.releaseBanner(
+        notificationId: notificationId,
+        type: kind,
+        referenceId: referenceId,
+      );
+      rethrow;
+    }
+  }
 
   /// Lock-screen, alarm-style presentation — bypasses Do Not Disturb-ish
   /// heads-up and actually launches your Activity over the lock screen.

@@ -63,6 +63,31 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   String? auditeeErrorMessage;
   AuditeeStats auditeeStats = const AuditeeStats();
 
+  // Bumped on logout — see resetForLogout. A fetch that started under an
+  // earlier value writes nothing when it lands (answer, error or loading flag).
+  int _epoch = 0;
+
+  /// Empties everything this provider holds and puts the filters back to
+  /// their defaults — call on logout, without refetching. The stat tiles
+  /// (assigned/in-progress counts, ATS/OTC score, auditee tallies) are the
+  /// previous account's numbers; a shared phone's next login must not show
+  /// them while its own fetch is in flight, and a fetch that was already on
+  /// the wire for the previous account drops its answer ([_epoch]). The self
+  /// id goes too: a SuperAdmin never gets one set (main.dart's _RootGate), so
+  /// it would otherwise keep filtering by the previous employee.
+  @override
+  void resetForLogout() {
+    _epoch++;
+    _selfEmployeeId = null;
+    stats = const AuditorStats();
+    auditeeStats = const AuditeeStats();
+    errorMessage = null;
+    auditeeErrorMessage = null;
+    isLoading = false;
+    isLoadingAuditee = false;
+    super.resetForLogout();
+  }
+
   bool _listening = false;
   // Stored so stopListening removes exactly this closure — Notifications-
   // Provider/AuditsProvider/NcProvider also register their own
@@ -140,6 +165,7 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   Future<void> fetchStats() async {
+    final epoch = _epoch;
     isLoading = true;
     errorMessage = null;
     notifyListeners();
@@ -148,17 +174,22 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.auditorStats,
         queryParameters: filterParams,
       );
+      if (epoch != _epoch) return;
       stats = AuditorStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
     } on DioException catch (e) {
-      errorMessage = extractErrorMessage(
-        e,
-        fallback: 'Could not load dashboard stats.',
-      );
+      if (epoch == _epoch) {
+        errorMessage = extractErrorMessage(
+          e,
+          fallback: 'Could not load dashboard stats.',
+        );
+      }
     } finally {
-      isLoading = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoading = false;
+        notifyListeners();
+      }
     }
   }
 
@@ -167,6 +198,7 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   /// which is auditor-only data (assigned audits, in-progress audits) and
   /// means nothing to someone viewing the app as an auditee.
   Future<void> fetchAuditeeStats() async {
+    final epoch = _epoch;
     isLoadingAuditee = true;
     auditeeErrorMessage = null;
     notifyListeners();
@@ -175,17 +207,22 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.ncsAtsSummary,
         queryParameters: _ncSummaryParams,
       );
+      if (epoch != _epoch) return;
       auditeeStats = AuditeeStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
     } on DioException catch (e) {
-      auditeeErrorMessage = extractErrorMessage(
-        e,
-        fallback: 'Could not load your NC summary.',
-      );
+      if (epoch == _epoch) {
+        auditeeErrorMessage = extractErrorMessage(
+          e,
+          fallback: 'Could not load your NC summary.',
+        );
+      }
     } finally {
-      isLoadingAuditee = false;
-      notifyListeners();
+      if (epoch == _epoch) {
+        isLoadingAuditee = false;
+        notifyListeners();
+      }
     }
   }
 }

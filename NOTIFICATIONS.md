@@ -1,26 +1,34 @@
-# Notifications: local poll + FCM push
+# Notifications: server push, one banner per event, local fallback
 
-Two layers, deliberately overlapping rather than one replacing the other:
+The server is where notifications come from
+(`server/services/notification.service.js#createNotification` is the only
+funnel: in-app row + socket event + email + web push + phone push). The phone
+gets each one through up to four routes, and the code makes sure it is ONE
+banner:
 
-- **Local poll** (this doc's original content, below) — a
-  poll-from-the-device pipeline, resilient on Android via AlarmManager +
-  a foreground service, best-effort on iOS (see **iOS reality check**).
-  Works with ZERO server/Firebase setup.
-- **FCM push** (`core/notifications/fcm_service.dart`) — real push via
-  Firebase Cloud Messaging, arriving even with the app fully closed/
-  killed on both platforms, sourced from the server's own Notification
-  system (`server/services/notification.service.js` ->
-  `fcmPush.service.js`, the exact same funnel the web app's browser push
-  already goes through). See **FCM push setup** below — it needs a real
-  Firebase project (and, for iOS, an Apple APNs key) to do anything; until
-  then it's a total no-op and the local poll (this whole rest of the doc)
-  is the only thing running.
+- **FCM push** (`core/notifications/fcm_service.dart`) — real push through
+  Firebase Cloud Messaging, arriving in every app state (foreground,
+  background, killed) on both platforms. Android is sent a data-only
+  message that this app draws; iOS is sent an alert push that iOS draws. It
+  needs a real Firebase project (and, for iOS, an Apple APNs key) — see
+  **FCM push setup** and **The Firebase project must match on both sides**.
+- **Socket** (`providers/notifications_provider.dart`) — the `new_notification`
+  event over the app's socket.io connection: what draws a banner in real
+  time while the app is open on a phone the server cannot push to, and the
+  fast path on Android.
+- **Local polls** (`event_poll.dart`, `overdue_poll.dart`) — the phone asks
+  `GET /audits/mine` and `GET /ncs/mine` about the signed-in person and derives
+  audit assigned / NC raised / approved / rejected / overdue itself. They are
+  the FALLBACK for a phone the server cannot push to, and the only source of
+  `audit_reminder`, which no server job sends. On Android they run every 15
+  minutes in a foreground service and at every launch/login; on iOS only at
+  launch/login (iOS gives an app no background clock).
 
-Neither layer's dedup state (SharedPreferences `notifiedDates`/`seenIds`
-locally, the server's own `Notification.isRead` for pushes) knows about
-the other, so the FIRST event after FCM goes live can show two tray
-entries for the same thing — a one-time overlap, not a bug to chase; see
-`event_poll.dart`'s own header comment.
+They are NOT independent any more: see **One banner per event** below. (An
+earlier version of this document called the overlap of push and poll "a
+one-time overlap, not a bug to chase". It was not one-time: the poll's dedup
+state never learned about pushes, so every server-pushed event was announced
+a second time, on Android at the next tick and on iOS at the next launch.)
 
 ## Settings: two master switches, then a switch per topic and channel
 
@@ -67,16 +75,19 @@ FCM background handler, the socket banner — can't reach AuthProvider):
 | per-topic Push values (JSON object, effective values) | `notif_push_types` | `readPushTypes()` / `readPushTypeEnabled(type)` (a missing topic is ON) |
 
 `NotificationPrefs.readPushAllowed(type)` = master AND topic, and is what the
-socket banner and both FCM renderers ask; a type that is not in the catalog
-answers to the master alone. The polls read one `PushGate` per tick
+socket banner asks; a type that is not in the catalog answers to the master
+alone. The FCM renderers deliberately do NOT ask it (the server already
+applied both switches, and a stale mirror would drop a push it approved) — they
+only require a signed-in session. The polls read one `PushGate` per tick
 (`refreshPushGate` in `event_poll.dart` re-fetches `GET /auth/me/preferences`
 first, so a change made on the web reaches the killed-app service too).
-Mapping of what a poll may show:
+Mapping of what a poll may show (as the fallback — see **One banner per
+event**; the reminders are the poll's own):
 
 | Local banner | Topic(s) that must be on |
 |---|---|
 | "New audit assigned" | `audit_created` AND `audit_reassigned` — a newly listed audit can be either, and the list can't say which |
-| "Audit starting" / "Audit due" | `audit_reminder` |
+| "Audit starting" / "Audit due" | `audit_reminder` — raised on the day the audit starts / is due, only while the app or the Android service runs; no server job sends them, and iOS never polls in the background. The row's copy says so, and that the Morning summary covers a closed app |
 | "New NC raised against you" | `nc_raised` |
 | "NC response approved" / "rejected" | `nc_approved` / `nc_rejected` |
 | overdue NC | `nc_overdue` |
@@ -100,8 +111,8 @@ per-type reminder toggles — are gone.
 
 | | Android | iOS |
 |---|---|---|
-| Shape | **data-only** (`title`/`body`/`type`/`referenceId`/`notificationId` in `data`, no `notification` block), `android.priority: high` | **alert push**: `notification` block + `apns` headers (`apns-push-type: alert`, `apns-priority: 10`, a collapse id) + `aps.sound`; `data` carries `type`/`referenceId`/`notificationId` for tap routing |
-| Drawn by | this app: `fcm_service.dart` renders a local notification (foreground handler + `_firebaseMessagingBackgroundHandler`) | iOS itself — banner + sound, even with the app force-quit. No Dart runs for the banner |
+| Shape | **data-only** (`title`/`body`/`type`/`referenceId`/`notificationId` in `data`, no `notification` block), `android.priority: high`, 24 h `ttl` | **alert push**: `notification` block + `apns` headers (`apns-push-type: alert`, `apns-priority: 10`, 24 h `apns-expiration`, a collapse id) + `aps.sound`; `data` carries `type`/`referenceId`/`notificationId` for tap routing |
+| Drawn by | this app: `fcm_service.dart` renders a local notification (foreground listener + `fcmBackgroundMessageHandler`, a separate isolate when the app is not in the foreground) | iOS itself — banner + sound, even with the app force-quit. No Dart runs for the banner |
 | `content-available` | n/a | deliberately NOT set — it would also wake the Dart background handler and double the banner |
 
 Why iOS can't use data-only: a data-only message shows nothing on iOS; it
@@ -111,23 +122,190 @@ messages a second time:
 
 - foreground: `setForegroundNotificationPresentationOptions(alert, badge,
   sound)` (in `FcmService.init`) makes iOS show the alert push while the
-  app is open, and `_handleForegroundMessage` skips any iOS message that
-  has a `notification` block;
-- `_firebaseMessagingBackgroundHandler` returns early for any message with
-  a `notification` block;
-- the socket-driven live banner (`NotificationsProvider`) stays quiet on
-  iOS once the token is registered (`FcmService.pushShownNatively`) —
-  otherwise the same event would show twice, once from the socket and
-  once from the push. Before registration succeeds it still acts as the
-  fallback.
+  app is open. `_handleForegroundMessage` does not draw it again — it only
+  RECORDS it in the banner ledger, which is how the socket path learns iOS
+  drew it (see below);
+- `fcmBackgroundMessageHandler` returns early for any message with a
+  `notification` block.
 
-Local notification ids derive from the server's Notification `_id`
-(`FcmService.localNotificationId`; the FCM `notificationId` and the
-socket `new_notification` `_id` are the same value), so if a socket banner
-and an FCM banner for one event DO both show (Android), they replace each
-other instead of stacking. Every local banner — socket, FCM foreground/
-background — is skipped while the mirrored master Push switch is off or that
-notification's own topic is off (`readPushAllowed`).
+The handler registered with `FirebaseMessaging.onBackgroundMessage` is NOT
+`fcmBackgroundMessageHandler` itself but the private
+`_firebaseMessagingBackgroundHandler` in the same file, which only delegates to
+it. The plugin persists a callback handle natively and Flutter maps it back to
+a function by name and library, so after an app update the phone still holds the
+old build's handle until the new build has launched once: the registered symbol
+must keep the name earlier builds registered, or a push in that gap is dropped.
+Never rename it. Log lines about a push carry its type and id only, never
+`data` (`debugPrint` reaches logcat and the iOS unified log in release builds).
+
+## One banner per event
+
+**Who owns what.** Everything the server pushes — audit assigned / series /
+reassigned / skipped / completed / overdue, NC raised / responded / approved
+/ rejected / overdue, both daily summaries, tickets — is owned by the
+server: FCM and the socket draw it. Only `audit_reminder` (start / due
+reminders) is owned by the phone. The polls announce a server-owned event only
+as a fallback (below).
+
+**The banner ledger.** Every route that draws a server notification goes
+through `LocalNotifications.showServerBanner`, which first *claims* it in a
+shared ledger (`NotificationPrefs.claimBanner`, SharedPreferences with a
+`reload()` before every read, so it is shared across the app's isolates):
+
+| Ledger key | Meaning | Used by |
+|---|---|---|
+| `n:<notificationId>` | the server's own id (the Mongo `_id`; FCM's `notificationId` and the socket `_id` are the same value) | socket vs FCM, exact |
+| `e:<type>\|<referenceId>` | the EVENT (only for the types a poll can derive: audit created / series / reassigned, NC raised / approved / rejected / overdue) | a poll, which only knows "this audit / NC changed" |
+
+Whoever claims first draws it; the others stay quiet. Entries are bounded
+(300, 3 days). If drawing fails the claim is given back so another route can
+still show it. Every route also uses the same tray id
+(`LocalNotifications.serverNotificationId`, a hash of the notification id) and
+posts `onlyAlertOnce`, so the residual race (two isolates interleaving their
+read-modify-write and both drawing) updates one tray entry silently instead
+of stacking or buzzing twice.
+
+**Route by route:**
+
+| App state | Android | iOS |
+|---|---|---|
+| Foreground | socket + FCM foreground callback both call `showServerBanner`; the first draws, the second is dropped | iOS draws the alert push; the FCM foreground callback records it in the ledger. The socket path waits up to `FcmService.nativeAlertGrace` (4 s) for that record and draws its OWN banner only if none arrived (broken APNs setup, dropped push) and the app is still in the foreground |
+| Background (process alive) | FCM background isolate + the socket (if still connected) → ledger | iOS draws it natively and nothing runs in Dart. While the phone is registered for push the socket path stays quiet (there is nothing to add, and a banner from a socket that outlived the foreground would repeat the OS's); on a phone the server can't push to it still draws |
+| Killed | FCM background isolate | iOS draws it natively |
+
+The socket-driven banner is also gated by the switches mirror
+(`readPushAllowed`: master AND topic). The FCM renderers deliberately are not
+(the server already applied both switches, and a mirror that is stale after a
+switch turned ON from the web while the app was killed would drop a push the
+server approved) — they check only that somebody is signed in.
+
+**Why iOS still lets the OS draw the foreground push.** The cleaner-looking
+design is to switch the foreground presentation options off and draw one local
+banner from whichever of socket / FCM `onMessage` arrives first. It was
+checked against `firebase_messaging` 16.7.0's iOS source and is NOT safe
+without a native change: the plugin answers iOS's `willPresent` for EVERY
+notification with those (global) options — including the local ones
+`flutter_local_notifications` posts (whose own `willPresent` answers only for
+notifications it created) — and it is registered before it (see
+`GeneratedPluginRegistrant.m`), so in the AppDelegate's first-reply-wins
+handler its answer most likely comes first (the Flutter engine's fan-out order
+is not something that could be read from source here). With the options off,
+every foreground banner (the socket fallback, the polls) would then be
+swallowed. It needs
+`AppDelegate.swift`'s `willPresent` to tell a remote push (`gcm.message_id` in
+`userInfo`) from a local one and answer differently; that is a Swift change
+that has to be tried on a real iPhone. Until then the app relies on evidence
+rather than a static assumption: it does not suppress its own banner just
+because a token is registered (which turned a misconfigured APNs key into a
+totally silent foreground iPhone), it waits to see whether iOS actually drew
+the push.
+
+**The polls are a fallback, not a second announcer.** A poll shows a banner for
+a server-owned event only when ALL hold:
+
+1. the account's master switch and that event's topic are on;
+2. the server cannot be counted on to have told the person — while
+   `NotificationPrefs.readFcmPushReady()` is true it is the server's job, and the
+   poll only keeps its bookkeeping (seen ids, last statuses, notified NCs), so
+   flipping the flag off later never dumps a backlog;
+3. no server banner for that event was already drawn on this phone
+   (`consumeServerEvent` — one recorded banner covers one observed change, so
+   an NC rejected twice is two events).
+
+`bg_fcm_push_ready` is written by `FcmService`: set when the server accepts this
+phone's token and doesn't say `pushReady: false`; cleared by sign-out, by a token
+refresh until the new token is registered, by the server saying it cannot
+send, and by a Settings "Send a test notification" that the server reports as
+undeliverable to this phone (a phone with a missing APNs key registers fine and
+then every send fails — only a real send reveals it; a later successful test
+clears the mark, and so does signing out). "Audit starting" / "Audit due" are
+the poll's own and follow only their topic.
+
+Limitation, fallback mode only: a recurring series is ONE server push
+(`audit_series_created`, referenceId = its first occurrence) but the audit
+list shows every occurrence, and the list cannot tell "a series was created"
+from "I was reassigned to it" — so on a phone the server cannot push to, the
+first occurrence is matched to the push and the rest each announce as "New
+audit assigned". While the server can push, none of it announces.
+
+**The polls fetch only the signed-in person's own items** (`employeeIds=<self>`,
+like the app's own screens). Without the parameter the server answers with the
+whole reporting hierarchy (a manager's team) or, for SuperAdmin / full-access
+accounts, the organisation, and each of those would have read as "assigned to
+you". With no known user id a poll does not run at all (never the unscoped
+fallback). A SuperAdmin's id is a users-collection id that matches no audit or
+NC, so their scoped lists are simply empty.
+
+**Master switch back ON does not dump what happened while it was OFF.** While
+the master is off the Android service stops itself and iOS never polled in the
+background, so the polls' "already seen" state stops advancing. Writing the
+master OFF (`NotificationPrefs.setPushEnabled(false)`) therefore marks both
+polls suspended (`bg_polls_suspended`); the first tick after the switch is back
+ON is a catch-up (`PollPlan.catchUp`): it records everything and announces
+nothing, and only a tick that read the lists successfully ends it. This is
+persisted, not in memory, because the pass runs in whichever isolate polls first.
+(A per-topic OFF needs none of this: the polls keep running and record.)
+
+**A session the server refused.** The polls authenticate with the mirrored
+token, a 1-day JWT on phones. Once it expires every poll request is a 401 that
+no later tick can fix; that is remembered (`markSessionRejected`) and the
+foreground service stops itself instead of "Watching for overdue NCs" while doing
+nothing. FCM is not affected (it doesn't use the JWT). The next login brings a
+new token and starts the service again. The consequence for `audit_reminder`
+on Android is that it can only appear while the mirrored token is valid — up to a
+day after the last login; making that longer is a server decision (a longer
+phone session, or a refresh route).
+
+**Switches, layer by layer** (OFF means nothing from ANY layer):
+
+| Switch | Server | Socket banner | FCM renderers | Polls |
+|---|---|---|---|---|
+| Master Push OFF | no FCM / web push | silent (mirror) | nothing arrives; a message already in flight is drawn | silent, and the service stops; catch-up on ON |
+| Topic Push OFF | none for that type | silent (mirror) | nothing arrives | silent for it; bookkeeping continues |
+| Master / topic ON | sends at once | mirror refreshed by `preferences_updated` / resume | works at once, no re-login | announces only what is new after the catch-up |
+| OS permission denied | still sends | nothing can be drawn | nothing can be drawn | not started |
+| Signed out | token unregistered | socket disconnected | dropped (no session) | stopped |
+
+The switch mirrors are `notif_push_enabled` / `notif_push_types` (see the
+table above).
+
+## Real-time: what the code guarantees and what it can't
+
+Guaranteed by the design (and covered by tests): one banner per notification
+whichever routes deliver it; nothing suppressed on the strength of a
+registration alone; the Android FCM path is as short as it can be — a cold
+isolate that touches no Firebase API and does the light notification init
+(plugin + the two high-importance channels, no timezone database) before
+drawing.
+
+Not something app code can guarantee, and never measured on a device here (this
+was all verified by reading code and by tests; only a real Android and a real
+iPhone can prove "within seconds"):
+
+- **Android killed state** needs the data push to reach a cold Dart isolate.
+  "Force stop" in system settings stops the app receiving FCM at all until it
+  is opened again. Xiaomi/Oppo/Vivo/Huawei/Samsung-style battery managers may
+  block background start unless the app is allowed to auto-start / run
+  unrestricted. Nothing in the app asks for battery-optimisation exemption or
+  explains OEM settings yet.
+- **Blocked channel or notification permission.** A banner posted while the
+  OS-level `App Updates` / `Overdue NCs` channel is switched off, or
+  POST_NOTIFICATIONS is denied, is dropped silently by Android while
+  Settings still reads "Active". Settings reads only the app-level permission.
+- **FCM delivery itself** is best effort (Doze, pending-message limits).
+  Android's `ttl` and iOS's `apns-expiration` are 24 h.
+- **iOS** works only once the Firebase project matches on both sides and the
+  APNs key is uploaded (below); until then the server drops every iOS push
+  and the app falls back to the socket banner (foreground) and the launch-time
+  poll.
+
+To measure it: on a real Android, `adb shell am force-stop` is NOT a valid
+"killed" test (it also blocks FCM); swipe the app away from Recents, lock
+the phone, trigger an event on the server and time it. Repeat with the app
+open, backgrounded, and with Push switched off then on (nothing while off; the
+next event after ON, without logging in again). Check
+`adb shell dumpsys notification | grep -A3 app_events` for the channel's
+importance.
 
 ## FCM push setup
 
@@ -233,9 +411,12 @@ the app's Firebase project, and the server's verdict/hint. It is the quickest
 way to tell "not registered", "wrong Firebase project", "APNs key missing" and
 "delivered" apart.
 
-The registration is retried when the app returns to the foreground
+The registration is retried in the foreground with backoff (5 s, 30 s, 2 min),
+and again when the app returns to the foreground or the socket reconnects
 (`FcmService.ensureRegistered`) if the login-time attempt failed or the
-permission was granted later, instead of waiting for the next login.
+permission was granted later, instead of waiting for the next login. A test that
+the server reports as undeliverable to this phone also puts the fallback layers
+back on (see **One banner per event**).
 
 ## Testing iOS push (real iPhone only)
 
@@ -254,7 +435,8 @@ one.
    with the app in the background AND after force-quitting it.
 4. Trigger a real event (raise a ticket, assign an audit). If nothing
    arrives, call **`POST /api/v1/device-tokens/test`** (authenticated) — it
-   sends a test push to the caller's OWN tokens only and returns
+   sends a test push to the caller's OWN tokens only (the app's Settings check
+   sends `{"token": <this phone's FCM token>}` so only this phone is tested) and returns
    `{ isOk, data: { sent, failed, pruned, results: [{ tokenId, platform,
    ok, code }] } }`:
    - `ok: true` on the iOS token — APNs accepted it; if nothing shows, look
@@ -353,67 +535,105 @@ them.
 
 | File | Runs where | Job |
 |---|---|---|
-| `core/notifications/notification_prefs.dart` | any isolate | SharedPreferences-backed session token, "already notified" NC ids, the `notif_push_enabled` and `notif_push_types` mirrors of the account's push switches, and the topic catalog (`kNotificationTopics`) — the only thing background isolates can reach (no Provider/DI) |
-| `core/notifications/local_notifications.dart` | any isolate | `flutter_local_notifications` init, channel setup, `showOverdueNc` / `showFullScreenAlarm` |
-| `core/notifications/overdue_poll.dart` | any isolate | `pollAndNotifyOverdueNcs()` — the one function that does the actual work: `GET /ncs/mine`, diff against already-notified, show |
-| `core/notifications/background_entrypoints.dart` | background isolates | `alarmTick` (self-rescheduling `AndroidAlarmManager.oneShot`), `watchdogTick` (`AndroidAlarmManager.periodic` recovery check), `backgroundServiceOnStart` (`flutter_background_service` foreground service) |
+| `core/notifications/notification_prefs.dart` | any isolate | SharedPreferences-backed state, the only thing background isolates can reach (no Provider/DI): the session token + user id, the poll dedup sets, the `notif_push_enabled` / `notif_push_types` mirrors of the account's push switches, the topic catalog (`kNotificationTopics`), the banner ledger (`claimBanner` / `consumeServerEvent`), `bg_fcm_push_ready`, `bg_polls_suspended`, and the rejected-session marker |
+| `core/notifications/local_notifications.dart` | any isolate | `flutter_local_notifications` init (`init()` = plugin + channels + timezone data for the app; `initLight()` = plugin + channels only, what the FCM background isolate uses), `showServerBanner` (claim, then draw), the per-type poll banners, `showOverdueNc` / `showFullScreenAlarm` |
+| `core/notifications/event_poll.dart` | any isolate | `pollAndNotifyEvents()` — new audit / audit start & due / NC raised / approved / rejected, plus `PollPlan`, `refreshPushGate`, and the shared authenticated GET (`pollGetJson`) |
+| `core/notifications/overdue_poll.dart` | any isolate | `pollAndNotifyOverdueNcs()` — `GET /ncs/mine`, diff against already-notified, show as one consolidated banner |
+| `core/notifications/background_entrypoints.dart` | service isolate | the Android foreground service (`flutter_background_service`): one poll at start, then `Timer.periodic(15 min)`; `serviceShouldRun` decides whether it exists at all |
 | `core/notifications/notification_bootstrap.dart` | foreground | one-time plugin init (call from `main()`) + runtime permission requests (call from a real screen) |
-| `core/notifications/notification_scheduler.dart` | foreground | the seam `AuthProvider` calls into on login/logout |
-| `core/notifications/fcm_service.dart` | foreground (+ FCM background isolate) | Firebase init, foreground/opened-app/background handlers, iOS permission (`requestIosPermission`), token registration (waits for the APNs token on iOS, one POST retry, single token-refresh listener) and un-registration |
+| `core/notifications/notification_scheduler.dart` | foreground | the seam `AuthProvider` calls into on login/logout and on a push-switch change |
+| `core/notifications/fcm_service.dart` | foreground (+ FCM background isolate) | Firebase init, the foreground listener and `fcmBackgroundMessageHandler`, iOS permission (`requestIosPermission`), token registration (waits for the APNs token on iOS, in-place retry plus foreground backoff, one token-refresh listener), sign-out unregistration (explicit-JWT DELETE, retry note, `deleteToken` fallback) and the persisted "the server can push to this phone" flag |
 
 Wired in: `main.dart` (`NotificationBootstrap.init()` and, in its OWN
 try/catch so one failing can't skip the other, `FcmService.init()` before
 `runApp`), `providers/auth_provider.dart` (`NotificationScheduler.onLoggedIn`
-/ `onLoggedOut`; `FcmService.unregisterToken()` runs BEFORE the auth token
-is cleared on logout — afterwards the DELETE would just 401 and the phone
-would keep receiving the signed-out account's pushes),
-`providers/notifications_provider.dart` (socket-driven live banner),
+/ `onLoggedOut`; one teardown for every way a session ends: it reads the JWT it
+still holds first, disconnects the socket, and unregisters the FCM token with
+that JWT sent explicitly — the server accepts an expired, validly signed
+one for exactly that DELETE — then stops the poll, clears the session mirror
+and the notification tray. A DELETE that can't reach the server is kept and
+retried at the next launch; if the server refuses or can't be reached,
+`FirebaseMessaging.deleteToken()` is the fallback), `providers/
+notifications_provider.dart` (the socket-driven banner and the badge),
 `screens/root/app_shell.dart` (`requestPermissions()` once the user is
 actually inside the app). `NotificationBootstrap.requestPermissions()`
 asks through `FcmService.requestIosPermission()` on iOS and through
-permission_handler on Android.
+permission_handler on Android. A notification TAP is held while signed out,
+offline, or on the update / maintenance screen, and applied by `main.dart`'s
+root gate once it clears.
 
-## Why three overlapping timers instead of one
+## What keeps the Android fallback alive
 
-- **`alarmTick`** (`AndroidAlarmManager.oneShot`, `exact: true,
-  allowWhileIdle: true`, every 15 min, re-arms itself from inside itself)
-  — the actual clock. Not `Timer.periodic`: an in-process Dart timer only
-  fires if the OS is still scheduling that isolate's event loop, and
-  Vivo/Xiaomi/Oppo-style battery managers freeze a backgrounded process's
-  event loop long before they kill it — the timer just silently stalls.
-  Going through the real OS `AlarmManager` means Doze/App Standby still
-  have to honor it (within their own throttling rules).
-- **`backgroundServiceOnStart`** (`flutter_background_service`, foreground
-  service) — not a timer at all, just *presence*. A visible foreground
-  notification makes the process a foreground service in the OS's eyes,
-  which most OEM battery managers treat very differently from a bare
-  background process. It does one poll on (re)start and otherwise waits.
-- **`watchdogTick`** (`AndroidAlarmManager.periodic`, every 30 min, not
-  self-rescheduling since a recovery check doesn't need that discipline) —
-  the "did the other two actually survive" check. If `alarmTick` hasn't
-  recorded a run in the last 3 poll-intervals, re-arms it. If the
-  foreground service isn't running, restarts it.
+There is no AlarmManager chain in this app (an earlier version of this document
+described `alarmTick` / `watchdogTick` / `kTickAlarmId`; none of that was ever
+implemented, there is no `android_alarm_manager_plus` in `pubspec.yaml`, and
+nothing here calls `zonedSchedule`, so there are also no scheduled
+notifications to cancel when push is switched off). The only local mechanism
+is ONE foreground service:
 
-None of this makes the pipeline unkillable — no third-party app can
-override an OEM that's determined to kill everything — it just gives the
-pipeline three independent chances to notice and self-heal instead of one
-silent single point of failure.
+- `flutter_background_service` runs `backgroundServiceOnStart` as a foreground
+  service (type `dataSync`, with a persistent "Watching for overdue NCs"
+  notification — a visible foreground service is treated very differently from
+  a bare background process by OEM battery managers). It polls once when it
+  starts, then every 15 minutes from a `Timer.periodic` in the service isolate.
+- It exists only while it has a job: someone is signed in, the master push
+  switch is on, and the session was not refused (`serviceShouldRun`). It is
+  started at login, when push is switched on, and every time the app comes to
+  the foreground; it stops itself on logout, on push OFF, on a 401 (see **A
+  session the server refused**), and — on Android 15+ only — after
+  `kServiceMaxRuntime` (5 h) without the app being in the foreground.
+  Android 15+ gives a `dataSync` service about 6 h in the background and kills
+  the WHOLE app process if it doesn't stop when time is up, and the plugin has
+  no `onTimeout` hook to stop it gracefully. Earlier releases have no such
+  timeout, so the service runs on there. The service's isolate cannot ask the
+  OS which release it is on: `MainActivity` answers `sdkInt` on the
+  `com.hqepl.audit360/device` channel, the UI isolate leaves it in the prefs
+  each time it starts the service (`recordAndroidSdk`), and until it is known
+  the cap applies. It restarts on the next foreground. FCM keeps delivering
+  while it is stopped; only the local fallback pauses.
+- No start at boot: `BootReceiver` is removed from the merged manifest and
+  `autoStartOnBoot` is false, so a reboot or app update does not bring up a
+  service (and its notification) for a phone nobody is signed in on. It comes back
+  when the app is opened.
+- `flutter_background_service` also keeps its own native watchdog alarm that
+  respawns the service if the process dies while it should be running (from
+  reading its 6.3.1 source; it is not configured here). What nothing detects is
+  a live-but-frozen Dart timer under an aggressive OEM battery manager — the
+  15-minute poll just stops until the app is opened. That is the honest limit of
+  the fallback; FCM is the real-time path.
 
 ## Testing it for real
 
-1. `flutter pub get` (already run — resolves clean against this repo).
-2. Log in on a physical Android device (emulators fake Doze behavior
-   unreliably). Grant the notification + exact-alarm prompts that appear.
-3. On the backend, set an NC's `targetDate` to a few minutes in the past
-   for the logged-in employee (`node -e` against the seeded data works —
-   see `server/seed/seedFullTestData.js` for NC ids/usernames), or just
-   wait for real data to go overdue.
-4. Force-stop the app from Recents (swipe away, not just background it —
-   this is the actual failure mode you're guarding against) and leave the
-   screen off for 15+ minutes. The notification should still arrive.
-5. `adb shell dumpsys alarm | grep -A3 internal_audit_app` to confirm the
-   two alarms (`kTickAlarmId` / `kWatchdogAlarmId`) are actually registered
-   with AlarmManager if a notification doesn't show up.
+1. Log in on a physical Android device (emulators fake Doze behaviour
+   unreliably) and grant the notification permission. Check the Firebase side
+   first: **Settings → Send a test notification** (it targets this phone's own
+   token) must say "Test notification sent".
+2. **FCM, app killed.** Swipe the app away from Recents (NOT
+   `adb shell am force-stop`, which also blocks FCM until the app is opened),
+   lock the phone, and trigger an event on the server (assign an audit, raise
+   an NC). One banner should arrive within seconds. Repeat with the app open
+   (one banner, not two) and just backgrounded.
+3. **Switches.** Turn Push OFF in Settings: trigger events — nothing. Turn it ON
+   again without logging in: the next event arrives at once, and the events
+   from the OFF period do NOT appear as banners (they are in the bell list).
+   Turn one topic OFF: only that topic goes quiet.
+4. **Logout.** Log out, trigger an event for that account: nothing on the
+   phone. Log in as someone else: only their events.
+5. **Local fallback (Android).** With the app signed in and the server
+   unable to push (or FCM not registered), set an NC's `targetDate` to a few
+   minutes in the past for the logged-in employee (see
+   `server/seed/seedFullTestData.js` for ids/usernames) and wait up to 15
+   minutes; the overdue banner should come from the poll. `adb shell dumpsys
+   activity services | grep BackgroundService` shows whether the service is
+   running.
+
+Do not read a banner that shows up ~15 minutes after an event as proof that push
+works: that is the poll. While the phone is registered for push
+(`bg_fcm_push_ready`) the polls do not announce audit assigned / NC raised /
+approved / rejected / overdue at all, precisely so a tester can no longer
+mistake the fallback for the server path (before this, on Android the poll
+masked any event the server forgot to push, while iOS, which polls only at
+launch, simply missed it).
 
 ## Full-screen, lock-screen alarm-style notification (Android 14+)
 
@@ -435,8 +655,7 @@ What's required beyond the notification call itself:
   `NotificationManagerCompat.from(context).canUseFullScreenIntent()`
   before relying on it; if false, fall back to `showOverdueNc` (a loud
   heads-up notification is still far better than nothing) and prompt the
-  user toward that settings screen the same way this repo already prompts
-  for exact-alarm.
+  user toward that settings screen.
 - Google Play policy restricts full-screen intent to genuine alarm/call
   use cases — don't ship it for anything less, it risks a policy strike.
 
@@ -473,16 +692,37 @@ deliberately not enabled.
 
 ## iOS reality check
 
-`android_alarm_manager_plus` has no iOS implementation — there is no
-Android-equivalent way to make iOS honor a "poll every 15 minutes" clock
-while backgrounded or killed. `flutter_background_service`'s
-`onIosBackground` only gets an *opportunistic* window iOS grants at its
-own discretion (frequently none for hours if the user hasn't opened the
-app recently) via `BGAppRefreshTask` under the hood. On iOS, this pipeline
-in practice means: notifications fire correctly while the app is open or
-was very recently backgrounded, and are NOT reliable once it's been
-backgrounded a while or force-quit. That is why iOS reliability rests on
-the FCM **alert** push (see **What each platform receives**), not on this
-poll — a silent (`content-available`) push is not a substitute either: iOS
-throttles it and doesn't deliver it at all after a force-quit. The poll
-stays on iOS only as a best-effort extra.
+iOS has no equivalent of the Android foreground service: there is no way to
+make it honour a "poll every 15 minutes" clock while the app is backgrounded
+or killed. The `onIosBackground` handler in `background_entrypoints.dart` is
+never registered (`configureBackgroundService` runs on Android only), so the
+polls run on iOS at launch and login only. On iOS, this fallback in practice
+means: while the app is open, and at each launch, on a phone the server cannot
+push to. That is why iOS reliability rests on the FCM **alert** push (see
+**What each platform receives**), not on the poll — a silent
+(`content-available`) push is not a substitute either: iOS throttles it and
+doesn't deliver it at all after a force-quit.
+
+Consequences worth knowing:
+
+- **Nothing reaches a closed iPhone until the Firebase project matches and the
+  APNs key is uploaded** (the known blocker: `GoogleService-Info.plist` names a
+  different project than the server's service account, so the server drops every
+  iOS push). Until then an open iPhone still gets the socket banner, and a
+  launch runs the poll fallback.
+- `audit_reminder` ("Audit starting" / "Audit due") has no server path, so on
+  iOS it appears only at launch/login — with the app closed, the **Morning
+  summary** (09:00 IST, lists what starts and is due today; skipped on holidays
+  and weekly-off days) is the push that tells you. Scheduling local notifications
+  from the audits list was considered and not built: iOS would fire them with no
+  Dart running, so a Push/topic switch turned OFF on the web while the app is
+  killed would not stop them, which breaks "OFF means nothing from any layer".
+  The reliable option is a push-only server sender for `audit_reminder`
+  (`resolveChannels` already treats it as push-only, so it would never be
+  emailed), retiring the poll's reminder banners in the same change so Android
+  does not double up.
+- Follow-up to make the foreground banner iOS-native and single without waiting
+  for the socket: `AppDelegate.swift`'s `willPresent` answering "no alert" for
+  remote pushes (`gcm.message_id` in `userInfo`) and banner+sound for local
+  ones, then `setForegroundNotificationPresentationOptions(alert: false, ...)`.
+  See **Why iOS still lets the OS draw the foreground push**.

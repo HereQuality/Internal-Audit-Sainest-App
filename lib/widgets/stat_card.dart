@@ -7,9 +7,15 @@ class StatCard extends StatelessWidget {
   /// size (even iOS "Extra Extra Large") the tile's column overflowed and
   /// the label got clipped. 40 is the fixed part (icon row + padding), 60 the
   /// text part, which scales.
-  static double compactTileExtent(BuildContext context) {
+  ///
+  /// [labelLines] > 1 is for a grid whose labels wrap (the audit-status
+  /// tiles: "NC Verification Pending" does not fit one line in a half-width
+  /// tile) — each extra line adds one bodySmall line (16 at scale 1), which
+  /// scales with the text size like the rest of the text part.
+  static double compactTileExtent(BuildContext context, {int labelLines = 1}) {
     final scale = MediaQuery.textScalerOf(context).scale(14) / 14;
-    return 40 + 60 * (scale < 1 ? 1 : scale);
+    final double s = scale < 1 ? 1 : scale;
+    return 40 + 60 * s + 16 * (labelLines - 1) * s;
   }
 
   final String label;
@@ -22,6 +28,10 @@ class StatCard extends StatelessWidget {
   // now that ScoreRow (ATS/OTC) is the visually dominant headline element
   // above it instead of competing for attention at the same size.
   final bool compact;
+  // How many lines the label may take: 1 for a compact tile (ellipsized), 2
+  // otherwise — unless a grid that sized its rows for more says so via
+  // compactTileExtent(labelLines:).
+  final int? labelMaxLines;
 
   const StatCard({
     super.key,
@@ -31,6 +41,7 @@ class StatCard extends StatelessWidget {
     required this.color,
     this.onTap,
     this.compact = false,
+    this.labelMaxLines,
   });
 
   @override
@@ -75,7 +86,7 @@ class StatCard extends StatelessWidget {
               const SizedBox(height: 2),
               Text(
                 label,
-                maxLines: compact ? 1 : 2,
+                maxLines: labelMaxLines ?? (compact ? 1 : 2),
                 overflow: compact ? TextOverflow.ellipsis : TextOverflow.clip,
                 style: (compact
                         ? Theme.of(context).textTheme.bodySmall

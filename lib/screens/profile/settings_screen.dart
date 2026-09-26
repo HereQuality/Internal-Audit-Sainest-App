@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart'
     show TargetPlatform, defaultTargetPlatform;
@@ -17,36 +19,53 @@ import '../../providers/profile_provider.dart';
 import '../../providers/theme_provider.dart';
 import 'edit_profile_screen.dart';
 
-/// What the OS currently says about this app posting notifications — shown
-/// as a status line under the Push switch, never as an option of its own.
-enum _PushPermission { granted, notAsked, blocked }
-
 /// iOS asks and reports through Firebase (the same source
 /// NotificationBootstrap.requestPermissions uses there) because
 /// permission_handler's iOS notification support only exists when a native
 /// build flag is set; everywhere else it's permission_handler.
-Future<_PushPermission> _readPermission() async {
+Future<PushPermission> _readPermission() async {
   if (defaultTargetPlatform == TargetPlatform.iOS) {
     try {
       final settings = await FirebaseMessaging.instance.getNotificationSettings();
       final status = settings.authorizationStatus;
       if (status == AuthorizationStatus.authorized ||
           status == AuthorizationStatus.provisional) {
-        return _PushPermission.granted;
+        return PushPermission.granted;
       }
       return status == AuthorizationStatus.notDetermined
-          ? _PushPermission.notAsked
-          : _PushPermission.blocked;
+          ? PushPermission.notAsked
+          : PushPermission.blocked;
     } catch (_) {
       // Firebase isn't set up on this build — fall through to the generic
       // check rather than showing nothing.
     }
   }
   final status = await Permission.notification.status;
-  if (status.isGranted || status.isProvisional) return _PushPermission.granted;
-  return status.isPermanentlyDenied
-      ? _PushPermission.blocked
-      : _PushPermission.notAsked;
+  if (status.isGranted || status.isProvisional) return PushPermission.granted;
+  if (status.isPermanentlyDenied) return PushPermission.blocked;
+  // Android below 13 has no notification prompt at all: notifications turned
+  // off in the system settings read as plain "denied" there, and request()
+  // cannot show anything, so an "Allow" button would do nothing. Android 13+
+  // also says "denied" for a permission it may still ask for (denied once) —
+  // there the OS says whether a request can still put a dialog up. Every
+  // login and every launch of the app shell has already asked by the time
+  // this screen can open, so "denied and no dialog possible" means only the
+  // system settings can change it.
+  if (defaultTargetPlatform == TargetPlatform.android &&
+      status.isDenied &&
+      !await _canAskAgain()) {
+    return PushPermission.blocked;
+  }
+  return PushPermission.notAsked;
+}
+
+Future<bool> _canAskAgain() async {
+  try {
+    return await Permission.notification.shouldShowRequestRationale;
+  } catch (_) {
+    // No activity to ask about (or the plugin failed): keep offering "Allow".
+    return true;
+  }
 }
 
 class SettingsScreen extends StatefulWidget {
@@ -60,7 +79,17 @@ class _SettingsScreenState extends State<SettingsScreen>
     with WidgetsBindingObserver {
   // Null until the first OS read lands, so the status line never renders a
   // guessed state.
-  _PushPermission? _permission;
+  PushPermission? _permission;
+  // Where this phone's registration with the server stands (token accepted,
+  // server able to send...) — read off FcmService, null until the first read.
+  PushRegistration? _registration;
+  // True while the status line's "Try again" is waiting for its attempt.
+  bool _retrying = false;
+  // FcmService has no change notifications (it is written to from many places
+  // and outside a widget's control), so the line looks again every few
+  // seconds while this screen is open. Each look is a couple of in-memory
+  // reads and rebuilds only when the answer changed.
+  Timer? _pushTimer;
   // Set while a switch change is in flight so the switch shows where it's
   // headed (and is locked) instead of looking dead until the server
   // answers; dropped again the moment the outcome is known.
@@ -83,7 +112,14 @@ class _SettingsScreenState extends State<SettingsScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _refreshPermission();
+    _refreshPermission().then((_) {
+      // Opening Settings also nudges a registration that ran out of retries
+      // (the login-time attempt met a flaky connection) instead of leaving
+      // "not registered" up until the next resume. A no-op once registered.
+      if (_permission == PushPermission.granted) unawaited(_retryRegistration());
+    });
+    _refreshPush();
+    _pushTimer = Timer.periodic(const Duration(seconds: 2), (_) => _refreshPush());
     // A 'preferences_updated' socket event can be missed (a half-open
     // connection looks alive on a phone) — catch up on opening, so this
     // screen never shows switches that disagree with the web's.
@@ -92,6 +128,7 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   @override
   void dispose() {
+    _pushTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -106,21 +143,34 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   Future<void> _onResumed() async {
     final wasDenied =
-        _permission == _PushPermission.notAsked ||
-        _permission == _PushPermission.blocked;
+        _permission == PushPermission.notAsked ||
+        _permission == PushPermission.blocked;
     await _refreshPermission();
     // Allowed from the OS settings while this screen was open: finish the
     // device setup the login-time attempt couldn't (token + polling)
     // instead of waiting for the next login.
-    if (mounted && wasDenied && _permission == _PushPermission.granted) {
+    if (mounted && wasDenied && _permission == PushPermission.granted) {
       await _finishDeviceSetup();
     }
+    await _refreshPush();
   }
 
   Future<void> _refreshPermission() async {
     final next = await _readPermission();
     if (!mounted) return;
     setState(() => _permission = next);
+  }
+
+  Future<void> _refreshPush() async {
+    var next = FcmService.registrationState;
+    // A test push the server could not deliver to this phone is remembered
+    // beside the registration (the polls read it too); "Active" under a
+    // dialog that just said otherwise would be the same lie as before.
+    if (next == PushRegistration.registered && !await NotificationPrefs.readFcmPushReady()) {
+      next = PushRegistration.cannotDeliver;
+    }
+    if (!mounted || next == _registration) return;
+    setState(() => _registration = next);
   }
 
   // Registers this phone with the server and starts/stops the Android
@@ -194,6 +244,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     if (!saved || !mounted) return;
     if (on) await _requestPermissionAndSetUp();
     await _refreshPermission();
+    await _refreshPush();
   }
 
   Future<void> _setEmail(bool on) async {
@@ -282,22 +333,46 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _allowOnThisPhone() async {
     await _requestPermissionAndSetUp();
     await _refreshPermission();
+    await _refreshPush();
+  }
+
+  // The status line's "Try again" (and the nudge on opening): the same thing a
+  // resume does, on demand.
+  Future<void> _retryRegistration() async {
+    if (_retrying || !mounted) return;
+    setState(() => _retrying = true);
+    try {
+      await FcmService.ensureRegistered();
+    } finally {
+      if (mounted) setState(() => _retrying = false);
+    }
+    await _refreshPush();
   }
 
   // Coming back from the OS settings re-checks via _onResumed.
   Future<void> _openSystemSettings() => openAppSettings();
 
+  // "Try again" shows as an attempt under way the moment it is tapped, before
+  // FcmService has started one.
+  PushBadge _badge(PushPermission permission, PushRegistration registration) {
+    final badge = resolvePushBadge(permission: permission, registration: registration);
+    return _retrying && badge == PushBadge.notRegistered ? PushBadge.registering : badge;
+  }
+
   bool _testingPush = false;
 
-  // Sends a real push to this account's phones and says plainly what
-  // happened — the one tap that tells "not registered", "server can't reach
-  // this phone's Firebase project", "Apple key missing" and "delivered" apart.
+  // Sends a real push to THIS phone and says plainly what happened — the one
+  // tap that tells "no token", "not registered", "server can't reach this
+  // phone's Firebase project", "Apple key missing" and "delivered" apart.
   Future<void> _sendTestPush() async {
     if (_testingPush) return;
     setState(() => _testingPush = true);
     final PushCheck check = await FcmService.runPushCheck();
     if (!mounted) return;
     setState(() => _testingPush = false);
+    // The check may have (re)registered the phone or found it undeliverable:
+    // the status line behind the dialog follows.
+    unawaited(_refreshPush());
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -322,30 +397,69 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   // Under the Push switch, only while it's on (with it off, the phone's
-  // permission is irrelevant and "Active" would be a lie).
-  Widget _permissionLine(BuildContext context, _PushPermission permission) {
+  // permission is irrelevant and "Active" would be a lie). One line for the
+  // whole chain a push travels — OS permission, this phone's token on the
+  // server, a server able to send — so "Active" is only said when all of it
+  // holds. The server's own problem text (Firebase project ids, env-var names)
+  // stays in the test dialog; the line only points there.
+  Widget _statusLine(BuildContext context, PushBadge badge) {
     final scheme = Theme.of(context).colorScheme;
-    final (icon, color, text, actionLabel, onAction) = switch (permission) {
-      _PushPermission.granted => (
+    final (icon, color, text, hint, actionLabel, onAction) = switch (badge) {
+      PushBadge.active => (
         Icons.check_circle_outline,
         scheme.primary,
         'Active on this phone',
         null,
         null,
+        null,
       ),
-      _PushPermission.notAsked => (
+      PushBadge.notAllowed => (
         Icons.info_outline,
         scheme.outline,
         'Not allowed on this phone yet',
+        null,
         'Allow',
         _allowOnThisPhone,
       ),
-      _PushPermission.blocked => (
+      PushBadge.blocked => (
         Icons.block,
         scheme.error,
         'Blocked in system settings',
+        null,
         'Open settings',
         _openSystemSettings,
+      ),
+      PushBadge.registering => (
+        Icons.sync,
+        scheme.outline,
+        'Registering this phone for push…',
+        'It keeps retrying by itself.',
+        null,
+        null,
+      ),
+      PushBadge.notRegistered => (
+        Icons.sync_problem,
+        scheme.error,
+        "This phone isn't registered for push yet",
+        'Check the connection, then try again.',
+        'Try again',
+        _retryRegistration,
+      ),
+      PushBadge.cannotDeliver => (
+        Icons.error_outline,
+        scheme.error,
+        "Registered, but the server can't send to this phone",
+        'Tap "Send a test notification" for the reason.',
+        null,
+        null,
+      ),
+      PushBadge.notSetUp => (
+        Icons.info_outline,
+        scheme.outline,
+        "Phone push isn't available in this build",
+        null,
+        null,
+        null,
       ),
     };
     // 72 = the SwitchListTile's own leading icon + gap, so the line lines up
@@ -357,9 +471,16 @@ class _SettingsScreenState extends State<SettingsScreen>
           Icon(icon, size: 16, color: color),
           const SizedBox(width: 6),
           Expanded(
-            child: Text(
-              text,
-              style: TextStyle(fontSize: 12, color: color),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(text, style: TextStyle(fontSize: 12, color: color)),
+                if (hint != null)
+                  Text(
+                    hint,
+                    style: TextStyle(fontSize: 11, color: scheme.outline),
+                  ),
+              ],
             ),
           ),
           if (actionLabel != null)
@@ -369,7 +490,7 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
-  // Under the permission line, once notifications are allowed on this phone.
+  // Under the status line, once notifications are allowed on this phone.
   Widget _testPushRow(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(64, 0, 8, 8),
@@ -468,9 +589,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                   value: pushOn,
                   onChanged: _pendingPush == null ? _setPush : null,
                 ),
-                if (pushOn && _permission != null)
-                  _permissionLine(context, _permission!),
-                if (pushOn && _permission == _PushPermission.granted)
+                if (pushOn && _permission != null && _registration != null)
+                  _statusLine(context, _badge(_permission!, _registration!)),
+                if (pushOn && _permission == PushPermission.granted)
                   _testPushRow(context),
               ],
             ),
