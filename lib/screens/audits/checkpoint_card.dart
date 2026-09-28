@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
@@ -20,28 +21,32 @@ import 'nc_details_sheet.dart';
 
 /// One leaf checkpoint — mirrors the web app's ParameterScoreCard.jsx:
 ///  - interactive (assigned auditor, audit still active): 4 finding
-///    buttons (Strong Compliance / Compliance / OFI / NC), an OFI-only
-///    score field, an optional remark, and optional photo evidence.
-///    Autosaves — no separate Save button to remember to tap: a finding
-///    pick or finishing the NC-details popup saves right away, remark/
-///    score typing saves itself a short pause after the last keystroke
-///    (see _onFieldEdited's debounce), and a picked photo uploads
-///    immediately on its own, independent of whether a finding/remark has
-///    even been filled in yet (see _pickPhotos/_uploadPhotos, mirroring
-///    AuditsProvider.uploadCheckpointEvidence). The finding/remark/score
-///    autosave fires once findingType alone is present (+ a numeric score
-///    if OFI, + NC details for a fresh NC) — see _maybeAutoSave/
-///    _isComplete — so a score typed on its own, or a remark typed/
-///    edited/cleared on its own, each save right away instead of waiting
-///    on the other field. Remark is NOT required to save from the phone
-///    (only web's ParameterScoreCard.jsx still requires it — see
-///    audit.controller.js#scoreParameter's isMobileRequest check).
-///    _statusRow shows what's still missing, that it's saving, a brief
-///    "Saved" confirmation, or — the one manual
-///    action left — a Retry if an autosave attempt actually failed; a
-///    failed photo upload gets its own, separate Retry right by the photo
-///    strip instead, since the two save paths are now fully independent.
+///    buttons (Strong / Compliance / OFI / NC), a score that follows the
+///    finding (see [scoreRuleFor]), an optional remark, and optional photo
+///    evidence.
 ///  - read-only: just shows whatever was recorded.
+///
+/// Nothing the auditor does is left to a Save button — every edit saves
+/// itself, and the card always knows whether it has anything the server
+/// hasn't confirmed yet:
+///  - a finding pick / finishing the NC-details popup saves right away;
+///    remark and score typing save a short pause after the last keystroke
+///    (_scheduleSave); a picked photo uploads immediately on its own.
+///  - every request for this checkpoint (score saves AND photo uploads) goes
+///    through one queue (_exclusive), and each score save reads the fields
+///    at the moment it actually runs — so two saves can never race and a
+///    slow, older request can never overwrite newer text with stale data.
+///  - a failed save retries by itself with a growing delay (_scheduleRetry),
+///    then falls back to a manual Retry; the card reports its state
+///    ([CheckpointSyncState]) to the screen, which uses it for the
+///    "changes not saved" back-guard and the top save indicator.
+///  - the card flushes immediately when the app goes to the background
+///    (WidgetsBindingObserver) and when it is removed from the tree (a
+///    location-tab switch), and the screen can [CheckpointCardState.flush]
+///    it before Submit/Final Submit.
+///  - the server refuses a score with no finding, so a remark typed BEFORE
+///    any finding is picked is kept as a draft on this device (see
+///    _writeDraft) and folded into the first save once a finding is chosen.
 /// `onSave`/`onUploadPhotos` return an error message on failure (null on
 /// success) — same shape as AuditsProvider#scoreCheckpoint/
 /// uploadCheckpointEvidence so this widget never needs to know about Dio/
@@ -83,11 +88,67 @@ typedef UpdateNc = Future<String?> Function({
   DateTime? targetDate,
 });
 
+/// Where a checkpoint stands with the server, as far as the screen's
+/// back-guard and save indicator care:
+///  - clean: everything the auditor did here is saved (or, for a remark
+///    typed with no finding yet, kept as a draft on the device);
+///  - saving: an edit/photo is waiting on, or in the middle of, a request;
+///  - failed: the last attempt failed (it may still be retrying);
+///  - incomplete: a finding was picked but what the server needs to accept
+///    it (a score, NC details) is still missing, so nothing can be sent.
+enum CheckpointSyncState { clean, saving, failed, incomplete }
+
+/// How a finding constrains its score. Strong is fixed at the full max, NC
+/// is fixed at 0, Compliance takes 0..max and OFI takes 0..max-1 (an OFI is
+/// by definition a partial score). Whole numbers only — same as the web's
+/// ParameterScoreCard.jsx, and the server's scoring never uses fractions.
+class ScoreRule {
+  final bool fixed;
+  final double min;
+  final double max;
+  const ScoreRule.fixed(double value)
+      : fixed = true,
+        min = value,
+        max = value;
+  const ScoreRule.range(this.min, this.max) : fixed = false;
+
+  /// Only meaningful when [fixed].
+  double get fixedValue => min;
+}
+
+ScoreRule scoreRuleFor(String? findingType, double maxScore) {
+  switch (findingType) {
+    case 'Strong Compliance':
+      return ScoreRule.fixed(maxScore);
+    case 'NC':
+      return const ScoreRule.fixed(0);
+    case 'OFI':
+      return ScoreRule.range(0, maxScore > 1 ? maxScore - 1 : 0);
+    default: // Compliance
+      return ScoreRule.range(0, maxScore);
+  }
+}
+
+/// Whole number without a trailing ".0" (a Dart double prints "10.0").
+String formatScore(double v) => v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toString();
+
+/// Inline error for a typed score, or null when it is acceptable. An empty
+/// box is reported too — callers decide whether to show it yet.
+String? validateScoreText(String text, ScoreRule rule) {
+  if (rule.fixed) return null;
+  final t = text.trim();
+  if (t.isEmpty) return 'Enter a score';
+  final n = int.tryParse(t);
+  if (n == null) return 'Whole numbers only';
+  if (n < rule.min || n > rule.max) return 'Must be ${formatScore(rule.min)}–${formatScore(rule.max)}';
+  return null;
+}
+
 const _findingLabels = {
   'Strong Compliance': 'Strong',
-  'Compliance': 'Compliant',
+  'Compliance': 'Compliance',
   'OFI': 'OFI',
-  'NC': 'Raise NC',
+  'NC': 'NC',
 };
 const _findingIcons = {
   'Strong Compliance': Icons.check_circle_outline,
@@ -130,11 +191,21 @@ class CheckpointCard extends StatefulWidget {
   // audit_detail_screen.dart#_ncAuditeeOptions) — this card never offers, or
   // defaults to, the auditor themselves.
   final List<EmployeeOption> employees;
-  // Reports every _saving true/false transition to the parent screen so it
-  // can block back-navigation while a save/upload is actually in flight
-  // (see audit_detail_screen.dart's PopScope) — this card is otherwise a
-  // fully isolated State with no way for its parent to know it's busy.
-  final ValueChanged<bool>? onSavingChanged;
+  // Reports every change of [CheckpointSyncState] to the parent screen so
+  // it can guard back-navigation and show one overall save indicator —
+  // this card is otherwise a fully isolated State with no way for its
+  // parent to know it's busy. Also called (with clean/saving/failed) after
+  // the card has been removed from the tree, for a save it flushed on the
+  // way out.
+  final ValueChanged<CheckpointSyncState>? onSyncStateChanged;
+  // Asked when the card is removed from the tree with unsaved edits: true
+  // (the default) flushes them first — a location-tab switch must not eat
+  // an edit — false drops them, which is what the screen's "Exit without
+  // saving" choice means.
+  final bool Function()? shouldFlushOnDispose;
+  // Where a remark typed before any finding is picked is kept on this
+  // device (see the class doc). Null turns the draft off.
+  final String? draftKey;
   // The full NC this checkpoint's finding raised, if any — resolved by the
   // caller via audit.ncsById[node.ncId] (models/audit_detail_model.dart),
   // itself sourced from the SAME GET /audits/:id response this whole card
@@ -158,17 +229,22 @@ class CheckpointCard extends StatefulWidget {
     required this.onUploadPhotos,
     this.onDeletePhoto,
     this.employees = const [],
-    this.onSavingChanged,
+    this.onSyncStateChanged,
+    this.shouldFlushOnDispose,
+    this.draftKey,
     this.linkedNc,
     this.currentEmployeeId,
     this.onUpdateNc,
   });
 
   @override
-  State<CheckpointCard> createState() => _CheckpointCardState();
+  State<CheckpointCard> createState() => CheckpointCardState();
 }
 
-class _CheckpointCardState extends State<CheckpointCard> {
+class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObserver {
+  static const _debounceDelay = Duration(milliseconds: 900);
+  static const _maxAutoRetries = 3;
+
   String? _findingType;
   String? _auditeeEmployeeId;
   // Due date for a fresh NC — collected in the NC-details popup (see
@@ -181,6 +257,16 @@ class _CheckpointCardState extends State<CheckpointCard> {
   String _severity = 'Minor';
   final _remarkController = TextEditingController();
   final _scoreController = TextEditingController();
+  // True once the score box has been typed in / focused — an untouched empty
+  // box shows a neutral hint instead of a red "Enter a score".
+  bool _scoreTouched = false;
+  // Programmatic text changes (defaults, restoring a draft, the NC popup's
+  // remark) must not count as the auditor editing.
+  bool _suppressEdits = false;
+  // Last text seen in each field — a controller also notifies on a bare
+  // cursor move or selection change, which is not an edit.
+  String _seenRemark = '';
+  String _seenScore = '';
   List<String> _existingPhotos = [];
   // Picked photos still uploading (or whose last upload attempt failed) —
   // NOT a "staged, not yet saved" queue the way it used to be. A pick
@@ -190,30 +276,36 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // the same setState — see _uploadPhotos below).
   final List<File> _newPhotos = [];
   final Set<String> _deletingPhotoUrls = {};
-  // Finding/remark/score/NC-details save — fully independent of photo
-  // upload below now (AuditsProvider.scoreCheckpoint no longer touches
-  // photoUrls at all).
+
+  // ── Save machinery ────────────────────────────────────────────────────
+  // Edits the server hasn't confirmed yet (finding / score / remark / NC
+  // details). Stays true across failures so a retry resends everything.
+  bool _dirty = false;
   bool _saving = false;
   bool _justSaved = false;
-  // Bumped on every field edit (remark/score typing, finding pick, NC
-  // details) — fields stay editable while a save is in flight, so _save()
-  // snapshots this and only shows "Saved" if nothing changed underneath it
-  // while it was in flight; otherwise the edit that arrived mid-save would
-  // be silently unsaved but the checkmark would claim it wasn't.
+  // Bumped on every edit — a save snapshots it and only clears _dirty if
+  // nothing changed underneath it while it was in flight; otherwise the
+  // loop in _drain simply goes around again with the newer values.
   int _editVersion = 0;
   String? _error;
-  // Photo upload — its own independent in-flight/error state (see
-  // _uploadPhotos), since a photo can now upload while a finding/remark
-  // save is separately in flight, or vice versa.
+  int _retryAttempt = 0;
+  Timer? _debounce;
+  Timer? _retryTimer;
+  // Tail of the per-checkpoint request queue — see _exclusive.
+  Future<void> _tail = Future<void>.value();
+  bool _disposed = false;
+  CheckpointSyncState _lastReported = CheckpointSyncState.clean;
+  ValueChanged<CheckpointSyncState>? _onSync;
+
+  // Photo upload — its own in-flight/error state (see _uploadPhotos), but it
+  // shares the request queue above with the score save so the two can never
+  // hit the server for this checkpoint at the same time.
   bool _uploadingPhotos = false;
   String? _photoUploadError;
+  int _photoRetryAttempt = 0;
+  Timer? _photoRetryTimer;
   UploadPhase? _uploadPhase;
   double? _uploadFraction;
-  // Debounces remark/score typing so autosave fires a short pause after
-  // the last keystroke instead of on every character — see
-  // _onFieldEdited. Discrete actions (finding pick, photo add, NC details)
-  // autosave immediately instead, no debounce needed.
-  Timer? _debounce;
 
   // An update to an ALREADY-raised NC is in flight (see _saveNcEdit) —
   // all that's left on the card of what used to be a whole inline edit
@@ -228,36 +320,37 @@ class _CheckpointCardState extends State<CheckpointCard> {
   void initState() {
     super.initState();
     _findingType = widget.node.findingType;
+    _onSync = widget.onSyncStateChanged;
     _remarkController.text = widget.node.remark ?? '';
-    // toStringAsFixed(0), not toString() — scores are always whole numbers
-    // (see the digitsOnly input formatter below), but a Dart double's own
-    // toString() always appends ".0" even for a whole value, so a
-    // genuinely-already-scored "0" or "3" was showing as the confusing
-    // "0.0"/"3.0" instead. A checkpoint that's never been scored still
-    // starts blank either way — the server defaults score to null, not 0
-    // (see server/models/Audit.js#AuditNodeSchema), so this only changes
-    // how an existing score is FORMATTED, never fabricates one.
-    _scoreController.text = widget.node.score != null ? widget.node.score!.toStringAsFixed(0) : '';
+    // Whole numbers only (see ScoreRule) — formatScore, not toString(), so a
+    // genuinely-already-scored "3" doesn't show as "3.0". A checkpoint that's
+    // never been scored still starts blank — the server defaults score to
+    // null, not 0 (server/models/Audit.js#AuditNodeSchema).
+    _scoreController.text = widget.node.score != null ? formatScore(widget.node.score!) : '';
     _existingPhotos = List.of(widget.node.photoUrls);
+    _seenRemark = _remarkController.text;
+    _seenScore = _scoreController.text;
     _remarkController.addListener(_onFieldEdited);
     _scoreController.addListener(_onFieldEdited);
+    if (!widget.readOnly) {
+      WidgetsBinding.instance.addObserver(this);
+      if (widget.node.findingType == null) _restoreDraft();
+    }
   }
 
   @override
   void didUpdateWidget(covariant CheckpointCard oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _onSync = widget.onSyncStateChanged;
     // Every save (scoreCheckpoint) refetches the whole audit tree and the
     // parent screen passes a fresh `node` down here under the SAME
     // ValueKey(node.id) — so Flutter reuses this State instead of running
     // initState() again, and _existingPhotos (set once, in initState)
-    // never picked up the newly-uploaded photo's Cloudinary URL. Net
-    // effect: the photo genuinely saved server-side, but visually
-    // vanished from the card — _newPhotos correctly dropped the local
-    // File once it was sent, and nothing ever added the server URL in
-    // its place. Only _existingPhotos is resynced here (never
-    // findingType/remark/score, which stay debounced-editable) since it's
-    // pure server truth — _newPhotos (locally-picked, not-yet-uploaded
-    // files) is untouched either way.
+    // never picked up the newly-uploaded photo's Cloudinary URL. Only
+    // _existingPhotos is resynced here (never findingType/remark/score,
+    // which stay debounced-editable) since it's pure server truth —
+    // _newPhotos (locally-picked, not-yet-uploaded files) is untouched
+    // either way.
     if (widget.node.photoUrls != oldWidget.node.photoUrls) {
       setState(() => _existingPhotos = List.of(widget.node.photoUrls));
     }
@@ -265,11 +358,42 @@ class _CheckpointCardState extends State<CheckpointCard> {
 
   @override
   void dispose() {
+    _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _debounce?.cancel();
+    _retryTimer?.cancel();
+    _photoRetryTimer?.cancel();
+    var report = CheckpointSyncState.clean;
+    if (_dirty && !widget.readOnly && (widget.shouldFlushOnDispose?.call() ?? true)) {
+      if (_isComplete) {
+        // Removed from the tree with an edit still on its way (a location-tab
+        // switch, a collapsed group): send the latest values anyway, a few
+        // tries, queued behind whatever is already in flight.
+        report = CheckpointSyncState.saving;
+        _detachedSave(_payload(), widget.onSave, _onSync);
+      } else if (_findingType == null) {
+        _persistDraft(widget.draftKey, _remarkController.text);
+      }
+    }
+    // Reported straight away, ahead of the queued save above finishing —
+    // the parent must never keep counting a card that no longer exists as
+    // "busy" forever (a detached save reports again when it's done).
+    if (report != _lastReported) _onSync?.call(report);
     _remarkController.dispose();
     _scoreController.dispose();
     super.dispose();
   }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Anything but resumed: the OS may kill a backgrounded app at any time,
+    // so push out whatever is still waiting on the debounce right now.
+    if (state != AppLifecycleState.resumed) flush();
+  }
+
+  // ── Derived state ─────────────────────────────────────────────────────
+
+  ScoreRule get _rule => scoreRuleFor(_findingType, widget.maxScore);
 
   // A fresh NC (not yet raised) always needs its own popup filled in — an
   // explicit "who is this against" pick (never defaulted to the auditor;
@@ -277,18 +401,18 @@ class _CheckpointCardState extends State<CheckpointCard> {
   // before it can save.
   bool get _needsNcDetails => _findingType == 'NC' && widget.node.ncId == null;
 
+  String? get _scoreError => validateScoreText(_scoreController.text, _rule);
+
   // What's still needed before this checkpoint can save at all — mirrors
   // audit.controller.js#scoreParameter's own validation for a mobile
-  // caller (findingType always; a numeric score additionally for OFI; an
-  // auditee pick + due date for a fresh NC) so the hint text here never
+  // caller (findingType always; a numeric in-range score for Compliance/OFI;
+  // an auditee pick + due date for a fresh NC) so the hint text here never
   // promises a save the server would actually reject. Remark is
   // deliberately NOT required here — the server only makes it mandatory
-  // for web callers; on the phone a finding pick, a score, or a remark
-  // typed on its own should each save right away instead of waiting on
-  // whichever of the three hasn't been filled in yet.
+  // for web callers.
   String? get _missingFieldHint {
     if (_findingType == null) return null; // nothing picked yet — no nag before they've started
-    if (_findingType == 'OFI' && double.tryParse(_scoreController.text.trim()) == null) return 'Enter a score to save';
+    if (_scoreError != null) return _scoreError == 'Enter a score' ? 'Enter a score to save' : _scoreError;
     if (_needsNcDetails && _auditeeEmployeeId == null) {
       return widget.employees.isEmpty ? "No one else is tagged to this audit's location." : 'Pick who this NC is against';
     }
@@ -297,6 +421,35 @@ class _CheckpointCardState extends State<CheckpointCard> {
   }
 
   bool get _isComplete => _findingType != null && _missingFieldHint == null;
+
+  CheckpointSyncState get _syncState {
+    if (widget.readOnly) return CheckpointSyncState.clean;
+    if (_error != null || _photoUploadError != null) return CheckpointSyncState.failed;
+    if (_saving || _uploadingPhotos) return CheckpointSyncState.saving;
+    if (_dirty) {
+      // Only a remark so far: the server can't take it without a finding,
+      // so it's kept as a draft on the device — nothing to lose.
+      if (_findingType == null) return CheckpointSyncState.clean;
+      return _isComplete ? CheckpointSyncState.saving : CheckpointSyncState.incomplete;
+    }
+    return CheckpointSyncState.clean;
+  }
+
+  void _report() {
+    final s = _syncState;
+    if (s == _lastReported) return;
+    _lastReported = s;
+    _onSync?.call(s);
+  }
+
+  // setState only while mounted — the save loop can outlive the widget.
+  void _update(VoidCallback fn) {
+    if (mounted) {
+      setState(fn);
+    } else {
+      fn();
+    }
+  }
 
   // Only the raising auditor, and only while the NC is still sitting in
   // "Raised" (before the auditee has submitted a response) — same two
@@ -313,15 +466,251 @@ class _CheckpointCardState extends State<CheckpointCard> {
       _isNcRaiser &&
       widget.linkedNc!.status == 'Raised';
 
+  // ── Request queue ─────────────────────────────────────────────────────
+
+  // Runs [task] only after everything queued before it has finished —
+  // score saves and photo uploads for this checkpoint never overlap.
+  Future<T> _exclusive<T>(Future<T> Function() task) {
+    final run = _tail.then((_) => task());
+    _tail = run.then<void>((_) {}, onError: (_) {});
+    return run;
+  }
+
+  // What the next save carries: the fields as they are RIGHT NOW (read when
+  // the save actually runs, not when it was scheduled).
+  ({String findingType, double score, String remark, String? auditee, DateTime? date, String? severity}) _payload() {
+    final rule = _rule;
+    final typed = double.tryParse(_scoreController.text.trim());
+    // Strong / NC are fixed by the finding; Compliance / OFI carry what was
+    // typed (already validated by _isComplete). NC always sends a score —
+    // the server rejects an NC save without one.
+    final score = rule.fixed ? rule.fixedValue : (typed ?? rule.max);
+    return (
+      findingType: _findingType!,
+      score: score,
+      remark: _remarkController.text.trim(),
+      auditee: _needsNcDetails ? _auditeeEmployeeId : null,
+      date: _needsNcDetails ? _targetDate : null,
+      severity: _needsNcDetails ? _severity : null,
+    );
+  }
+
+  // Sends everything pending, one request at a time, until what's on screen
+  // is what the server has.
+  Future<void> _drain() => _exclusive(() async {
+        var rounds = 0;
+        while (_dirty && !_disposed && _isComplete && rounds++ < 20) {
+          final version = _editVersion;
+          final p = _payload();
+          final save = widget.onSave;
+          final nodeBefore = widget.node;
+          _update(() {
+            _saving = true;
+            _error = null;
+          });
+          _report();
+          final error = await save(
+            findingType: p.findingType,
+            score: p.score,
+            remark: p.remark,
+            auditeeEmployeeId: p.auditee,
+            targetDate: p.date,
+            severity: p.severity,
+          );
+          // Removed mid-request: dispose already queued a final save with the
+          // latest values, nothing more to do here.
+          if (_disposed) return;
+          if (error != null) {
+            _update(() {
+              _saving = false;
+              _error = error;
+            });
+            _report();
+            _scheduleRetry();
+            return;
+          }
+          _retryAttempt = 0;
+          final unchanged = _editVersion == version;
+          _update(() {
+            _saving = false;
+            if (unchanged) {
+              _dirty = false;
+              _justSaved = true;
+            }
+          });
+          _report();
+          // Now on the server — the on-device draft (if any) is obsolete.
+          if (unchanged) {
+            _persistDraft(widget.draftKey, '');
+            _resyncAfterSave(nodeBefore);
+          }
+        }
+      });
+
+  // The save refetches the audit and the parent hands this card the fresh
+  // node one frame later — so, once that has landed, show what the server
+  // actually stored (it may have clamped/derived the score), never what was
+  // typed. Skipped when no new node arrived (the refetch failed: the old one
+  // is not the server's answer) or when the auditor has already typed on.
+  void _resyncAfterSave(ParameterNode nodeBefore) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _dirty || _saving || identical(widget.node, nodeBefore)) return;
+      final n = widget.node;
+      if (n.findingType == null) return;
+      final score = n.score != null ? formatScore(n.score!) : '';
+      if (n.findingType == _findingType && score == _scoreController.text) return;
+      _suppressEdits = true;
+      setState(() {
+        _findingType = n.findingType;
+        _scoreController.text = score;
+        _seenScore = score;
+      });
+      _suppressEdits = false;
+    });
+  }
+
+  void _scheduleRetry() {
+    _retryTimer?.cancel();
+    if (_disposed || _retryAttempt >= _maxAutoRetries) return;
+    final delay = Duration(seconds: 3 << _retryAttempt);
+    _retryAttempt++;
+    _retryTimer = Timer(delay, () {
+      if (!_disposed) _drain();
+    });
+    // The failed row switches from "Retry" to "retrying…".
+    if (mounted) setState(() {});
+  }
+
+  // The last chance for an edit made on a card that's already gone.
+  void _detachedSave(
+    ({String findingType, double score, String remark, String? auditee, DateTime? date, String? severity}) p,
+    SaveCheckpoint save,
+    ValueChanged<CheckpointSyncState>? report,
+  ) {
+    _exclusive(() async {
+      String? error;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        error = await save(
+          findingType: p.findingType,
+          score: p.score,
+          remark: p.remark,
+          auditeeEmployeeId: p.auditee,
+          targetDate: p.date,
+          severity: p.severity,
+        );
+        if (error == null) break;
+        await Future<void>.delayed(Duration(seconds: 3 * (attempt + 1)));
+      }
+      // Clean either way: the card is gone, so nothing will ever retry — a
+      // lingering "failed" would keep the screen's save chip and back-guard
+      // stuck for good.
+      report?.call(CheckpointSyncState.clean);
+    });
+  }
+
+  /// Sends everything pending right now (skipping the debounce and any retry
+  /// wait) and resolves once this checkpoint's queue is empty. False if the
+  /// last attempt failed — the caller (Submit / Final Submit) must not carry
+  /// on as if it were saved.
+  Future<bool> flush() async {
+    if (widget.readOnly || _disposed) return true;
+    _debounce?.cancel();
+    _retryTimer?.cancel();
+    _photoRetryTimer?.cancel();
+    if (_findingType == null && _dirty) await _writeDraft();
+    _retryAttempt = 0;
+    if (_photoUploadError != null && _newPhotos.isNotEmpty && !_uploadingPhotos) {
+      _photoRetryAttempt = 0;
+      unawaited(_uploadPhotos(List.of(_newPhotos)));
+    }
+    await _drain();
+    await _tail;
+    // "Incomplete" (finding picked, score / NC details still missing) is not
+    // saved either — Submit must not go on as if it were.
+    final s = _syncState;
+    return s != CheckpointSyncState.failed && s != CheckpointSyncState.incomplete;
+  }
+
+  // Marks an edit and (re)starts the save: immediately for a discrete action
+  // (finding pick, NC details), after a short pause for typing.
+  void _scheduleSave({bool immediate = false}) {
+    _debounce?.cancel();
+    _retryTimer?.cancel();
+    _retryAttempt = 0;
+    if (immediate) {
+      _drain();
+    } else {
+      _debounce = Timer(_debounceDelay, _onDebounceFired);
+    }
+  }
+
+  void _onDebounceFired() {
+    if (_disposed) return;
+    if (_findingType == null) {
+      _writeDraft();
+    } else {
+      _drain();
+    }
+    _report();
+  }
+
+  // Every remark/score keystroke goes through here.
+  void _onFieldEdited() {
+    final changed = _remarkController.text != _seenRemark || _scoreController.text != _seenScore;
+    _seenRemark = _remarkController.text;
+    _seenScore = _scoreController.text;
+    if (!changed || _suppressEdits || _disposed) return;
+    setState(() {
+      _justSaved = false;
+      _dirty = true;
+      _error = null;
+      _editVersion++;
+    });
+    _scheduleSave();
+    _report();
+  }
+
+  // ── On-device draft (remark typed before any finding) ────────────────
+
+  Future<void> _restoreDraft() async {
+    final key = widget.draftKey;
+    if (key == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(key);
+      if (saved == null || saved.isEmpty || !mounted) return;
+      // The auditor already started typing while this loaded — theirs wins.
+      if (_remarkController.text.isNotEmpty || _findingType != null) return;
+      _suppressEdits = true;
+      _remarkController.text = saved;
+      _suppressEdits = false;
+      setState(() {});
+    } catch (_) {
+      // No storage available — just no draft.
+    }
+  }
+
+  Future<void> _writeDraft() => _persistDraft(widget.draftKey, _remarkController.text);
+
+  Future<void> _persistDraft(String? key, String text) async {
+    if (key == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (text.trim().isEmpty) {
+        await prefs.remove(key);
+      } else {
+        await prefs.setString(key, text);
+      }
+    } catch (_) {
+      // Best effort — the draft is a safety net, never a failure.
+    }
+  }
+
+  // ── NC edit / details ─────────────────────────────────────────────────
+
   // Opens the NC-details sheet in EDIT mode (nc_details_sheet.dart),
   // seeded with what this NC currently carries, and pushes whatever comes
-  // back straight at updateNc. This was an inline form that unfolded
-  // inside the card itself — two dropdowns, a date row and a Save/Cancel
-  // pair grown in place, which shoved every checkpoint below it down the
-  // scroll the moment it opened, gave a long employee list a cramped
-  // in-card dropdown to live in, and duplicated (in a worse form) the
-  // exact three fields the raise-time sheet already collects properly.
-  // One sheet serves both directions now.
+  // back straight at updateNc.
   Future<void> _openNcEditSheet() async {
     final nc = widget.linkedNc;
     if (nc == null || widget.onUpdateNc == null) {
@@ -385,46 +774,44 @@ class _CheckpointCardState extends State<CheckpointCard> {
     }
   }
 
-  // Autosaves once this checkpoint is actually complete (see _isComplete) —
-  // a no-op otherwise (e.g. a finding was just picked but the remark's
-  // still empty), so every call site below can fire this unconditionally
-  // right after its own edit instead of separately checking readiness.
-  // Cancels any pending debounce first — an immediate trigger (finding
-  // pick, photo, NC details) firing this makes a still-queued debounced
-  // save from earlier remark typing redundant; without this it would fire
-  // moments later and resend the exact same fields a second time.
-  void _maybeAutoSave() {
-    _debounce?.cancel();
-    if (!mounted || _saving || !_isComplete) return;
-    _save();
-  }
-
-  // Every remark/score keystroke goes through here — refreshes the hint
-  // text, clears any stale "Saved" state, and (re)starts the debounce
-  // timer so autosave fires a short pause after the last keystroke rather
-  // than mid-word on every character.
-  void _onFieldEdited() {
-    setState(() {
-      _justSaved = false;
-      _editVersion++;
-    });
-    _debounce?.cancel();
-    _debounce = Timer(const Duration(milliseconds: 900), _maybeAutoSave);
+  // Score box defaults for a freshly picked finding: Strong/NC are fixed
+  // (shown, not typed), Compliance starts at full marks (the usual answer —
+  // one tap to save), OFI keeps a valid typed value or starts blank (there's
+  // no sensible default for a partial score).
+  void _applyScoreDefaults(String ft) {
+    final rule = scoreRuleFor(ft, widget.maxScore);
+    final current = int.tryParse(_scoreController.text.trim());
+    String next;
+    if (rule.fixed) {
+      next = formatScore(rule.fixedValue);
+    } else if (current != null && current >= rule.min && current <= rule.max) {
+      next = _scoreController.text.trim();
+    } else {
+      next = ft == 'Compliance' ? formatScore(rule.max) : '';
+    }
+    _suppressEdits = true;
+    _scoreController.text = next;
+    _suppressEdits = false;
+    _scoreTouched = false;
   }
 
   void _selectFinding(String ft) {
     setState(() {
       _findingType = ft;
+      _applyScoreDefaults(ft);
       _justSaved = false;
+      _dirty = true;
+      _error = null;
       _editVersion++;
     });
+    _report();
     // A fresh NC needs its own popup (auditee pick + due date) filled in
     // before it can be saved — open it right away instead of leaving the
     // auditor to hunt for a now-visible-but-easy-to-miss inline control.
     if (ft == 'NC' && widget.node.ncId == null) {
       _openNcDetailsPopup();
     } else {
-      _maybeAutoSave();
+      _scheduleSave(immediate: true);
     }
   }
 
@@ -443,15 +830,20 @@ class _CheckpointCardState extends State<CheckpointCard> {
       initialSeverity: _severity,
     );
     if (result == null || !mounted) return;
+    _suppressEdits = true;
+    _remarkController.text = result.remark;
+    _suppressEdits = false;
     setState(() {
       _auditeeEmployeeId = result.auditeeEmployeeId;
       _targetDate = result.targetDate;
-      _remarkController.text = result.remark;
       _severity = result.severity;
       _justSaved = false;
+      _dirty = true;
+      _error = null;
       _editVersion++;
     });
-    _maybeAutoSave();
+    _report();
+    _scheduleSave(immediate: true);
   }
 
   // An already-uploaded photo is removed immediately (not deferred to the
@@ -464,7 +856,9 @@ class _CheckpointCardState extends State<CheckpointCard> {
       return;
     }
     setState(() => _deletingPhotoUrls.add(url));
-    final error = await widget.onDeletePhoto!(url);
+    // Behind any save/upload already queued for this checkpoint.
+    final delete = widget.onDeletePhoto!;
+    final error = await _exclusive(() => delete(url));
     if (!mounted) return;
     setState(() {
       _deletingPhotoUrls.remove(url);
@@ -477,95 +871,60 @@ class _CheckpointCardState extends State<CheckpointCard> {
     final picked = await pickEvidencePhotos(context);
     if (picked.isEmpty || !mounted) return;
     setState(() => _newPhotos.addAll(picked));
+    _photoRetryAttempt = 0;
     await _uploadPhotos(picked);
   }
 
-  // Uploads immediately — independent of the finding/remark save below,
-  // and of whether this checkpoint is even complete yet (see the class
-  // doc comment). `photos` is exactly the set this attempt is sending, so
-  // a Retry after a failure (see the photo-strip error row) can pass the
-  // same still-pending `_newPhotos` back in without resending anything
-  // that separately succeeded in the meantime.
-  Future<void> _uploadPhotos(List<File> photos) async {
-    if (!mounted) return;
+  // Uploads immediately — independent of the finding/remark save, and of
+  // whether this checkpoint is even complete yet (see the class doc
+  // comment), but queued behind any request already running for it.
+  // `photos` is exactly the set this attempt is sending, so a Retry after a
+  // failure can pass the same still-pending `_newPhotos` back in without
+  // resending anything that separately succeeded in the meantime.
+  Future<void> _uploadPhotos(List<File> photos) {
+    if (!mounted) return Future.value();
+    _photoRetryTimer?.cancel();
     setState(() {
       _uploadingPhotos = true;
       _photoUploadError = null;
     });
-    widget.onSavingChanged?.call(true);
-    final error = await widget.onUploadPhotos(
-      photos: photos,
-      onProgress: (phase, fraction) {
-        if (!mounted) return;
-        setState(() {
-          _uploadPhase = phase;
-          _uploadFraction = fraction;
+    _report();
+    final upload = widget.onUploadPhotos;
+    return _exclusive(() async {
+      final error = await upload(
+        photos: photos,
+        onProgress: (phase, fraction) {
+          if (!mounted) return;
+          setState(() {
+            _uploadPhase = phase;
+            _uploadFraction = fraction;
+          });
+        },
+      );
+      if (_disposed) return;
+      _update(() {
+        _uploadingPhotos = false;
+        _uploadPhase = null;
+        _uploadFraction = null;
+        _photoUploadError = error;
+        // On success the server already attached these to photoUrls and
+        // refetched the audit — didUpdateWidget's node.photoUrls resync
+        // picks them up as _existingPhotos, so drop them here rather than
+        // showing every photo twice. Left in _newPhotos on failure so
+        // Retry has exactly what to resend.
+        if (error == null) photos.forEach(_newPhotos.remove);
+      });
+      _report();
+      if (error != null && _photoRetryAttempt < 2) {
+        final delay = Duration(seconds: 4 << _photoRetryAttempt);
+        _photoRetryAttempt++;
+        _photoRetryTimer = Timer(delay, () {
+          if (!_disposed && _newPhotos.isNotEmpty && !_uploadingPhotos) _uploadPhotos(List.of(_newPhotos));
         });
-      },
-    );
-    // Reported unconditionally, ahead of the `mounted` guard below — this
-    // card can be unmounted mid-upload (e.g. a location-filter toggle
-    // removes it from the tree while its request is still in flight) and
-    // the parent's active-save count must still come back down, or the
-    // back-navigation guard would stay locked forever over a card that no
-    // longer exists.
-    widget.onSavingChanged?.call(false);
-    if (!mounted) return;
-    setState(() {
-      _uploadingPhotos = false;
-      _uploadPhase = null;
-      _uploadFraction = null;
-      _photoUploadError = error;
-      // On success the server already attached these to photoUrls and
-      // refetched the audit — didUpdateWidget's node.photoUrls resync
-      // picks them up as _existingPhotos, so drop them here rather than
-      // showing every photo twice. Left in _newPhotos on failure so
-      // Retry has exactly what to resend.
-      if (error == null) photos.forEach(_newPhotos.remove);
+      } else if (error == null) {
+        _photoRetryAttempt = 0;
+      }
     });
-  }
-
-  Future<void> _save() async {
-    if (!_isComplete || _saving) return;
-    double? score;
-    if (_findingType == 'OFI') {
-      score = double.tryParse(_scoreController.text.trim());
-    }
-    final savedVersion = _editVersion;
-    setState(() {
-      _error = null;
-      _saving = true;
-    });
-    widget.onSavingChanged?.call(true);
-    final error = await widget.onSave(
-      findingType: _findingType!,
-      score: score,
-      remark: _remarkController.text.trim(),
-      auditeeEmployeeId: _needsNcDetails ? _auditeeEmployeeId : null,
-      targetDate: _needsNcDetails ? _targetDate : null,
-      severity: _needsNcDetails ? _severity : null,
-    );
-    // Reported unconditionally, ahead of the `mounted` guard below — this
-    // card can be unmounted mid-save (e.g. a location-filter toggle removes
-    // it from the tree while its request is still in flight) and the
-    // parent's active-save count must still come back down, or the
-    // back-navigation guard would stay locked forever over a card that no
-    // longer exists.
-    widget.onSavingChanged?.call(false);
-    if (!mounted) return;
-    setState(() {
-      _saving = false;
-      _error = error;
-      // Only claim "Saved" if nothing changed while this request was in
-      // flight — an edit made mid-save bumps _editVersion, and that edit
-      // wasn't included in what was just sent.
-      _justSaved = error == null && _editVersion == savedVersion;
-    });
-    // An edit landed while this save was in flight (see the doc comment on
-    // _editVersion) — with no Save button left for the auditor to press
-    // themselves, this has to follow up on its own so that edit doesn't
-    // just sit there silently unsaved.
-    if (error == null && _editVersion != savedVersion) _maybeAutoSave();
   }
 
   @override
@@ -884,32 +1243,9 @@ class _CheckpointCardState extends State<CheckpointCard> {
             );
           }).toList(),
         ),
-        if (_findingType == 'OFI') ...[
+        if (_findingType != null) ...[
           const SizedBox(height: 10),
-          SizedBox(
-            width: 140,
-            child: TextField(
-              controller: _scoreController,
-              keyboardType: TextInputType.number,
-              // Whole numbers only — no decimal point, no exponent/sign
-              // characters a bare TextInputType.number keyboard can still
-              // let through on some IMEs.
-              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-              decoration: InputDecoration(labelText: 'Score (max ${(widget.maxScore - 1).toStringAsFixed(0)})'),
-              // Hard-clamp to strictly BELOW this checkpoint's own max as they
-              // type — an OFI is by definition a partial score (full marks
-              // belong to Strong Compliance/Compliance instead), same rule the
-              // server enforces, but letting the field visibly show the
-              // impossible max first is confusing.
-              onChanged: (value) {
-                final n = double.tryParse(value);
-                if (n != null && n >= widget.maxScore) {
-                  final clamped = (widget.maxScore - 1).toStringAsFixed(0);
-                  _scoreController.value = TextEditingValue(text: clamped, selection: TextSelection.collapsed(offset: clamped.length));
-                }
-              },
-            ),
-          ),
+          _scoreSection(scheme),
         ],
         // Fresh NC — auditee pick + due date are
         // both collected together in one popup (see nc_details_sheet.dart)
@@ -995,7 +1331,10 @@ class _CheckpointCardState extends State<CheckpointCard> {
               Expanded(child: Text(_photoUploadError!, style: TextStyle(color: scheme.error, fontSize: 12.5))),
               const SizedBox(width: 8),
               TextButton.icon(
-                onPressed: () => _uploadPhotos(List.of(_newPhotos)),
+                onPressed: () {
+                  _photoRetryAttempt = 0;
+                  _uploadPhotos(List.of(_newPhotos));
+                },
                 icon: const Icon(Icons.refresh, size: 15),
                 label: const Text('Retry'),
                 style: TextButton.styleFrom(
@@ -1030,52 +1369,125 @@ class _CheckpointCardState extends State<CheckpointCard> {
     ]);
   }
 
-  // Saving (spinner), a brief "Saved" confirmation right after success, a
-  // muted hint for whatever's still missing (findingType, remark, OFI
-  // score, NC details) before autosave has anything to send, or — the one
-  // case that still needs a manual tap — a save that actually failed,
-  // alongside Retry.
+  // The card's one small save indicator, right-aligned under everything:
+  // Saving… (spinner), a brief "Saved" confirmation, a failure that is being
+  // retried automatically — or, once those retries are used up, the error
+  // with a manual Retry — the on-device draft note for a remark typed before
+  // any finding, or a muted hint for whatever's still missing before there
+  // is anything to send. Wraps instead of clipping at large text sizes.
   Widget _statusRow(ColorScheme scheme) {
-    if (_saving) {
-      return Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-        SizedBox(height: 13, width: 13, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.outline)),
-        const SizedBox(width: 6),
-        Text('Saving…', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
-      ]);
-    }
-    if (_justSaved) {
-      return Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-        Icon(Icons.check_circle, size: 14, color: AppColors.green),
-        const SizedBox(width: 4),
-        Text('Saved', style: TextStyle(color: AppColors.green, fontSize: 12.5, fontWeight: FontWeight.w600)),
-      ]);
-    }
+    final small = TextStyle(color: scheme.outline, fontSize: 12.5);
+    Widget line(Widget icon, String text, {Color? color, FontWeight? weight}) => Wrap(
+          alignment: WrapAlignment.end,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 6,
+          children: [
+            icon,
+            Text(text, style: small.copyWith(color: color, fontWeight: weight)),
+          ],
+        );
+    Widget spinner() => SizedBox(height: 13, width: 13, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.outline));
+
+    Widget content;
     if (_error != null) {
-      return Row(
-        mainAxisAlignment: MainAxisAlignment.end,
+      final retrying = _retryTimer?.isActive ?? false;
+      content = Row(
         children: [
-          Expanded(child: Text(_error!, style: TextStyle(color: scheme.error, fontSize: 12.5))),
-          const SizedBox(width: 8),
-          // Default tap target, not the Size.zero + shrinkWrap this used
-          // to carry — a save that actually failed is the one thing on
-          // this card the auditor MUST be able to hit, and it was the same
-          // sub-44dp target the NC Edit button was called out for.
-          TextButton.icon(
-            onPressed: _save,
-            icon: const Icon(Icons.refresh, size: 15),
-            label: const Text('Retry'),
+          Expanded(
+            child: Text(
+              retrying ? 'Couldn\'t save — retrying…' : _error!,
+              style: TextStyle(color: scheme.error, fontSize: 12.5),
+            ),
           ),
+          if (!retrying) ...[
+            const SizedBox(width: 8),
+            // Default tap target — a save that actually failed is the one
+            // thing on this card the auditor MUST be able to hit.
+            TextButton.icon(
+              onPressed: () {
+                _retryAttempt = 0;
+                _drain();
+              },
+              icon: const Icon(Icons.refresh, size: 15),
+              label: const Text('Retry'),
+            ),
+          ],
         ],
       );
+    } else if (_syncState == CheckpointSyncState.saving && !_uploadingPhotos) {
+      content = line(spinner(), 'Saving…');
+    } else if (_justSaved && !_dirty) {
+      content = line(const Icon(Icons.check_circle, size: 14, color: AppColors.green), 'Saved',
+          color: AppColors.readable(context, AppColors.green), weight: FontWeight.w600);
+    } else if (_findingType == null && _remarkController.text.trim().isNotEmpty) {
+      content = line(Icon(Icons.phone_android, size: 14, color: scheme.outline), 'Draft kept on this device — pick a finding to submit it');
+    } else if (_missingFieldHint != null && _scoreError == null) {
+      content = Text(_missingFieldHint!, textAlign: TextAlign.end, style: small);
+    } else {
+      return const SizedBox.shrink();
     }
-    final hint = _missingFieldHint;
-    if (hint != null) {
-      return Align(
-        alignment: Alignment.centerRight,
-        child: Text(hint, style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+    return Align(alignment: Alignment.centerRight, child: content);
+  }
+
+  // The score follows the finding: Strong is fixed at the full max, NC is
+  // fixed at 0 (it's the state that raises the NC), Compliance takes
+  // 0..max and OFI 0..max-1 (see scoreRuleFor). A fixed score is shown, not
+  // typed, so there's nothing to get wrong; a typed one is validated inline
+  // and is simply not sent until it's in range.
+  Widget _scoreSection(ColorScheme scheme) {
+    final rule = _rule;
+    final max = formatScore(widget.maxScore);
+    if (rule.fixed) {
+      final tone = _findingColor(_findingType!);
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: tone.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: tone.withValues(alpha: 0.3)),
+        ),
+        child: Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 2,
+          children: [
+            Icon(Icons.lock_outline, size: 15, color: AppColors.readable(context, tone)),
+            Text('Score', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+            Text('${formatScore(rule.fixedValue)} / $max',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.readable(context, tone))),
+            Text(_findingType == 'NC' ? 'fixed for an NC' : 'full marks', style: TextStyle(color: scheme.outline, fontSize: 12)),
+          ],
+        ),
       );
     }
-    return const SizedBox.shrink();
+    final error = _scoreTouched || _scoreController.text.isNotEmpty ? _scoreError : null;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: SizedBox(
+        width: 190,
+        child: Focus(
+          onFocusChange: (focused) {
+            if (!focused && !_scoreTouched) setState(() => _scoreTouched = true);
+          },
+          child: TextField(
+            controller: _scoreController,
+            keyboardType: TextInputType.number,
+            // Whole numbers only — no decimal point, no exponent/sign
+            // characters a bare TextInputType.number keyboard can still let
+            // through on some IMEs. Range is checked live (errorText) rather
+            // than silently rewriting what was typed.
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
+            decoration: InputDecoration(
+              labelText: 'Score',
+              suffixText: '/ $max',
+              helperText: 'Allowed ${formatScore(rule.min)}–${formatScore(rule.max)}',
+              errorText: error,
+              prefixIcon: const Icon(Icons.pin_outlined, size: 20),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   // Once the NC-details popup has been filled in, show what was picked

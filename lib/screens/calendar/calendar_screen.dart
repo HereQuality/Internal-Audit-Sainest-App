@@ -5,7 +5,6 @@ import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_date_range.dart';
 import '../../core/utils/audit_status.dart';
 import '../../providers/audits_provider.dart';
-import '../../providers/dashboard_provider.dart';
 import '../../providers/filter_options_provider.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
@@ -111,14 +110,11 @@ class _CalendarScreenState extends State<CalendarScreen> {
     final audits = context.read<AuditsProvider>();
     final result = await showAuditFilterSheet(
       context,
-      isTeam: audits.isTeamScope,
-      employees: audits.employeeFilter,
-      locations: audits.locationFilter,
-      auditTypes: audits.auditTypeFilter,
-      // Non-null is what makes the sheet show its Month section at all —
-      // this is the only screen that passes it, because it is the only one
-      // whose content is laid out by month.
-      month: _visibleMonth,
+      // A non-null month is what makes the sheet show its Month section at
+      // all — this is the only screen that passes it, because it is the only
+      // one whose content is laid out by month.
+      initial: AuditFilterSelection.fromScope(audits, month: _visibleMonth),
+      // Status/flag don't apply to the month grid; a date range does.
     );
     // Dismissed without applying — leave every dimension exactly as it was.
     if (result == null || !mounted) {
@@ -136,25 +132,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
     if (!context.mounted) {
       return;
     }
-    // Applied to BOTH providers, exactly as ScopeToggle already does for
-    // the Me/Team flag alone: they hold separate copies of the same filter
-    // (see AuditFilterScope's class doc for why), so updating one and not
-    // the other leaves the dashboard's numbers describing a different
-    // population than the list the user is looking at.
-    await Future.wait([
-      context.read<AuditsProvider>().applyFilters(
-        isTeam: result.isTeam,
-        employees: result.employees,
-        locations: result.locations,
-        auditTypes: result.auditTypes,
-      ),
-      context.read<DashboardProvider>().applyFilters(
-        isTeam: result.isTeam,
-        employees: result.employees,
-        locations: result.locations,
-        auditTypes: result.auditTypes,
-      ),
-    ]);
+    // Pushed to every filter-holding provider (Audits, Dashboard, NC): the
+    // filters are one shared state across the app, so the calendar and the
+    // lists never describe different populations.
+    await applyAuditFilterSelection(context, result);
   }
 
   /// Back to the resting "just me, everywhere, every type" state — on both
@@ -163,10 +144,17 @@ class _CalendarScreenState extends State<CalendarScreen> {
   /// not a filter, and yanking the user back to the current month while
   /// they are reading November is not what "clear filters" promises.
   Future<void> _clearFilters() {
-    return Future.wait([
-      context.read<AuditsProvider>().clearFilters(),
-      context.read<DashboardProvider>().clearFilters(),
-    ]);
+    // Keeps any Status / Flag pick: this screen doesn't offer them, so a
+    // "Clear" here must not wipe something the user can't see.
+    final audits = context.read<AuditsProvider>();
+    return applyAuditFilterSelection(
+      context,
+      AuditFilterSelection(
+        statuses: audits.statusFilter,
+        includeSkipped: audits.includeSkipped,
+        flags: audits.flagFilter,
+      ),
+    );
   }
 
   @override
@@ -219,7 +207,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
           // being stretched to the full toolbar height by the actions Row.
           Center(
             child: FilterButton(
-              activeCount: auditsProvider.activeFilterCount,
+              activeCount: auditsProvider.activeFilterCountFor(
+                status: false,
+                flag: false,
+              ),
               onTap: _openFilters,
             ),
           ),
@@ -229,7 +220,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (auditsProvider.hasActiveFilters)
+          if (auditsProvider.activeFilterCountFor(status: false, flag: false) > 0)
             _ActiveFilterBar(
               labels: _activeFilterLabels(auditsProvider, filterOptions),
               onClear: _clearFilters,
@@ -373,10 +364,20 @@ List<String> _activeFilterLabels(
   FilterOptionsProvider options,
 ) {
   final labels = <String>[];
+  if (audits.teamFilter.isNotEmpty) {
+    labels.add(
+      _summarise(
+        audits.teamFilter,
+        {for (final t in options.teams) t.id: t.name},
+        'team',
+        'teams',
+      ),
+    );
+  }
   if (audits.employeeFilter.isNotEmpty) {
-    // A non-empty people pick WINS over the Me/Team flag (see
-    // AuditFilterScope.filterParams), so showing "Team" alongside it would
-    // describe a scope that isn't in force.
+    // A non-empty people pick WINS over the Me/All Members flag (see
+    // AuditFilterScope.filterParams), so showing "All Members" alongside it
+    // would describe a scope that isn't in force.
     labels.add(
       _summarise(
         audits.employeeFilter,
@@ -385,8 +386,8 @@ List<String> _activeFilterLabels(
         'people',
       ),
     );
-  } else if (audits.isTeamScope) {
-    labels.add('Team');
+  } else if (audits.isTeamScope && audits.teamFilter.isEmpty) {
+    labels.add('All Members');
   }
   if (audits.locationFilter.isNotEmpty) {
     labels.add(
@@ -398,6 +399,17 @@ List<String> _activeFilterLabels(
       ),
     );
   }
+  if (audits.departmentFilter.isNotEmpty) {
+    labels.add(
+      _summarise(
+        audits.departmentFilter,
+        {for (final d in options.departments) d.id: d.name},
+        'department',
+        'departments',
+      ),
+    );
+  }
+  if (audits.hasDateFilter) labels.add('Date range');
   if (audits.auditTypeFilter.isNotEmpty) {
     // Audit types are filtered by NAME rather than id (models/audit_type_
     // option.dart explains why), so a single pick is already displayable

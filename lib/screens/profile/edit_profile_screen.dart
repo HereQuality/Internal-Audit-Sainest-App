@@ -72,10 +72,18 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   }
 
   Future<void> _pickImage() async {
-    final picked = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 800, imageQuality: 85);
-    if (picked != null) {
+    final XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(source: ImageSource.gallery, maxWidth: 800, imageQuality: 85);
+    } catch (_) {
+      // Photo access refused or the picker failed: nothing was chosen.
+      if (mounted) showErrorSnackBar(context, 'Could not open your photos.');
+      return;
+    }
+    if (picked != null && mounted) {
+      final path = picked.path;
       setState(() {
-        _pickedImage = File(picked.path);
+        _pickedImage = File(path);
         _removeExistingPic = false;
       });
     }

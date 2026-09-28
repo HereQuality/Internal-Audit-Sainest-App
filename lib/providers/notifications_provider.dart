@@ -43,8 +43,14 @@ class NotificationsProvider extends ChangeNotifier with WidgetsBindingObserver {
     _onNewNotification = (data) {
       if (data is Map) {
         final map = Map<String, dynamic>.from(data);
-        notifications = [NotificationModel.fromJson(map), ...notifications];
-        unreadCount += 1;
+        final incoming = NotificationModel.fromJson(map);
+        // The same event can reach this list twice — a socket that reconnected
+        // and re-delivered it, or a refetch that already carries it by the
+        // time the live event lands. It is listed, counted and announced once.
+        final known = incoming.id.isNotEmpty && notifications.any((n) => n.id == incoming.id);
+        if (known) return;
+        notifications = [incoming, ...notifications];
+        if (!incoming.isRead) unreadCount += 1;
         notifyListeners();
         unawaited(_showLiveBanner(map));
       }
@@ -93,6 +99,7 @@ class NotificationsProvider extends ChangeNotifier with WidgetsBindingObserver {
   // this stays quiet (a banner from a socket that outlived the foreground
   // would repeat the OS's).
   Future<void> _showLiveBanner(Map<String, dynamic> map) async {
+    final epoch = _epoch;
     try {
       final type = map['type']?.toString() ?? '';
       if (!await NotificationPrefs.readPushAllowed(type)) return;
@@ -102,6 +109,9 @@ class NotificationsProvider extends ChangeNotifier with WidgetsBindingObserver {
         if (await FcmService.awaitNativeAlert(notificationId)) return;
         if (!_inForeground) return;
       }
+      // Signed out while the checks above were waiting (the native-alert wait
+      // alone can take seconds): the banner belongs to the account that left.
+      if (epoch != _epoch) return;
       await LocalNotifications.showServerBanner(
         notificationId: notificationId,
         type: type,
@@ -193,6 +203,9 @@ class NotificationsProvider extends ChangeNotifier with WidgetsBindingObserver {
           fallback: 'Could not load notifications.',
         );
       }
+    } catch (e, st) {
+      debugPrint('NotificationsProvider.fetchNotifications: unreadable answer: $e\n$st');
+      if (epoch == _epoch) errorMessage = 'Could not load notifications.';
     } finally {
       if (epoch == _epoch) {
         isLoading = false;

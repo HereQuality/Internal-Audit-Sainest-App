@@ -33,6 +33,17 @@ class AppModeProvider extends ChangeNotifier {
     await SecureStorage.instance.saveAppMode(next == AppMode.auditor ? 'auditor' : 'auditee');
   }
 
+  /// Called when a session ends. SecureStorage.clear() already wiped the saved
+  /// choice, but this provider lives for the whole process and would keep it in
+  /// memory — so the NEXT person to sign in on this phone would land in the
+  /// previous account's Auditor/Auditee tab set instead of being asked. Keeps
+  /// [loaded]: the (now empty) answer is known.
+  void resetForLogout() {
+    if (mode == null) return;
+    mode = null;
+    notifyListeners();
+  }
+
   /// Back to the role picker — doesn't touch auth, just clears the local
   /// preference so _RootGate shows RolePickerScreen again.
   Future<void> reset() async {

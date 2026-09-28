@@ -321,6 +321,15 @@ class AuditorStats {
   // someone responds to NCs raised against them).
   final double? auditAtsScore;
   final double? auditOtcScore;
+  // The auditor scorecard's figures (same GET /audits/auditor-stats response;
+  // ATS/OTC above are no longer shown for an auditor's own audits — they are
+  // the auditee's, for their NCs). totalAudits = every audit in the plan
+  // pipeline (Not Started + In Progress + Overdue + Delayed + On-Time + Not
+  // Attempted); overall/last score are null until an audit has been scored.
+  final int totalAudits;
+  final int activeAudits;
+  final double? overallScore;
+  final double? lastAuditScore;
 
   const AuditorStats({
     this.assignedAudits = 0,
@@ -346,6 +355,10 @@ class AuditorStats {
     this.totalClosedIds = const [],
     this.auditAtsScore,
     this.auditOtcScore,
+    this.totalAudits = 0,
+    this.activeAudits = 0,
+    this.overallScore,
+    this.lastAuditScore,
   });
 
   /// The tally for one status label of the unified vocabulary (0 for a label
@@ -409,6 +422,10 @@ class AuditorStats {
       totalClosedIds: asIds(json['totalClosedIds']),
       auditAtsScore: (json['auditAtsScore'] as num?)?.toDouble(),
       auditOtcScore: (json['auditOtcScore'] as num?)?.toDouble(),
+      totalAudits: asInt(json['totalAudits']),
+      activeAudits: asInt(json['activeAudits']),
+      overallScore: (json['overallScore'] as num?)?.toDouble(),
+      lastAuditScore: (json['lastAuditScore'] as num?)?.toDouble(),
     );
   }
 }

@@ -42,6 +42,10 @@ class StatusFilterChipRow extends StatefulWidget {
   /// mark while its chip is selected.
   final Color? Function(String option)? dotColorFor;
 
+  /// Optional display text per option (the NC lists show "Total NC" for the
+  /// underlying 'All'); defaults to the option itself.
+  final String Function(String option)? labelFor;
+
   const StatusFilterChipRow({
     super.key,
     required this.options,
@@ -49,6 +53,7 @@ class StatusFilterChipRow extends StatefulWidget {
     required this.onSelected,
     this.height = 44,
     this.dotColorFor,
+    this.labelFor,
   });
 
   @override
@@ -120,7 +125,7 @@ class _StatusFilterChipRowState extends State<StatusFilterChipRow> {
     return Center(
       key: _keyAt(index),
       child: ChoiceChip(
-        label: Text(label),
+        label: Text(widget.labelFor?.call(label) ?? label),
         avatar: dot == null
             ? null
             : Container(

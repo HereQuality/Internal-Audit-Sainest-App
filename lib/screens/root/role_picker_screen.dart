@@ -59,6 +59,14 @@ class RolePickerScreen extends StatelessWidget {
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline),
                     textAlign: TextAlign.center,
                   ),
+                  const SizedBox(height: 12),
+                  // The picker is the first screen after every login, so
+                  // "wrong account" needs a way out from here too.
+                  TextButton.icon(
+                    onPressed: () => context.read<AuthProvider>().logout(),
+                    icon: const Icon(Icons.logout_rounded, size: 18),
+                    label: const Text('Sign out'),
+                  ),
                 ],
               ),
             ),

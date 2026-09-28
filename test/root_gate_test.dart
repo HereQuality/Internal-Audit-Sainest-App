@@ -20,11 +20,13 @@ import 'package:internal_audit_app/providers/audits_provider.dart';
 import 'package:internal_audit_app/providers/auth_provider.dart';
 import 'package:internal_audit_app/providers/dashboard_provider.dart';
 import 'package:internal_audit_app/providers/filter_options_provider.dart';
+import 'package:internal_audit_app/providers/list_view_memory.dart';
 import 'package:internal_audit_app/providers/maintenance_provider.dart';
 import 'package:internal_audit_app/providers/nc_provider.dart';
 import 'package:internal_audit_app/providers/notifications_provider.dart';
 import 'package:internal_audit_app/providers/tickets_provider.dart';
 import 'package:internal_audit_app/screens/auth/login_screen.dart';
+import 'package:internal_audit_app/screens/root/role_picker_screen.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -103,6 +105,7 @@ void main() {
             ChangeNotifierProvider<DashboardProvider>.value(value: dashboard),
             ChangeNotifierProvider<TicketsProvider>.value(value: tickets),
             ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
+            ChangeNotifierProvider(create: (_) => ListViewMemory()),
           ],
           child: MaterialApp(
             navigatorKey: notificationNavigatorKey,
@@ -189,6 +192,23 @@ void main() {
       expect(notifications.unreadCount, 0);
       expect(tickets.tickets, isEmpty);
       expect(takeHeldNotificationTap(), isNull);
+    });
+  });
+
+  group('signing in again on the same phone', () {
+    testWidgets('the role the previous account picked is forgotten, so the next one is asked', (tester) async {
+      await mount(tester);
+      appMode.mode = AppMode.auditor;
+      await setStatus(tester, AuthStatus.authenticated);
+      expect(appMode.mode, AppMode.auditor);
+
+      await setStatus(tester, AuthStatus.unauthenticated);
+      await settleUi(tester);
+      expect(appMode.mode, isNull);
+      expect(find.byType(LoginScreen), findsOneWidget);
+
+      await setStatus(tester, AuthStatus.authenticated, role: 'Employee');
+      expect(find.byType(RolePickerScreen), findsOneWidget);
     });
   });
 

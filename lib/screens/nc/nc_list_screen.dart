@@ -6,12 +6,14 @@ import '../../core/utils/formatters.dart';
 import '../../core/utils/nc_timeliness.dart';
 import '../../models/nc_model.dart';
 import '../../providers/auth_provider.dart';
+import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
-import '../../widgets/filter_sheet.dart' show FilterButton;
-import '../../widgets/scope_toggle.dart';
+import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
+import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/status_badge.dart';
+import '../../widgets/status_filter_chip_row.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
 
@@ -212,207 +214,107 @@ class _NcListScreenState extends State<NcListScreen>
   }
 }
 
-// Shared by both lists below — Me/Team on the left, the status Filters
-// button on the right, same spaceBetween header-row shape as
-// DashboardFilterBar/MyAuditsScreen use for their own scope+filter rows.
+// Shared by both lists below — the shared filter bar (Me / All Members, the
+// Filters sheet with Team, Members, Location + Department, Audit Type, Date
+// range and Flag, and the removable pills), then a search box and the NC
+// status chips (single-select — the same six/four buckets as this side's own
+// dashboard tiles, see _auditorStatusFilters / _auditeeStatusFilters).
 //
-// This used to be a permanently-visible horizontal row of ALL TEN status
-// chips (StatusFilterChipRow, one per _ncStatusFilters entry) sitting
-// under the ScopeToggle — on a phone that's a wall of pills wide enough
-// that most of them scroll off-screen, and "In Progress"/"Pending
-// Approval"/"Overdue"/"On Time"/"Delayed" (the derived buckets) sitting
-// right next to "Raised"/"Response Submitted"/"Verification"/"Closed"
-// (the raw statuses) reads as one undifferentiated cluster. A single
-// "Filters" button opening a picker sheet (see showNcStatusFilterSheet)
-// keeps the status choice one tap away without permanently spending
-// screen space on nine options nobody has picked.
-class _NcListFilterRow extends StatelessWidget {
-  final bool isTeam;
-  final ValueChanged<bool> onScopeChanged;
+// The filters themselves are the shared app-wide state (NcProvider holds them
+// like AuditsProvider/DashboardProvider; see applyAuditFilterSelection) and go
+// to GET /ncs/raised / /ncs/mine as query params, so they filter server-side
+// exactly as on the web. The chip, the search text and the scroll offset are
+// remembered in ListViewMemory, so opening an NC and pressing Back finds the
+// list as it was.
+class _NcListHeader extends StatelessWidget {
+  final TextEditingController searchController;
+  final ValueChanged<String> onSearchChanged;
   final String statusFilter;
   final ValueChanged<String> onStatusChanged;
 
-  /// Which values this side's sheet offers — _auditorStatusFilters or
+  /// Which values this side offers — _auditorStatusFilters or
   /// _auditeeStatusFilters — and their display labels.
   final List<String> filters;
   final Map<String, String> labels;
 
-  const _NcListFilterRow({
-    required this.isTeam,
-    required this.onScopeChanged,
+  const _NcListHeader({
+    required this.searchController,
+    required this.onSearchChanged,
     required this.statusFilter,
     required this.onStatusChanged,
     required this.filters,
     required this.labels,
   });
 
-  Future<void> _openStatusSheet(BuildContext context) async {
-    final result = await showNcStatusFilterSheet(
-      context,
-      selected: statusFilter,
-      filters: filters,
-      labels: labels,
-    );
-    if (result != null) {
-      onStatusChanged(result);
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Flexible(
-          child: Padding(
-            padding: const EdgeInsets.only(right: 12),
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: ScopeToggle(isTeam: isTeam, onChanged: onScopeChanged),
+        // Kept visible through loading/error/empty too — an empty "Me"
+        // list is exactly when widening to All Members matters most.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: const AuditFilterBar(showFlag: true),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: TextField(
+            controller: searchController,
+            textInputAction: TextInputAction.search,
+            onChanged: onSearchChanged,
+            decoration: InputDecoration(
+              isDense: true,
+              prefixIcon: const Icon(Icons.search, size: 20),
+              hintText: 'Search NCs, audit, person...',
+              suffixIcon: searchController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear, size: 18),
+                      tooltip: 'Clear search',
+                      onPressed: () {
+                        searchController.clear();
+                        onSearchChanged('');
+                      },
+                    ),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
             ),
           ),
         ),
-        FilterButton(
-          activeCount: statusFilter == 'All' ? 0 : 1,
-          onTap: () => _openStatusSheet(context),
+        StatusFilterChipRow(
+          options: filters,
+          selected: statusFilter,
+          labelFor: (o) => labels[o] ?? o,
+          onSelected: onStatusChanged,
         ),
       ],
     );
   }
 }
 
-/// The status picker sheet _NcListFilterRow's Filters button opens.
-/// Single-select: tapping a row both picks it AND closes the sheet (one
-/// tap, no separate Apply step needed for a single value) and returns the
-/// chosen filter string; dismissing without picking (tap outside, drag
-/// down) returns null and the caller leaves the current filter alone.
-Future<String?> showNcStatusFilterSheet(
-  BuildContext context, {
-  required String selected,
-  required List<String> filters,
-  required Map<String, String> labels,
-}) {
-  return showModalBottomSheet<String>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    builder: (_) => _NcStatusFilterSheet(
-      selected: selected,
-      filters: filters,
-      labels: labels,
-    ),
-  );
-}
+/// "Nothing came back under the filters" — distinct from "you have none", so
+/// a filter can never read as a clean record. Offers the way out.
+Widget _filteredEmpty(BuildContext context) => EmptyState(
+  icon: Icons.filter_alt_off_outlined,
+  title: 'No NCs match your filters',
+  subtitle: 'Try widening the people, place, date or flag.',
+  action: OutlinedButton.icon(
+    onPressed: () =>
+        applyAuditFilterSelection(context, AuditFilterSelection.cleared),
+    icon: const Icon(Icons.filter_alt_off_outlined),
+    label: const Text('Clear filters'),
+  ),
+);
 
-class _NcStatusFilterSheet extends StatelessWidget {
-  final String selected;
-  final List<String> filters;
-  final Map<String, String> labels;
-
-  const _NcStatusFilterSheet({
-    required this.selected,
-    required this.filters,
-    required this.labels,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      // Status is a single tap-to-pick list, never a text field — no
-      // keyboard can appear over it — but the same viewInsets padding
-      // every other sheet in this app applies costs nothing and keeps
-      // this one consistent if a future revision ever adds a search box.
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
-      // Ink, not Container: the sheet's own Material is transparent, so a
-      // decorated Container sat on top of the option rows' InkWell ripple.
-      child: Ink(
-        decoration: BoxDecoration(
-          color: scheme.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        // + the home-indicator inset, so the last option isn't under it.
-        padding: EdgeInsets.fromLTRB(0, 20, 0, 12 + MediaQuery.paddingOf(context).bottom),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                'Status',
-                style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w700,
-                    ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            // Same capped-height, scrollable list convention as every
-            // other multi-select sheet in this app (see
-            // select_representative_sheet.dart's own identical
-            // ConstrainedBox+shrinkWrap pair) — a fixed cap outside any
-            // Flexible/Expanded needs no ambiguous parent height to work
-            // against, unlike sizing this off a percentage of the sheet's
-            // own (itself content-sized) height would.
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 400),
-              child: ListView(
-                shrinkWrap: true,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                children: [
-                  for (final option in filters)
-                    _StatusOptionTile(
-                      label: labels[option] ?? option,
-                      checked: option == selected,
-                      onTap: () => Navigator.of(context).pop(option),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _StatusOptionTile extends StatelessWidget {
-  final String label;
-  final bool checked;
-  final VoidCallback onTap;
-
-  const _StatusOptionTile({
-    required this.label,
-    required this.checked,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                label,
-                style: TextStyle(
-                  fontWeight: checked ? FontWeight.w700 : FontWeight.w500,
-                  color: checked ? scheme.primary : scheme.onSurface,
-                ),
-              ),
-            ),
-            if (checked)
-              Icon(Icons.check_rounded, size: 20, color: scheme.primary),
-          ],
-        ),
-      ),
-    );
-  }
+/// Free-text narrowing over what is already loaded (like the Audits tab's
+/// search): the NC's title/id, its audit's title and both people's names.
+bool _ncMatchesSearch(NcModel n, String query) {
+  bool has(String? v) => v != null && v.toLowerCase().contains(query);
+  return has(n.title) ||
+      has(n.ncId) ||
+      has(n.auditTitle) ||
+      has(n.auditee.name) ||
+      has(n.raisedBy.name);
 }
 
 class _RaisedByMeList extends StatefulWidget {
@@ -426,7 +328,49 @@ class _RaisedByMeList extends StatefulWidget {
 }
 
 class _RaisedByMeListState extends State<_RaisedByMeList> {
-  late String _statusFilter = widget.initialStatusFilter ?? 'All';
+  static const _memoryId = 'nc-raised';
+  late final ListScreenMemory _saved;
+  late String _statusFilter;
+  late final TextEditingController _search;
+  late final ScrollController _scroll;
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    final memory = context.read<ListViewMemory>();
+    // A dashboard tile jump re-keys this screen with the tile's own filter:
+    // start fresh for it. A plain remount keeps what was remembered.
+    if (widget.initialStatusFilter != null) memory.forget(_memoryId);
+    _saved = memory.screen(_memoryId);
+    if (widget.initialStatusFilter != null) {
+      _saved.chip = widget.initialStatusFilter!;
+    }
+    _statusFilter = _saved.chip;
+    _query = _saved.search;
+    _search = TextEditingController(text: _saved.search);
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
+      ..addListener(() {
+        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
+      });
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onSearch(String v) {
+    _saved.search = v;
+    setState(() => _query = v);
+  }
+
+  void _onStatus(String v) {
+    _saved.chip = v;
+    setState(() => _statusFilter = v);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -435,25 +379,26 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
     final showError =
         provider.raisedError != null && provider.raisedByMe.isEmpty;
     final showEmpty = !showLoading && !showError && provider.raisedByMe.isEmpty;
+    final query = _query.trim().toLowerCase();
     final filtered = provider.raisedByMe
-        .where((n) => _matchesFilter(n, _statusFilter))
+        .where(
+          (n) =>
+              _matchesFilter(n, _statusFilter) &&
+              (query.isEmpty || _ncMatchesSearch(n, query)),
+        )
         .toList();
     return Column(
       children: [
         // Kept visible through loading/error/empty too — an empty "Me"
         // list (nobody raised against your own scope) is exactly when
         // switching to "Team" to check your reports' NCs matters most.
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: _NcListFilterRow(
-            isTeam: provider.isTeamScope,
-            onScopeChanged: (isTeam) =>
-                context.read<NcProvider>().setTeamScope(isTeam),
-            statusFilter: _statusFilter,
-            onStatusChanged: (v) => setState(() => _statusFilter = v),
-            filters: _auditorStatusFilters,
-            labels: _auditorStatusFilterLabels,
-          ),
+        _NcListHeader(
+          searchController: _search,
+          onSearchChanged: _onSearch,
+          statusFilter: _statusFilter,
+          onStatusChanged: _onStatus,
+          filters: _auditorStatusFilters,
+          labels: _auditorStatusFilterLabels,
         ),
         Expanded(
           child: showLoading
@@ -464,10 +409,12 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
                   onRetry: widget.onRefresh,
                 )
               : showEmpty
-              ? const EmptyState(
-                  icon: Icons.fact_check_outlined,
-                  title: 'No NCs raised yet',
-                )
+              ? (provider.hasActiveFilters
+                    ? _filteredEmpty(context)
+                    : const EmptyState(
+                        icon: Icons.fact_check_outlined,
+                        title: 'No NCs raised yet',
+                      ))
               : RefreshIndicator(
                   onRefresh: widget.onRefresh,
                   child: filtered.isEmpty
@@ -478,12 +425,15 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
                               height: MediaQuery.of(context).size.height * 0.5,
                               child: EmptyState(
                                 icon: Icons.filter_alt_off_outlined,
-                                title: 'No $_statusFilter NCs',
+                                title: query.isNotEmpty
+                                    ? 'No NCs match "${_query.trim()}"'
+                                    : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
                               ),
                             ),
                           ],
                         )
                       : ListView.separated(
+                          controller: _scroll,
                           padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                           itemCount: filtered.length,
                           separatorBuilder: (_, _) =>
@@ -524,7 +474,49 @@ class _AgainstMeList extends StatefulWidget {
 }
 
 class _AgainstMeListState extends State<_AgainstMeList> {
-  late String _statusFilter = widget.initialStatusFilter ?? 'All';
+  static const _memoryId = 'nc-against';
+  late final ListScreenMemory _saved;
+  late String _statusFilter;
+  late final TextEditingController _search;
+  late final ScrollController _scroll;
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    final memory = context.read<ListViewMemory>();
+    // A dashboard tile jump re-keys this screen with the tile's own filter:
+    // start fresh for it. A plain remount keeps what was remembered.
+    if (widget.initialStatusFilter != null) memory.forget(_memoryId);
+    _saved = memory.screen(_memoryId);
+    if (widget.initialStatusFilter != null) {
+      _saved.chip = widget.initialStatusFilter!;
+    }
+    _statusFilter = _saved.chip;
+    _query = _saved.search;
+    _search = TextEditingController(text: _saved.search);
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
+      ..addListener(() {
+        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
+      });
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onSearch(String v) {
+    _saved.search = v;
+    setState(() => _query = v);
+  }
+
+  void _onStatus(String v) {
+    _saved.chip = v;
+    setState(() => _statusFilter = v);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -532,8 +524,13 @@ class _AgainstMeListState extends State<_AgainstMeList> {
     final showLoading = provider.isLoadingMine && provider.raisedAgainstMe.isEmpty;
     final showError = provider.mineError != null && provider.raisedAgainstMe.isEmpty;
     final showEmpty = !showLoading && !showError && provider.raisedAgainstMe.isEmpty;
+    final query = _query.trim().toLowerCase();
     final filtered = provider.raisedAgainstMe
-        .where((n) => _matchesFilter(n, _statusFilter))
+        .where(
+          (n) =>
+              _matchesFilter(n, _statusFilter) &&
+              (query.isEmpty || _ncMatchesSearch(n, query)),
+        )
         .toList();
     return Column(
       children: [
@@ -542,17 +539,13 @@ class _AgainstMeListState extends State<_AgainstMeList> {
         // raised anything against your own scope) is exactly when switching
         // to "Team" to check your downstream reports' NCs matters most. Same
         // Me/Team scope as the web app's Auditee.jsx TeamFilterPanel.
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: _NcListFilterRow(
-            isTeam: provider.isTeamScope,
-            onScopeChanged: (isTeam) =>
-                context.read<NcProvider>().setTeamScope(isTeam),
-            statusFilter: _statusFilter,
-            onStatusChanged: (v) => setState(() => _statusFilter = v),
-            filters: _auditeeStatusFilters,
-            labels: _auditeeStatusFilterLabels,
-          ),
+        _NcListHeader(
+          searchController: _search,
+          onSearchChanged: _onSearch,
+          statusFilter: _statusFilter,
+          onStatusChanged: _onStatus,
+          filters: _auditeeStatusFilters,
+          labels: _auditeeStatusFilterLabels,
         ),
         Expanded(
           child: showLoading
@@ -563,10 +556,12 @@ class _AgainstMeListState extends State<_AgainstMeList> {
                   onRetry: widget.onRefresh,
                 )
               : showEmpty
-              ? const EmptyState(
-                  icon: Icons.thumb_up_outlined,
-                  title: 'No NCs against you — great work!',
-                )
+              ? (provider.hasActiveFilters
+                    ? _filteredEmpty(context)
+                    : const EmptyState(
+                        icon: Icons.thumb_up_outlined,
+                        title: 'No NCs against you — great work!',
+                      ))
               : RefreshIndicator(
                   onRefresh: widget.onRefresh,
                   child: filtered.isEmpty
@@ -577,12 +572,15 @@ class _AgainstMeListState extends State<_AgainstMeList> {
                               height: MediaQuery.of(context).size.height * 0.5,
                               child: EmptyState(
                                 icon: Icons.filter_alt_off_outlined,
-                                title: 'No $_statusFilter NCs',
+                                title: query.isNotEmpty
+                                    ? 'No NCs match "${_query.trim()}"'
+                                    : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
                               ),
                             ),
                           ],
                         )
                       : ListView.separated(
+                          controller: _scroll,
                           padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                           itemCount: filtered.length,
                           separatorBuilder: (_, _) => const SizedBox(height: 10),

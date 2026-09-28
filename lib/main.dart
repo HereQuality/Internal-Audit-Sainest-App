@@ -15,6 +15,7 @@ import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/dashboard_provider.dart';
 import 'providers/filter_options_provider.dart';
+import 'providers/list_view_memory.dart';
 import 'providers/maintenance_provider.dart';
 import 'providers/nc_provider.dart';
 import 'providers/notifications_provider.dart';
@@ -101,6 +102,7 @@ class InternalAuditApp extends StatelessWidget {
         // Option lists for the Dashboard/Audits/Calendar filter sheet —
         // loaded lazily the first time a sheet opens, then cached.
         ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
+        ChangeNotifierProvider(create: (_) => ListViewMemory()),
       ],
       child: Consumer<ThemeProvider>(
         builder: (context, themeProvider, _) => MaterialApp(
@@ -231,6 +233,7 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
       // if there's no pushed route yet (e.g. still on the login screen),
       // but pops back to root if this fires while several screens deep.
       WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
         Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
       });
     }
@@ -253,6 +256,7 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
           // reads these providers until AppShell mounts again on the next
           // login, long after this frame finishes.
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
             // Screens pushed over the shell (an audit, an NC, the profile)
             // would otherwise stay on top of the login screen after a
             // session that ended on its own (expiry, blocked account) —
@@ -263,7 +267,11 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
             context.read<NcProvider>().resetForLogout();
             context.read<NotificationsProvider>().resetForLogout();
             context.read<FilterOptionsProvider>().resetForLogout();
+            context.read<ListViewMemory>().resetForLogout();
             context.read<TicketsProvider>().resetForLogout();
+            // The role picked (Auditor/Auditee) was that account's choice; the
+            // next sign-in is asked again, as after a relaunch.
+            context.read<AppModeProvider>().resetForLogout();
             // A tap still waiting for its turn was that account's.
             clearHeldNotificationTap();
           });
@@ -292,6 +300,7 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
           // NOT pop them away, so without this a blocked user could stay
           // fully interactive on whatever screen they already had open.
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
             Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
           });
         }
@@ -350,6 +359,7 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
         final heldTap = takeHeldNotificationTap();
         if (heldTap != null) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
             handleLocalNotificationTap(heldTap);
           });
         }

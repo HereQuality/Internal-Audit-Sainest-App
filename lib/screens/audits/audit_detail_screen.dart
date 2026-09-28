@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/theme/app_colors.dart';
@@ -13,7 +14,6 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import 'audit_header_card.dart';
 import 'checkpoint_card.dart';
-import 'raise_nc_sheet.dart';
 import 'select_representative_sheet.dart';
 
 /// The scoring workspace for one audit — "my portion", mirrors the web
@@ -49,59 +49,132 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // _buildTree) — lets Final Submit jump straight to whichever checkpoint
   // is still unscored (see _scrollToFirstIncomplete) instead of just
   // sitting disabled with no way to tell what's actually blocking it.
-  final Map<String, GlobalKey> _checkpointKeys = {};
-  GlobalKey _keyFor(String nodeId) =>
-      _checkpointKeys.putIfAbsent(nodeId, () => GlobalKey());
+  final Map<String, GlobalKey<CheckpointCardState>> _checkpointKeys = {};
+  GlobalKey<CheckpointCardState> _keyFor(String nodeId) =>
+      _checkpointKeys.putIfAbsent(nodeId, () => GlobalKey<CheckpointCardState>());
   // Per-group collapse flags, keyed by that group node's id — lifted up
   // from _GroupHeader (below) so _scrollToFirstIncomplete can force a
   // collapsed ancestor open before it scrolls: a collapsed group's child
   // subtree is fully unmounted, not just hidden, so the checkpoint inside
   // (and its GlobalKey above) wouldn't exist yet otherwise.
   final Map<String, bool> _groupCollapsed = {};
-  // How many CheckpointCards below currently have a save/upload in flight
-  // — each card reports its own _saving via onSavingChanged since they're
-  // otherwise fully isolated State objects with no shared knowledge of one
-  // another. Gates the PopScope guard in build() below: back out mid-save
-  // and you'd otherwise lose whatever that in-flight request was carrying
-  // (a photo, a finding pick) with no warning it never actually persisted.
-  int _activeSaveCount = 0;
+  // What each CheckpointCard below says about its own saved-ness, keyed by
+  // node id — the cards are otherwise fully isolated State objects with no
+  // shared knowledge of one another. Anything other than "clean" means the
+  // auditor has something the server hasn't confirmed yet, which is what
+  // gates the PopScope guard in build() below and drives the save
+  // indicator in the AppBar.
+  final Map<String, CheckpointSyncState> _syncStates = {};
+  // Set by "Exit" in the unsaved-changes dialog: cards being torn down by
+  // that pop must NOT flush what they were still holding (see
+  // CheckpointCard.shouldFlushOnDispose).
+  bool _discardOnExit = false;
+  // Flips on the first save activity so a screen nobody has edited yet
+  // doesn't open with an "All changes saved" chip.
+  bool _sawSaveActivity = false;
+
+  bool get _hasUnsaved => _syncStates.values.any((s) => s != CheckpointSyncState.clean);
+  bool get _anyFailed => _syncStates.values.any((s) => s == CheckpointSyncState.failed);
+  bool get _anySaving => _syncStates.values.any((s) => s == CheckpointSyncState.saving);
 
   // Instant Audit builder — see _buildInstantAuditBuilder below.
   final _newCheckpointController = TextEditingController();
   bool _addingCheckpoint = false;
   bool _updatingScope = false;
 
-  void _onCheckpointSavingChanged(bool saving) {
+  // Cards report from async callbacks — but also from dispose(), i.e. in the
+  // middle of this screen's own build/teardown, where setState would throw.
+  void _onCheckpointSyncChanged(String nodeId, CheckpointSyncState state) {
+    if (state == CheckpointSyncState.clean) {
+      _syncStates.remove(nodeId);
+    } else {
+      _syncStates[nodeId] = state;
+      _sawSaveActivity = true;
+    }
     if (!mounted) return;
-    setState(() => _activeSaveCount += saving ? 1 : -1);
+    if (SchedulerBinding.instance.schedulerPhase == SchedulerPhase.persistentCallbacks) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      setState(() {});
+    }
   }
 
-  Future<void> _confirmLeaveWhileSaving(BuildContext context) async {
-    final busyWithFinalSubmit = _isFinalSubmitting;
-    final leave = await showDialog<bool>(
+  // Pushes every mounted card's pending edits out now and waits for them.
+  // False if any of them still failed — the caller must not go on to Submit
+  // as if everything had been saved. (A card that's already gone flushed
+  // itself in dispose(); its state stays in _syncStates until that ends.)
+  Future<bool> _flushAll() async {
+    final states = _checkpointKeys.values.map((k) => k.currentState).whereType<CheckpointCardState>().toList();
+    final results = await Future.wait(states.map((c) => c.flush()));
+    // Give a detached (already unmounted) card's last save a moment to land.
+    for (var i = 0; i < 20 && _syncStates.values.any((s) => s == CheckpointSyncState.saving); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+    }
+    return results.every((ok) => ok) && !_anyFailed;
+  }
+
+  Future<bool> _ensureSavedBeforeSubmit() async {
+    final ok = await _flushAll();
+    if (!ok && mounted) {
+      final incomplete = _syncStates.values.any((s) => s == CheckpointSyncState.incomplete);
+      showErrorSnackBar(
+        context,
+        incomplete && !_anyFailed
+            ? 'Some checkpoints still need a score or NC details before they can be saved. Complete them, then submit again.'
+            : "Some changes couldn't be saved yet. Check your connection and use Retry on the checkpoint, then submit again.",
+      );
+    }
+    return ok;
+  }
+
+  Future<void> _onBlockedPop() async {
+    if (!_hasUnsaved) {
+      // Only a submit in flight is holding the screen.
+      final leave = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Still submitting'),
+          content: const Text('This audit is still being submitted. Leaving now may interrupt it.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Wait')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Leave anyway')),
+          ],
+        ),
+      );
+      if (leave == true && mounted) Navigator.of(context).pop();
+      return;
+    }
+    final exit = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Still saving'),
+        icon: const Icon(Icons.cloud_off_outlined),
+        title: const Text('Your changes are not saved yet'),
         content: Text(
-          busyWithFinalSubmit
-              ? 'This audit is still being submitted. Leaving now may interrupt it.'
-              : _activeSaveCount > 1
-              ? '$_activeSaveCount checkpoints are still saving. Leaving now may lose those updates.'
-              : 'A checkpoint is still saving. Leaving now may lose that update.',
+          _anyFailed
+              ? "Some changes couldn't be saved. If you exit now they will be lost."
+              : 'If you exit now, anything still waiting to be saved will be lost.',
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Wait'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: AppColors.red),
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Leave anyway'),
+            child: const Text('Exit'),
           ),
         ],
       ),
     );
-    if (leave == true && context.mounted) Navigator.of(context).pop();
+    if (!mounted) return;
+    if (exit == true) {
+      _discardOnExit = true;
+      Navigator.of(context).pop();
+    } else {
+      // Cancel: stay, and make sure saving carries on right now rather than
+      // waiting out a debounce or a retry timer.
+      _flushAll();
+    }
   }
 
   // Kept from initState so dispose() below can reach the provider without a
@@ -130,7 +203,9 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     super.dispose();
   }
 
-  Future<void> _load() async {
+  // [promptRepresentative] is false for a pull-to-refresh: the sheet opens
+  // when the screen does (a banner button brings it back), not on every pull.
+  Future<void> _load({bool promptRepresentative = true}) async {
     final provider = context.read<AuditsProvider>();
     final myId = context.read<AuthProvider>().user?.id;
     await provider.fetchAuditDetail(widget.auditId);
@@ -155,6 +230,9 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     if (audit != null) {
       await provider.fetchLocationEmployees(
         audit.locationLabels.map((l) => l.id).toList(),
+        // A department-scoped (CFT) audit has NO locations — without its
+        // departments the picker's pool was empty and the step vanished.
+        departmentIds: audit.departmentLabels.map((d) => d.id).toList(),
       );
     }
     // Only the Instant Audit builder needs the full location list — no
@@ -170,7 +248,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     // _needsRepresentative, which keeps the checklist read-only and
     // Submit/Final Submit hidden until a representative is actually set,
     // and _buildBody's banner offers a way back into this same prompt.
-    if (audit != null && _needsRepresentative(audit, myId)) {
+    if (promptRepresentative && audit != null && _needsRepresentative(audit, myId)) {
       await _promptForRepresentative(audit);
     }
   }
@@ -181,9 +259,23 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   }) async {
     if (!mounted) return;
     final provider = context.read<AuditsProvider>();
-    // Nobody to pick from (e.g. a location with no active staff yet) —
-    // skip rather than block the auditor with an unpickable dropdown.
-    if (provider.auditeeCandidates.isEmpty) return;
+    // The pool is empty when the lookup failed (or never ran): try once more
+    // rather than silently doing nothing, and if there really is nobody, say
+    // so — the banner button used to just not respond.
+    if (provider.auditeeCandidates.isEmpty) {
+      await provider.fetchLocationEmployees(
+        audit.locationLabels.map((l) => l.id).toList(),
+        departmentIds: audit.departmentLabels.map((d) => d.id).toList(),
+      );
+      if (!mounted) return;
+      if (provider.auditeeCandidates.isEmpty) {
+        showErrorSnackBar(
+          context,
+          'No members found for this audit\'s location. Pull to refresh and try again.',
+        );
+        return;
+      }
+    }
     final picked = await showSelectRepresentativeSheet(
       context,
       employees: provider.auditeeCandidates,
@@ -204,10 +296,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
       // picker rather than silently dropping the selection. Backing out
       // of the sheet itself (picked == null, above) is a deliberate skip,
       // not an error, so that path does NOT re-prompt.
-      await _promptForRepresentative(
-        audit,
-        initiallySelected: initiallySelected,
-      );
+      await _promptForRepresentative(audit, initiallySelected: picked);
     }
   }
 
@@ -528,6 +617,9 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     final dashboardProvider = context.read<DashboardProvider>();
     setState(() => _isSubmitting = true);
     try {
+      // Whatever is still typing/uploading must land before the server
+      // judges the audit.
+      if (!await _ensureSavedBeforeSubmit() || !mounted) return;
       final error = await auditsProvider.mobileSubmitAudit(widget.auditId);
       if (!mounted) return;
       if (error != null) {
@@ -603,6 +695,13 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
         ],
       ),
     );
+    final finalRemark = remarkController.text.trim();
+    // Not straight away: the dialog's exit animation is still drawing the
+    // TextField that owns this controller once showDialog has returned.
+    Future<void>.delayed(
+      const Duration(milliseconds: 500),
+      remarkController.dispose,
+    );
     if (proceeded != true) return;
     if (!mounted) return;
 
@@ -634,9 +733,14 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     setState(() => _isFinalSubmitting = true);
     final auditsProvider = context.read<AuditsProvider>();
     final dashboardProvider = context.read<DashboardProvider>();
+    if (!await _ensureSavedBeforeSubmit()) {
+      if (mounted) setState(() => _isFinalSubmitting = false);
+      return;
+    }
+    if (!mounted) return;
     final error = await auditsProvider.completeAudit(
       widget.auditId,
-      finalAuditorRemark: remarkController.text.trim(),
+      finalAuditorRemark: finalRemark,
     );
     if (!mounted) return;
     setState(() => _isFinalSubmitting = false);
@@ -663,26 +767,16 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     final myId = context.watch<AuthProvider>().user?.id;
 
     return PopScope(
-      canPop: _activeSaveCount == 0 && !_isFinalSubmitting,
+      canPop: !_hasUnsaved && !_isFinalSubmitting && !_isSubmitting,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) return;
-        _confirmLeaveWhileSaving(context);
+        _onBlockedPop();
       },
       child: Scaffold(
         appBar: AppBar(
           title: Text(audit?.title ?? 'Audit'),
           actions: [
-            if (audit != null)
-              IconButton(
-                tooltip: 'Raise NC',
-                icon: const Icon(Icons.report_gmailerrorred_outlined),
-                onPressed: () => showRaiseNcSheet(
-                  context,
-                  auditId: audit.id,
-                  auditTitle: audit.title,
-                  employees: _ncAuditeeOptions(provider.auditeeCandidates, myId),
-                ),
-              ),
+            if (audit != null) _buildSaveIndicator(context),
           ],
         ),
         body: provider.isLoadingDetail && audit == null
@@ -704,6 +798,59 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     );
   }
 
+  // One small, unobtrusive chip in the AppBar: Saving… / Saved / Failed –
+  // retrying. Hidden until something has actually been edited.
+  Widget _buildSaveIndicator(BuildContext context) {
+    if (!_sawSaveActivity) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    final IconData? icon;
+    final String label;
+    final Color color;
+    if (_anyFailed) {
+      icon = Icons.sync_problem_outlined;
+      label = 'Failed – retrying';
+      color = scheme.error;
+    } else if (_anySaving) {
+      icon = null;
+      label = 'Saving…';
+      color = scheme.outline;
+    } else if (_hasUnsaved) {
+      icon = Icons.edit_note_outlined;
+      label = 'Not saved yet';
+      color = AppColors.readable(context, AppColors.amber);
+    } else {
+      icon = Icons.check_circle_outline;
+      label = 'Saved';
+      color = AppColors.readable(context, AppColors.green);
+    }
+    return Padding(
+      padding: const EdgeInsets.only(right: 16),
+      child: Center(
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 200),
+          child: Container(
+            key: ValueKey(label),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                icon != null
+                    ? Icon(icon, size: 14, color: color)
+                    : SizedBox(height: 12, width: 12, child: CircularProgressIndicator(strokeWidth: 2, color: color)),
+                const SizedBox(width: 6),
+                Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w600)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildBody(
     BuildContext context,
     AuditDetailModel audit,
@@ -719,7 +866,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     final tree = _activeTree(audit);
 
     return RefreshIndicator(
-      onRefresh: _load,
+      onRefresh: () => _load(promptRepresentative: false),
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
         children: [
@@ -1145,6 +1292,13 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                 // an ancestor animation, e.g. the swipe-back transition
                 // compositing this screen over the previous route) triggers
                 // a frame, which is what made long checklists feel laggy.
+                // Fixed when this card is built: its saves (including the one
+                // its dispose() sends after a location-tab switch) must go to
+                // the location it was typed in, not whichever is active by the
+                // time they run.
+                final cardLocationId = audit.structureMode == 'per-location'
+                    ? _activeLocationId
+                    : null;
                 final checkpointCard = RepaintBoundary(
                   child: Padding(
                     padding: EdgeInsets.only(left: depth * 12, bottom: 10),
@@ -1153,7 +1307,11 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                       node: node,
                       serial: serial,
                       readOnly: readOnly,
-                      onSavingChanged: _onCheckpointSavingChanged,
+                      onSyncStateChanged: (state) =>
+                          _onCheckpointSyncChanged(node.id, state),
+                      shouldFlushOnDispose: () => !_discardOnExit,
+                      draftKey:
+                          'checkpoint_draft:${audit.id}:${audit.structureMode == 'per-location' ? _activeLocationId : ''}:${node.id}',
                       // Mirrors server/utils/scoring.js#leafMax — every leaf
                       // shares the audit's own single maxScore, falling back to
                       // a legacy per-leaf weight (then 1) only for an audit
@@ -1182,8 +1340,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                             targetDate,
                             severity,
                           }) {
-                            return context
-                                .read<AuditsProvider>()
+                            return _auditsProvider
                                 .scoreCheckpoint(
                                   auditId: widget.auditId,
                                   nodeId: node.id,
@@ -1191,42 +1348,35 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                                   score: score,
                                   remark: remark,
                                   locationId:
-                                      audit.structureMode == 'per-location'
-                                      ? _activeLocationId
-                                      : null,
+                                      cardLocationId,
                                   auditeeEmployeeId: auditeeEmployeeId,
                                   targetDate: targetDate,
                                   severity: severity,
                                 );
                           },
                       onUploadPhotos: ({required photos, onProgress}) {
-                        return context
-                            .read<AuditsProvider>()
+                        return _auditsProvider
                             .uploadCheckpointEvidence(
                               auditId: widget.auditId,
                               nodeId: node.id,
                               photos: photos,
-                              locationId: audit.structureMode == 'per-location'
-                                  ? _activeLocationId
-                                  : null,
+                              locationId: cardLocationId,
                               onProgress: onProgress,
                             );
                       },
                       onDeletePhoto: (url) =>
-                          context.read<AuditsProvider>().deleteEvidencePhoto(
+                          _auditsProvider.deleteEvidencePhoto(
                             auditId: widget.auditId,
                             nodeId: node.id,
                             url: url,
-                            locationId: audit.structureMode == 'per-location'
-                                ? _activeLocationId
-                                : null,
+                            locationId: cardLocationId,
                           ),
                       currentEmployeeId: myId,
                       onUpdateNc:
                           node.ncId == null
                           ? null
                           : ({auditeeEmployeeId, severity, targetDate}) {
-                              return context.read<AuditsProvider>().updateNc(
+                              return _auditsProvider.updateNc(
                                 auditId: widget.auditId,
                                 ncId: node.ncId!,
                                 auditeeEmployeeId: auditeeEmployeeId,

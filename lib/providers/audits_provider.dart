@@ -12,6 +12,7 @@ import '../models/audit_model.dart';
 import '../models/employee_option.dart';
 import '../models/location_option.dart';
 import '../models/upload_phase.dart';
+import '../core/utils/report_stats.dart';
 import 'audit_filter_scope.dart';
 
 class AuditsProvider extends ChangeNotifier with AuditFilterScope {
@@ -56,12 +57,23 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// location/audit-type filter that skipped the second one would visibly
   /// only half-apply on the calendar.
   @override
-  Future<void> refetchForFilters() =>
-      Future.wait([fetchMyAudits(), fetchAuditsAtMyLocation()]);
+  Future<void> refetchForFilters() => Future.wait([
+    fetchMyAudits(),
+    fetchAuditsAtMyLocation(),
+    // The Final Report is open: its list and tiles follow the filters too.
+    if (reportsInUse) fetchReportAudits(),
+    if (reportsInUse) fetchReportStats(),
+  ]);
 
   bool isLoading = false;
   String? errorMessage;
   List<AuditModel> audits = [];
+
+  /// [audits] under the Status multi-select (the other filters are applied
+  /// server-side; Status is matched here over the loaded list, like the
+  /// existing chips always were — see AuditFilterScope.matchesStatusFilter).
+  List<AuditModel> get visibleAudits =>
+      statusFilter.isEmpty ? audits : audits.where(matchesStatusFilter).toList();
 
   bool isLoadingDetail = false;
   String? detailError;
@@ -77,6 +89,16 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // own on the wire.
   int _epoch = 0;
 
+  // Per-call sequence numbers, one per fetch: two quick filter changes (or a
+  // save's refetch racing a socket refetch) put two requests on the wire and
+  // the older answer may land last — only the newest call of each fetch may
+  // write its result, its error or its loading flag.
+  int _myAuditsSeq = 0;
+  int _detailSeq = 0;
+  int _reportAuditsSeq = 0;
+  int _reportStatsSeq = 0;
+  int _atMyLocationSeq = 0;
+
   /// Empties every list and the open audit, and puts the filters back to
   /// their defaults — call on logout, without refetching. Every list here is
   /// the previous account's audits (titles, locations, people); a shared
@@ -87,11 +109,22 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// previous employee.
   @override
   void resetForLogout() {
+    stopListening();
     _epoch++;
     _selfEmployeeId = null;
     audits = [];
     auditsAtMyLocation = [];
     reportAudits = [];
+    ledReportAudits = [];
+    ledLocationIds = const [];
+    ledDepartmentIds = const [];
+    ledPlaceNames = const [];
+    reportsInUse = false;
+    reportsLed = false;
+    reportsStatus = null;
+    reportsSearch = '';
+    reportStats = null;
+    isLoadingReportStats = false;
     activeAudit = null;
     auditeeCandidates = [];
     allLocations = [];
@@ -123,14 +156,23 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     _onNewNotification = (data) {
       if (data is Map &&
           (data['type']?.toString() ?? '').startsWith('audit_')) {
-        fetchMyAudits();
-        if (activeAudit != null) fetchAuditDetail(activeAudit!.id);
+        // A burst of notifications refetches once, not once each.
+        _refreshTimer?.cancel();
+        _refreshTimer = Timer(const Duration(milliseconds: 500), () {
+          fetchMyAudits();
+          if (activeAudit != null) {
+            fetchAuditDetail(activeAudit!.id, quiet: true);
+          }
+        });
       }
     };
     SocketService.instance.on('new_notification', _onNewNotification!);
   }
 
+  Timer? _refreshTimer;
+
   void stopListening() {
+    _refreshTimer?.cancel();
     _listening = false;
     if (_onNewNotification != null) {
       SocketService.instance.off('new_notification', _onNewNotification);
@@ -140,7 +182,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
 
   /// Who's actually assigned to the given Locations — powers both the
   /// "select representative auditee" picker and the "raise NC against"
-  /// picker (checkpoint_card.dart, raise_nc_sheet.dart, select_representative
+  /// picker (checkpoint_card.dart, nc_details_sheet.dart, select_representative
   /// _sheet.dart), same pool the web app's equivalent picker offers.
   /// Deliberately NOT scoped by the logged-in auditor's own manager-
   /// hierarchy (who reports to whom) or by audit type — an auditee is
@@ -151,26 +193,50 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// rather than merging into it, so a location dropped from scope also
   /// drops its members here, not just adds new ones as locations are
   /// tagged.
-  Future<void> fetchLocationEmployees(List<String> locationIds) async {
-    if (locationIds.isEmpty) {
+  ///
+  /// [departmentIds] is the same lookup for a department-scoped (Cross
+  /// Functional Team) audit, which is saved with an EMPTY locationIds — with
+  /// only locations passed such an audit had nobody to pick from and the
+  /// representative step silently never appeared. Returns false when the
+  /// request failed (the list is then cleared, never left showing the
+  /// previous audit's people), so a caller can say so instead of showing an
+  /// empty picker.
+  Future<bool> fetchLocationEmployees(
+    List<String> locationIds, {
+    List<String> departmentIds = const [],
+  }) async {
+    if (locationIds.isEmpty && departmentIds.isEmpty) {
       auditeeCandidates = [];
       notifyListeners();
-      return;
+      return true;
     }
     final epoch = _epoch;
+    final request = ++_candidatesRequest;
     try {
-      final res = await _dio.get(ApiConstants.employeesByLocation(locationIds));
-      if (epoch != _epoch) return;
+      final res = await _dio.get(
+        ApiConstants.employeesByLocation(
+          locationIds,
+          departmentIds: departmentIds,
+        ),
+      );
+      // Logged out, or a newer lookup (another audit / a re-tag) started
+      // meanwhile — its answer is the one that counts.
+      if (epoch != _epoch || request != _candidatesRequest) return true;
       auditeeCandidates = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => EmployeeOption.fromJson(Map<String, dynamic>.from(e)))
           .toList();
       notifyListeners();
+      return true;
     } on DioException {
-      // Picker just renders empty on failure — same "fail quiet"
-      // convention used elsewhere in this app for supporting-list fetches.
+      if (epoch != _epoch || request != _candidatesRequest) return true;
+      auditeeCandidates = [];
+      notifyListeners();
+      return false;
     }
   }
+
+  int _candidatesRequest = 0;
 
   // ── Instant Audit builder (screens/audits/audit_detail_screen.dart's
   // "set up" section) — mirrors the web app's InstantAudit.jsx for the
@@ -364,63 +430,35 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
 
   Future<void> fetchMyAudits() async {
     final epoch = _epoch;
+    final seq = ++_myAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _myAuditsSeq;
     isLoading = true;
     errorMessage = null;
     notifyListeners();
     try {
       final res = await _dio.get(
         ApiConstants.myAudits,
-        queryParameters: filterParams,
+        // + Include skipped (list-only) — see AuditFilterScope.listFilterParams.
+        queryParameters: listFilterParams,
       );
-      if (epoch != _epoch) return;
+      if (stale()) return;
       final list = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
       audits = list;
     } on DioException catch (e) {
-      if (epoch == _epoch) {
+      if (!stale()) {
         errorMessage = extractErrorMessage(
           e,
           fallback: 'Could not load your audits.',
         );
       }
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoading = false;
         notifyListeners();
       }
-    }
-  }
-
-  Future<String?> raiseNc({
-    required String auditId,
-    required String title,
-    required String description,
-    required DateTime targetDate,
-    // Always the auditor's explicit pick from the audited location's people
-    // — an NC is never raised against the raiser by default.
-    required String auditeeEmployeeId,
-    String? severity,
-  }) async {
-    try {
-      await _dio.post(
-        ApiConstants.ncs,
-        data: {
-          'auditId': auditId,
-          'title': title,
-          'description': description,
-          'targetDate': targetDate.toIso8601String(),
-          'auditeeEmployeeId': auditeeEmployeeId,
-          'severity': ?severity,
-        },
-      );
-      return null;
-    } on DioException catch (e) {
-      return extractErrorMessage(
-        e,
-        fallback: 'Could not raise the NC. Please try again.',
-      );
     }
   }
 
@@ -429,26 +467,33 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // full parameter tree, assignments, ncs. Access is enforced server-side
   // (SuperAdmin, this audit's own auditors/auditee/planner, or their
   // hierarchy scope), not by anything client-side.
-  Future<void> fetchAuditDetail(String auditId) async {
+  // [quiet] is for refreshing the audit that is already open (after a save,
+  // on a socket event): no loading flag, and one notify when the answer
+  // lands instead of two.
+  Future<void> fetchAuditDetail(String auditId, {bool quiet = false}) async {
     final epoch = _epoch;
-    isLoadingDetail = true;
-    detailError = null;
-    notifyListeners();
+    final seq = ++_detailSeq;
+    bool stale() => epoch != _epoch || seq != _detailSeq;
+    if (!quiet) {
+      isLoadingDetail = true;
+      detailError = null;
+      notifyListeners();
+    }
     try {
       final res = await _dio.get(ApiConstants.auditById(auditId));
-      if (epoch != _epoch) return;
+      if (stale()) return;
       activeAudit = AuditDetailModel.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
     } on DioException catch (e) {
-      if (epoch == _epoch) {
+      if (!stale()) {
         detailError = extractErrorMessage(
           e,
           fallback: 'Could not load this audit.',
         );
       }
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoadingDetail = false;
         notifyListeners();
       }
@@ -479,67 +524,220 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     isLoadingDetail = true;
   }
 
-  // ── Reports (Profile → Reports) ───────────────────────────────────────
-  // Same GET /audits/mine list fetchMyAudits already uses — always this
-  // employee's own audits regardless of the My Audits team-scope toggle,
-  // since Reports is a personal record, not a team view — but unfiltered
-  // by status (mirrors the web app's CompletedAudits.jsx, which lists
-  // every stage behind its own status dropdown, not Completed-only).
-  // ReportsScreen narrows this down client-side via status chips, same
-  // "fetch once, filter locally" pattern MyAuditsScreen's chips already
-  // use over `audits` below.
+  // ── Reports (Profile → Reports, titled "Final Report") ────────────────
+  // Two views, like the web's My audits / Audits at places I lead switch:
+  //  * "My audits" — GET /audits/mine under the SHARED filters (Team,
+  //    Members, Location + Department, Audit Type, Date range). The default
+  //    scope is Me, so a plain visit lists only this auditor's own audits;
+  //    All Members widens it, and Me + a Location is only my audits there
+  //    while All Members + a Location is every audit at that location (for
+  //    places I belong to or lead) — all decided server-side
+  //    (audit.controller.js#whereWithScope), so this just sends the params.
+  //  * "My locations" (only for a leader — [ledPlaceIds] non-empty) — GET
+  //    /audits/at-places-i-lead: every audit at a place I lead, whoever the
+  //    auditor is. That endpoint deliberately ignores employeeIds.
+  // ReportsScreen narrows either list client-side via status chips + search,
+  // the same "fetch once, filter locally" pattern MyAuditsScreen uses.
   bool isLoadingReports = false;
   String? reportsError;
   List<AuditModel> reportAudits = [];
 
-  Future<void> fetchReportAudits() async {
+  /// Audits at the places this employee leads (empty for a non-leader).
+  List<AuditModel> ledReportAudits = [];
+
+  /// What this employee leads, from GET /audits/led-places: location ids,
+  /// department ids and display names. Empty = not a leader, which is how the
+  /// Final Report decides whether to offer its "My locations" view at all.
+  List<String> ledLocationIds = const [];
+  List<String> ledDepartmentIds = const [];
+  List<String> ledPlaceNames = const [];
+  bool get isPlaceLeader =>
+      ledLocationIds.isNotEmpty || ledDepartmentIds.isNotEmpty;
+
+  /// The four Final Report tiles for what is in view — the server's, or null
+  /// until loaded / when the endpoint isn't open to this role (the screen then
+  /// works them out from the rows on screen, see ReportStats.fromAudits).
+  ReportStats? reportStats;
+  bool isLoadingReportStats = false;
+
+  /// What the Final Report screen currently asks for, kept here so a FILTER
+  /// change (which reaches this provider through refetchForFilters) reloads
+  /// the report lists and tiles too: the screen registers itself while it is
+  /// open ([reportsInUse]), and says which view / status chip / search text
+  /// the rows and the tiles are for.
+  bool reportsInUse = false;
+  bool reportsLed = false;
+  String? reportsStatus;
+  String reportsSearch = '';
+
+  Future<void> fetchLedPlaces() async {
     final epoch = _epoch;
+    try {
+      final res = await _dio.get(ApiConstants.ledPlaces);
+      if (epoch != _epoch) return;
+      final data = res.data['data'];
+      final locations = data is Map ? (data['locations'] as List? ?? []) : [];
+      final departments = data is Map ? (data['departments'] as List? ?? []) : [];
+      ledLocationIds = [
+        for (final l in locations.whereType<Map>()) l['_id'].toString(),
+      ];
+      ledDepartmentIds = [
+        for (final d in departments.whereType<Map>()) d['_id'].toString(),
+      ];
+      ledPlaceNames = [
+        for (final l in locations.whereType<Map>()) (l['name'] ?? '').toString(),
+        for (final d in departments.whereType<Map>())
+          (d['departmentName'] ?? '').toString(),
+      ].where((n) => n.isNotEmpty).toList();
+      notifyListeners();
+    } on DioException {
+      // Fail quiet: without it the Final Report simply has no second view.
+    }
+  }
+
+  static int _byRecency(AuditModel a, AuditModel b) {
+    final ad = a.completedDate ?? a.scheduledDate;
+    final bd = b.completedDate ?? b.scheduledDate;
+    if (ad == null && bd == null) return 0;
+    if (ad == null) return 1;
+    if (bd == null) return -1;
+    return bd.compareTo(ad);
+  }
+
+  /// Loads the list for the Final Report view chosen in [reportsLed] ("My
+  /// locations" or "My audits") under the current shared filters. The stat
+  /// tiles are a separate request, [fetchReportStats].
+  Future<void> fetchReportAudits() async {
+    final led = reportsLed;
+    final epoch = _epoch;
+    final seq = ++_reportAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _reportAuditsSeq;
     isLoadingReports = true;
     reportsError = null;
     notifyListeners();
     try {
-      final res = await _dio.get(
-        ApiConstants.myAudits,
-        // Always self only — per this section's own doc comment above.
-        // Can't reuse `filterParams`: it deliberately sends NO employeeIds
-        // for Team scope, which resolveScopedEmployeeIds (server) reads as
-        // "self + whole downstream hierarchy" — for a SuperAdmin/
-        // full-access role, no scope at ALL — the exact opposite of what a
-        // personal Reports list is for. Omitting this was a real bug: a
-        // manager's Reports screen was silently pooling in every
-        // subordinate's audits too, and a SuperAdmin's showed the entire
-        // org's.
-        queryParameters: selfEmployeeId != null
-            ? {'employeeIds': selfEmployeeId}
-            : null,
-      );
-      if (epoch != _epoch) return;
-      final list = (res.data['data'] as List? ?? [])
-          .whereType<Map>()
-          .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
-          .toList();
-      list.sort((a, b) {
-        final ad = a.completedDate ?? a.scheduledDate;
-        final bd = b.completedDate ?? b.scheduledDate;
-        if (ad == null && bd == null) return 0;
-        if (ad == null) return 1;
-        if (bd == null) return -1;
-        return bd.compareTo(ad);
-      });
-      reportAudits = list;
+      final List<AuditModel> list;
+      if (led) {
+        list = await _fetchLedAudits();
+      } else {
+        final res = await _dio.get(
+          ApiConstants.myAudits,
+          // The SHARED filters, Me by default (employeeIds = self). NOT
+          // listFilterParams: Include skipped is an Audits-tab switch.
+          queryParameters: {
+            ...?filterParams,
+            // Same population rule as the tiles (fetchReportStats). The search
+            // box narrows these rows on the device (the screen filters the
+            // loaded list), so it is not sent.
+            'hideUnstarted': 'true',
+          },
+        );
+        list = (res.data['data'] as List? ?? [])
+            .whereType<Map>()
+            .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (stale()) return;
+      list.sort(_byRecency);
+      if (led) {
+        ledReportAudits = list;
+      } else {
+        reportAudits = list;
+      }
     } on DioException catch (e) {
-      if (epoch == _epoch) {
+      if (!stale()) {
         reportsError = extractErrorMessage(
           e,
-          fallback: 'Could not load your audits.',
+          fallback: led
+              ? 'Could not load the audits at your locations.'
+              : 'Could not load your audits.',
         );
       }
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoadingReports = false;
         notifyListeners();
       }
     }
+  }
+
+  // Every audit at a place I lead, paged 100 at a time (the endpoint's
+  // maximum) — the Final Report list is one scroll, not a paginated table.
+  Future<List<AuditModel>> _fetchLedAudits() async {
+    final params = Map<String, dynamic>.from(filterParams ?? const {})
+      // The led list ignores employeeIds by design (a "just me" default would
+      // empty a list whose point is other people's audits).
+      ..remove('employeeIds')
+      // Without a status the server defaults to the still-open ones; a Final
+      // Report wants every started audit, so name them.
+      ..['status'] = 'Not Started,In Progress,Overdue,Completed'
+      ..['limit'] = 100;
+    final all = <AuditModel>[];
+    var page = 1;
+    while (page <= 20) {
+      final res = await _dio.get(
+        ApiConstants.auditsAtPlacesILead,
+        queryParameters: {...params, 'page': page},
+      );
+      final data = res.data['data'];
+      final rows = data is Map ? (data['audits'] as List? ?? []) : const [];
+      all.addAll(
+        rows.whereType<Map>().map(
+          (e) => AuditModel.fromJson(Map<String, dynamic>.from(e)),
+        ),
+      );
+      final total = data is Map ? (data['total'] as num?)?.toInt() ?? 0 : 0;
+      if (rows.isEmpty || all.length >= total) break;
+      page++;
+    }
+    return all;
+  }
+
+  /// The Final Report tiles from GET /audits/stats/completed under the same
+  /// filters as the list, so the numbers equal the web's. "My locations" asks
+  /// as All Members over the places I lead (or the picked ones among them),
+  /// which the server reads as every audit there. If the endpoint isn't open
+  /// to this role (it needs Final Report read access) [reportStats] stays null
+  /// and the screen works the same four numbers out from the loaded list.
+  Future<void> fetchReportStats() async {
+    final led = reportsLed;
+    final epoch = _epoch;
+    final seq = ++_reportStatsSeq;
+    isLoadingReportStats = true;
+    notifyListeners();
+    ReportStats? stats;
+    try {
+      final params = Map<String, dynamic>.from(filterParams ?? const {});
+      if (led) {
+        params.remove('employeeIds');
+        if (!params.containsKey('locationIds') &&
+            !params.containsKey('departmentIds')) {
+          if (ledLocationIds.isNotEmpty) {
+            params['locationIds'] = ledLocationIds.join(',');
+          }
+          if (ledDepartmentIds.isNotEmpty) {
+            params['departmentIds'] = ledDepartmentIds.join(',');
+          }
+        }
+      }
+      // The Final Report's own rule: only started audits (server:
+      // hideUnstarted) — the same rows its table lists.
+      params['hideUnstarted'] = 'true';
+      // The tiles describe what the list shows: its status chip and search.
+      if (reportsStatus != null) params['status'] = reportsStatus;
+      if (reportsSearch.trim().isNotEmpty) params['search'] = reportsSearch.trim();
+      final res = await _dio.get(
+        ApiConstants.completedStats,
+        queryParameters: params,
+      );
+      stats = ReportStats.tryParse(res.data['data']);
+    } on DioException {
+      stats = null;
+    }
+    if (epoch != _epoch || seq != _reportStatsSeq) return;
+    reportStats = stats;
+    isLoadingReportStats = false;
+    notifyListeners();
   }
 
   // ── "Audits at my location" (Calendar) ──────────────────────────────────
@@ -557,6 +755,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     if (locationFilter.isNotEmpty) {
       params['locationIds'] = locationFilter.join(',');
     }
+    if (departmentFilter.isNotEmpty) {
+      params['departmentIds'] = departmentFilter.join(',');
+    }
     if (auditTypeFilter.isNotEmpty) {
       params['auditType'] = auditTypeFilter.join(',');
     }
@@ -565,6 +766,8 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
 
   Future<void> fetchAuditsAtMyLocation() async {
     final epoch = _epoch;
+    final seq = ++_atMyLocationSeq;
+    bool stale() => epoch != _epoch || seq != _atMyLocationSeq;
     isLoadingAtMyLocation = true;
     notifyListeners();
     try {
@@ -577,7 +780,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.auditsAtMyLocation,
         queryParameters: _placeAndTypeParams,
       );
-      if (epoch != _epoch) return;
+      if (stale()) return;
       auditsAtMyLocation = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
@@ -587,7 +790,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       // above — worst case the calendar just shows NC dots with no blue
       // "audit visit" markers layered on top.
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoadingAtMyLocation = false;
         notifyListeners();
       }
@@ -689,18 +892,52 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       await Future.wait(
         jobs.map((j) => _waitForEvidenceJob(j['jobId'] as String)),
       );
-      await fetchAuditDetail(auditId);
+      try {
+        await fetchAuditDetail(auditId, quiet: true);
+      } catch (_) {}
       return null;
-    } on DioException catch (e) {
-      return extractErrorMessage(e, fallback: 'Could not upload this photo.');
+    } catch (e) {
+      // Not just DioException: _waitForEvidenceJob rejects with a plain
+      // Exception ("Upload failed" / "taking longer than expected") that
+      // used to escape uncaught and leave the card stuck on "Uploading…".
+      if (e is Exception && e is! DioException) {
+        final text = e.toString().replaceFirst('Exception: ', '');
+        return text.isEmpty ? 'Could not upload this photo.' : text;
+      }
+      return _saveErrorMessage(e, 'Could not upload this photo.');
     }
   }
 
-  /// Saves this checkpoint's finding — remark, and (for OFI) score, NC
-  /// details for a fresh NC. Evidence photos are handled separately (see
+  /// Turns whatever a checkpoint save/upload threw into a message an auditor
+  /// can act on. The server's own text is kept for 4xx (those are written
+  /// for people: "Remark is mandatory…", "not an assigned auditor…") but a
+  /// 5xx carries a raw exception string (Mongoose/Node) that means nothing
+  /// on a phone, so it is replaced. Also catches non-Dio failures (a bad
+  /// response shape, say) so a save can never end in an uncaught error that
+  /// leaves the checkpoint card stuck on "Saving…".
+  String _saveErrorMessage(Object e, String fallback) {
+    if (e is DioException) {
+      final status = e.response?.statusCode ?? 0;
+      if (status >= 500) {
+        return 'The server had a problem saving this. We\'ll keep trying.';
+      }
+      if (status == 401) return 'Your session expired. Please sign in again.';
+      return extractErrorMessage(e, fallback: fallback);
+    }
+    return fallback;
+  }
+
+  /// Saves this checkpoint's finding — remark, score, and NC details for a
+  /// fresh NC. Evidence photos are handled separately (see
   /// uploadCheckpointEvidence above), so this never touches photoUrls.
-  /// Returns the error message on failure, null on success, then
-  /// refreshes activeAudit so the tree reflects the save immediately.
+  ///
+  /// `score` must always be sent: the server (audit.controller.js#
+  /// scoreParameter) derives Strong Compliance/Compliance itself (full
+  /// marks, ignoring what's sent) but REQUIRES a numeric score for OFI and
+  /// for NC — an NC save with no score is rejected with "A numeric score is
+  /// required for an NC finding.", which is what made raising an NC from a
+  /// checkpoint fail. Returns the error message on failure, null on
+  /// success, then refreshes activeAudit so the tree reflects the save.
   Future<String?> scoreCheckpoint({
     required String auditId,
     required String nodeId,
@@ -725,14 +962,15 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           'severity': ?severity,
         },
       );
-      await fetchAuditDetail(auditId);
-      return null;
-    } on DioException catch (e) {
-      return extractErrorMessage(
-        e,
-        fallback: 'Could not save this checkpoint.',
-      );
+    } catch (e) {
+      return _saveErrorMessage(e, 'Could not save this checkpoint.');
     }
+    // The PATCH already succeeded — a failed refresh must not read as a
+    // failed save (the card would retry and resend a save that landed).
+    try {
+      await fetchAuditDetail(auditId, quiet: true);
+    } catch (_) {}
+    return null;
   }
 
   /// Auditor: fix a mistake on an already-raised NC — reassign who it's
@@ -758,7 +996,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           'targetDate': ?targetDate?.toIso8601String(),
         },
       );
-      await fetchAuditDetail(auditId);
+      await fetchAuditDetail(auditId, quiet: true);
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(

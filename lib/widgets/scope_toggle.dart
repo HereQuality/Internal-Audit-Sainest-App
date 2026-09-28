@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 
-/// "Me" (just the logged-in user's own audits/NCs) vs "Team" (self +
+/// "Me" (just the logged-in user's own audits/NCs) vs "All Members" (self +
 /// everyone in their downstream hierarchy — the "all" scope
 /// server/utils/scopeEmployeeIds.js#resolveScopedEmployeeIds falls back to
-/// when no employeeIds param is sent at all).
+/// when no employeeIds param is sent at all; the web's "All Members"). With a
+/// Location picked, All Members shows every audit at that location whoever the
+/// auditor is, while Me shows only my own there.
 ///
 /// "ME" IS THE DEFAULT everywhere this is used — every provider's own
 /// isTeamScope starts false. Someone opening this app on a phone, usually
@@ -26,7 +28,16 @@ class ScopeToggle extends StatelessWidget {
   final bool isTeam;
   final ValueChanged<bool> onChanged;
 
-  const ScopeToggle({super.key, required this.isTeam, required this.onChanged});
+  /// True while a specific Team/Members pick is in force — it outranks both
+  /// segments, so neither is drawn as selected; tapping one goes back to it.
+  final bool specific;
+
+  const ScopeToggle({
+    super.key,
+    required this.isTeam,
+    required this.onChanged,
+    this.specific = false,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -39,12 +50,16 @@ class ScopeToggle extends StatelessWidget {
         ),
         ButtonSegment(
           value: true,
-          label: Text('Team'),
+          label: Text('All Members'),
           icon: Icon(Icons.groups_outlined, size: 16),
         ),
       ],
-      selected: {isTeam},
-      onSelectionChanged: (s) => onChanged(s.first),
+      emptySelectionAllowed: true,
+      selected: specific ? const <bool>{} : {isTeam},
+      onSelectionChanged: (s) {
+        // Tapping the already-selected segment yields an empty set — a no-op.
+        if (s.isNotEmpty) onChanged(s.first);
+      },
     );
   }
 }

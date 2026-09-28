@@ -6,7 +6,6 @@ import 'package:internal_audit_app/models/employee_option.dart';
 import 'package:internal_audit_app/models/nc_model.dart';
 import 'package:internal_audit_app/screens/audits/checkpoint_card.dart';
 import 'package:internal_audit_app/screens/audits/nc_details_sheet.dart';
-import 'package:internal_audit_app/screens/audits/raise_nc_sheet.dart';
 
 /// An NC's "Flag" is the wire/DB field `severity`, renamed for the user.
 /// It has exactly two values — Major and Minor. "Observation" is legacy:
@@ -191,43 +190,6 @@ void main() {
       expect(find.text("No one else is tagged to this audit's location."), findsOneWidget);
       final save = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Save & Raise NC'));
       expect(save.onPressed, isNull);
-    });
-  });
-
-  group('Raise Non-Conformance sheet (freeform NC)', () {
-    testWidgets('labels the field Flag, never Severity, and offers Major/Minor only', (tester) async {
-      await pumpAndOpen(tester, (context) {
-        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP', employees: const [ravi]);
-      });
-
-      expect(find.text('Flag'), findsOneWidget);
-      expect(find.text('Severity'), findsNothing);
-      // Defaults to Minor.
-      expect(find.text('Minor'), findsOneWidget);
-      await expectFlagMenuIsMajorMinorOnly(tester);
-    });
-
-    testWidgets('always shows the Raise NC against picker; raising is enabled when someone can be picked', (tester) async {
-      await pumpAndOpen(tester, (context) {
-        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP', employees: const [ravi]);
-      });
-
-      expect(find.text('Raise NC against'), findsOneWidget);
-      expect(find.textContaining('Self Audit'), findsNothing);
-      expect(find.text("No one else is tagged to this audit's location."), findsNothing);
-      final raise = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Raise NC'));
-      expect(raise.onPressed, isNotNull);
-    });
-
-    testWidgets('with nobody else at the location it says so and blocks raising', (tester) async {
-      await pumpAndOpen(tester, (context) {
-        showRaiseNcSheet(context, auditId: 'a1', auditTitle: 'Line 1 GMP');
-      });
-
-      expect(find.text('Raise NC against'), findsOneWidget);
-      expect(find.text("No one else is tagged to this audit's location."), findsOneWidget);
-      final raise = tester.widget<ElevatedButton>(find.widgetWithText(ElevatedButton, 'Raise NC'));
-      expect(raise.onPressed, isNull);
     });
   });
 

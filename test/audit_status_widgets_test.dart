@@ -15,6 +15,8 @@ import 'package:internal_audit_app/providers/audits_provider.dart';
 import 'package:internal_audit_app/providers/auth_provider.dart';
 import 'package:internal_audit_app/providers/dashboard_provider.dart';
 import 'package:internal_audit_app/providers/filter_options_provider.dart';
+import 'package:internal_audit_app/providers/list_view_memory.dart';
+import 'package:internal_audit_app/providers/nc_provider.dart';
 import 'package:internal_audit_app/screens/audits/my_audits_screen.dart';
 import 'package:internal_audit_app/screens/dashboard/dashboard_screen.dart';
 import 'package:internal_audit_app/screens/profile/reports_screen.dart';
@@ -504,7 +506,9 @@ void main() {
           ChangeNotifierProvider(create: (_) => AuditsProvider()),
           ChangeNotifierProvider(create: (_) => AuthProvider()),
           ChangeNotifierProvider(create: (_) => DashboardProvider()),
+          ChangeNotifierProvider(create: (_) => NcProvider()),
           ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
+          ChangeNotifierProvider(create: (_) => ListViewMemory()),
         ],
         child: MaterialApp(
           theme: AppTheme.light(),
@@ -540,14 +544,21 @@ void main() {
         expect(find.text('Audit $id'), findsOneWidget, reason: 'All -> $id');
       }
 
-      Future<void> pick(String chip) async {
-        final finder = find.widgetWithText(ChoiceChip, chip);
+      // The chips are a multi-select now (tapping one ADDS it), so a "pick"
+      // here means: back to All, then that one chip.
+      Future<void> tapChip(String chip) async {
+        final finder = find.widgetWithText(FilterChip, chip);
         // The row scrolls sideways: bring the chip on screen the way a thumb
         // would before tapping it.
         await tester.ensureVisible(finder);
         await tester.pumpAndSettle();
         await tester.tap(finder);
         await tester.pumpAndSettle();
+      }
+
+      Future<void> pick(String chip) async {
+        if (chip != 'All') await tapChip('All');
+        await tapChip(chip);
       }
 
       Set<String> shown() => {
@@ -629,7 +640,11 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.reset);
       await tester.pumpWidget(MultiProvider(
-        providers: [ChangeNotifierProvider(create: (_) => AuditsProvider())],
+        providers: [
+          ChangeNotifierProvider(create: (_) => AuditsProvider()),
+          ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
+          ChangeNotifierProvider(create: (_) => ListViewMemory()),
+        ],
         child: MaterialApp(
           theme: AppTheme.light(),
           builder: (context, child) => MediaQuery(

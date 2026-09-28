@@ -50,6 +50,11 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
         if (n.id == widget.nc.id) return n;
       }
     }
+    // Opened from a notification the NC may be in neither list (Me scope, an
+    // older page); verify() leaves the server's fresh copy in activeNc, so the
+    // status still moves on this screen after Approve/Reject.
+    final active = provider.activeNc;
+    if (active != null && active.id == widget.nc.id) return active;
     return widget.nc;
   }
 
@@ -68,6 +73,7 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
   }
 
   Future<void> _handle(String action, NcModel nc) async {
+    if (_busy) return;
     if (action == 'Reject' && _noteController.text.trim().isEmpty) {
       showErrorSnackBar(context, 'A remark is required when rejecting.');
       return;
@@ -88,16 +94,21 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
       showErrorSnackBar(context, error);
       return;
     }
+    _noteController.clear();
     // The socket-driven refetch in NcProvider only fires for the OTHER
     // party's notification — the raiser (acting here) never gets notified
     // of their own action, so this list needs an explicit refresh for
     // _resolveNc above to pick up the new status right away. Same reasoning
     // extends to the dashboard's NC/completed tallies, which this action
     // also moves but has no refresh path of its own for the actor.
-    await Future.wait([
-      ncProvider.fetchRaisedByMe(),
-      context.read<DashboardProvider>().refreshAll(),
-    ]);
+    try {
+      await Future.wait([
+        ncProvider.fetchRaisedByMe(),
+        context.read<DashboardProvider>().refreshAll(),
+      ]);
+    } catch (_) {
+      // The action itself succeeded; a failed refresh is not worth an error.
+    }
     if (!mounted) return;
     showSuccessSnackBar(
       context,

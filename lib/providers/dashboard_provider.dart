@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
@@ -67,6 +69,17 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   // earlier value writes nothing when it lands (answer, error or loading flag).
   int _epoch = 0;
 
+  // Per-call sequence numbers — see AuditsProvider: only the newest call of
+  // each fetch may write, so two quick filter changes can't leave the older
+  // answer on screen.
+  int _statsSeq = 0;
+  int _auditeeSeq = 0;
+
+  /// True once a stats answer has landed — lets the screen show its full-page
+  /// loader only for the very first load, not on every refresh (which would
+  /// rebuild the page and lose the scroll position).
+  bool hasLoadedStats = false;
+
   /// Empties everything this provider holds and puts the filters back to
   /// their defaults — call on logout, without refetching. The stat tiles
   /// (assigned/in-progress counts, ATS/OTC score, auditee tallies) are the
@@ -77,9 +90,11 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   /// it would otherwise keep filtering by the previous employee.
   @override
   void resetForLogout() {
+    stopListening();
     _epoch++;
     _selfEmployeeId = null;
     stats = const AuditorStats();
+    hasLoadedStats = false;
     auditeeStats = const AuditeeStats();
     errorMessage = null;
     auditeeErrorMessage = null;
@@ -114,14 +129,19 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
       if (data is Map) {
         final type = data['type']?.toString() ?? '';
         if (type.startsWith('audit_') || type.startsWith('nc_')) {
-          refreshAll();
+          // A burst of notifications refetches once, not once each.
+          _refreshTimer?.cancel();
+          _refreshTimer = Timer(const Duration(milliseconds: 500), refreshAll);
         }
       }
     };
     SocketService.instance.on('new_notification', _onNewNotification!);
   }
 
+  Timer? _refreshTimer;
+
   void stopListening() {
+    _refreshTimer?.cancel();
     _listening = false;
     if (_onNewNotification != null) {
       SocketService.instance.off('new_notification', _onNewNotification);
@@ -141,31 +161,18 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   Future<void> refreshAll() =>
       Future.wait([fetchStats(), fetchAuditeeStats()]);
 
-  /// Everything from [filterParams] that GET /ncs/ats-summary actually
-  /// honours — deliberately NOT the location filter.
-  ///
-  /// Two separate reasons, both worth knowing before "fixing" this:
-  ///  1. That endpoint reads `locationId` (singular), not the `locationIds`
-  ///     every audit endpoint takes, so the audit-shaped param would be
-  ///     silently ignored anyway.
-  ///  2. Far worse, when a location IS supplied it REPLACES the employee
-  ///     scoping rather than narrowing it — see nc.controller.js#getAtsSummary,
-  ///     where `authorizedLocationIds` short-circuits the `employeeIds`
-  ///     branch entirely. So "Me + Zone A" would quietly become "EVERYONE's
-  ///     NCs in Zone A" and show a personal dashboard a number that is not
-  ///     the user's own. Dropping the param keeps this score honest; the
-  ///     chip row on the dashboard is where we tell the user that location
-  ///     doesn't narrow it.
-  /// Audit type is fine to pass — getAtsSummary applies it alongside the
-  /// scope rather than instead of it.
-  Map<String, dynamic>? get _ncSummaryParams {
-    final params = Map<String, dynamic>.from(filterParams ?? const {});
-    params.remove('locationIds');
-    return params.isEmpty ? null : params;
-  }
+  /// What GET /ncs/ats-summary takes: every shared filter plus the NC flag.
+  /// The location facet used to be dropped here because that endpoint let a
+  /// location REPLACE the employee scoping ("Me + Zone A" quietly became
+  /// everyone's NCs in Zone A); the server now ANDs the place with the person
+  /// scope (nc.controller.js#buildNcBaseQuery), so it is safe — and needed for
+  /// the tiles to match the NC list — to send it.
+  Map<String, dynamic>? get _ncSummaryParams => ncFilterParams;
 
   Future<void> fetchStats() async {
     final epoch = _epoch;
+    final seq = ++_statsSeq;
+    bool stale() => epoch != _epoch || seq != _statsSeq;
     isLoading = true;
     errorMessage = null;
     notifyListeners();
@@ -174,19 +181,23 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.auditorStats,
         queryParameters: filterParams,
       );
-      if (epoch != _epoch) return;
+      if (stale()) return;
       stats = AuditorStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
+      hasLoadedStats = true;
     } on DioException catch (e) {
-      if (epoch == _epoch) {
+      if (!stale()) {
         errorMessage = extractErrorMessage(
           e,
           fallback: 'Could not load dashboard stats.',
         );
       }
+    } catch (e, st) {
+      debugPrint('DashboardProvider.fetchStats: unreadable answer: $e\n$st');
+      if (!stale()) errorMessage = 'Could not load dashboard stats.';
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoading = false;
         notifyListeners();
       }
@@ -199,6 +210,8 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   /// means nothing to someone viewing the app as an auditee.
   Future<void> fetchAuditeeStats() async {
     final epoch = _epoch;
+    final seq = ++_auditeeSeq;
+    bool stale() => epoch != _epoch || seq != _auditeeSeq;
     isLoadingAuditee = true;
     auditeeErrorMessage = null;
     notifyListeners();
@@ -207,19 +220,22 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
         ApiConstants.ncsAtsSummary,
         queryParameters: _ncSummaryParams,
       );
-      if (epoch != _epoch) return;
+      if (stale()) return;
       auditeeStats = AuditeeStats.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
     } on DioException catch (e) {
-      if (epoch == _epoch) {
+      if (!stale()) {
         auditeeErrorMessage = extractErrorMessage(
           e,
           fallback: 'Could not load your NC summary.',
         );
       }
+    } catch (e, st) {
+      debugPrint('DashboardProvider.fetchAuditeeStats: unreadable answer: $e\n$st');
+      if (!stale()) auditeeErrorMessage = 'Could not load your NC summary.';
     } finally {
-      if (epoch == _epoch) {
+      if (!stale()) {
         isLoadingAuditee = false;
         notifyListeners();
       }

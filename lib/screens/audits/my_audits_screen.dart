@@ -6,15 +6,16 @@ import 'package:provider/provider.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_status.dart';
 import '../../models/audit_model.dart';
+import '../../providers/audit_filter_scope.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/auth_provider.dart';
+import '../../providers/list_view_memory.dart';
 import '../../providers/dashboard_provider.dart';
+import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/audit_agenda.dart';
+import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
-import '../../widgets/filter_sheet.dart';
-import '../../widgets/status_filter_chip_row.dart';
-import '../dashboard/dashboard_screen.dart' show DashboardFilterBar;
 
 /// screens/audits/my_audits_screen.dart
 /// ─────────────────────────────────────
@@ -37,40 +38,23 @@ import '../dashboard/dashboard_screen.dart' show DashboardFilterBar;
 /// loading/error/empty states, pull-to-refresh, and the sliver wiring
 /// that makes the anchor work.
 ///
-/// The filter bar reuses [DashboardFilterBar] wholesale rather than
-/// growing a second copy of it — the naming is a dashboard-screen
-/// artifact of where it was built first, but `AuditsProvider.audits` (the
-/// very list this screen renders) is exactly what its Me/Team toggle,
-/// people/location/audit-type chips and Filters sheet already narrow.
-/// `_applyFilters` below pushes every result to BOTH AuditsProvider and
-/// DashboardProvider, same reasoning as the Auditee Dashboard's own
-/// _applyFilters: they are shared, root-scoped state, and a filter set
-/// from this tab has to stay visible/consistent everywhere else that
-/// state is read (the Dashboard's own tiles and "what needs attention"
-/// panel, the Calendar) — not just here.
+/// The filter bar is the shared [AuditFilterBar] (Me / All Members, the
+/// Filters sheet — Team, Members, Location + Department, Audit Type, Date
+/// range, Status, Include skipped — and the removable active-filter pills).
+/// The filters are ONE state shared by the Audits, Dashboard and NC
+/// providers (see applyAuditFilterSelection), so a filter set here is the one
+/// the Dashboard tiles and the Calendar are computed under too.
 ///
-/// Unchanged on purpose: the status chips (still a
-/// client-side filter over the one fetched list), the empty/error states,
+/// What Back returns to: the agenda's expanded group (an accordion — one at a
+/// time), the scroll offset, the search text and the filters all live in
+/// [ListViewMemory]/the filter providers, not in this widget, so opening an
+/// audit and pressing Back — or the tab being remounted — finds the list
+/// exactly as it was left; logout wipes it.
+///
+/// Unchanged on purpose: the status chips row (now a multi-select over the
+/// same client-side filter), the empty/error states,
 /// RefreshIndicator -> fetchMyAudits(), and the `initialStatusFilter`
 /// prop AppShell passes when a dashboard stat tile jumps here.
-
-// "All" plus the eight lifecycle statuses (Not Started / In Progress /
-// Overdue / Delayed Completed / On-Time Completed / NC Response Pending / NC
-// Verification Pending / Total Closed) — core/utils/audit_status.dart's
-// auditStatusFilterOptions, which also decides what each chip matches (the
-// two "Completed" chips by the audit's timeliness, the rest by the status
-// its badge shows). Skipped is already excluded server-side
-// (audit.controller.js#notSkipped); Draft is deliberately left off too —
-// this row is for triaging ACTIVE work, and a Draft (not-yet-scheduled/
-// incomplete-setup) audit doesn't fit that question. It still shows up under
-// "All", just with no chip of its own to isolate it — the same "Complete
-// Setup" row on the web Schedule Audit page is where a planner actually
-// deals with drafts, not this triage list.
-// Filtered client-side over the one fetched list rather than a re-fetch
-// per tap, since a single auditor's own audit list is small enough that
-// round-tripping the server for every filter change would just be
-// perceptible lag for no benefit (the app never sends `?status=`).
-const _statusFilters = auditStatusFilterOptions;
 
 // Which way the "Today" pill would take you — also its visibility, since
 // "you are already at Today" is exactly when it should not be on screen.
@@ -82,7 +66,7 @@ enum _JumpTarget { hidden, up, down }
 const double _jumpThreshold = 80;
 
 class MyAuditsScreen extends StatefulWidget {
-  // Pre-applies one of _statusFilters below — set by AppShell when a
+  // Pre-applies one status (AuditStatus.pipeline) — set by AppShell when a
   // dashboard stat tile is tapped (see DashboardScreen's AuditStatsGrid),
   // remounted under a fresh key each time so this always takes effect
   // even when the tile tapped is the same filter already showing.
@@ -95,25 +79,31 @@ class MyAuditsScreen extends StatefulWidget {
 }
 
 class _MyAuditsScreenState extends State<MyAuditsScreen> {
-  late String _statusFilter = widget.initialStatusFilter ?? 'All';
+  static const _memoryId = 'audits';
 
-  /// Which groups the user opened/closed. Held here, in the State object,
-  /// rather than inside each section widget: AppShell wraps every tab in
-  /// a _KeepAlivePage, so this survives a swipe to another tab and back —
-  /// returning to the Audits tab to find every group you had opened
-  /// slammed shut would make the tab feel like it reloads on every swipe.
+  /// Which groups the user opened/closed, and the other things to put back
+  /// when the user returns (search text, scroll offset). Held in
+  /// [ListViewMemory] — a provider that outlives this widget — rather than
+  /// here: see the class doc above. AppShell also keeps this tab alive across
+  /// swipes, but a remount (a dashboard tile jump re-keys it) would otherwise
+  /// lose them.
   ///
   /// The old screen's "default the open group to the newest date, once
   /// per list load" behaviour is deliberately NOT carried over: the Today
   /// anchor is what decides where the user lands now, and an auto-opened
   /// group somewhere down the list would just fight it.
-  final AgendaExpansion _expansion = AgendaExpansion();
+  late final ListViewMemory _memory = context.read<ListViewMemory>();
+  AgendaExpansion get _expansion => _memory.agendaExpansion;
+  late final ListScreenMemory _saved = _memory.screen(_memoryId);
 
   /// Marks the Today sliver as the CustomScrollView's `center` — see
   /// _buildAgenda for what that actually does.
   final GlobalKey _todayKey = GlobalKey(debugLabel: 'agenda-today-sliver');
 
-  final ScrollController _scroll = ScrollController();
+  // A dashboard tile jump starts at the top, whatever was remembered.
+  late final ScrollController _scroll = ScrollController(
+    initialScrollOffset: widget.initialStatusFilter != null ? 0 : _saved.scroll,
+  );
 
   /// Free-text narrowing, applied on top of the status chip. Local to
   /// this screen and deliberately NOT pushed into AuditsProvider like the
@@ -122,8 +112,10 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
   /// network on every keystroke would make typing lag on exactly the
   /// mid-range phones this app targets. Everything the agenda shows is
   /// already in memory, so this filters the loaded list instead.
-  final TextEditingController _searchController = TextEditingController();
-  String _search = '';
+  late final TextEditingController _searchController = TextEditingController(
+    text: _saved.search,
+  );
+  late String _search = _saved.search;
 
   /// Title, scope and location are all drawn on the agenda card itself
   /// (audit_agenda.dart renders `audit.scope` under the title), so a hit
@@ -160,10 +152,38 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
   void initState() {
     super.initState();
     _scroll.addListener(_onScroll);
+    // A dashboard tile jump (AppShell re-keys this screen and passes the
+    // tile's status): start fresh — top of the list, nothing expanded, no
+    // search — with just that status picked. A plain remount passes nothing
+    // and keeps what was remembered.
+    final jump = widget.initialStatusFilter;
+    if (jump != null) {
+      // Reset in place, NOT _memory.forget(): _saved (and the scroll
+      // controller's later writes to it) must stay the object the memory
+      // holds, or they would go to an orphan the next visit never reads.
+      _saved
+        ..scroll = 0
+        ..search = '';
+      _memory.agendaExpansion.collapseAll();
+      _search = '';
+      _searchController.text = '';
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final selfId = context.read<AuthProvider>().user?.id;
       if (selfId != null) {
         context.read<AuditsProvider>().setSelfEmployeeId(selfId);
+      }
+      if (jump != null) {
+        final statuses = jump == 'All' ? const <String>[] : [jump];
+        // Shared state: every filter-holding provider, no refetch needed —
+        // Status is matched over the loaded list (AuditsProvider.visibleAudits).
+        for (final AuditFilterScope p in [
+          context.read<AuditsProvider>(),
+          context.read<DashboardProvider>(),
+          context.read<NcProvider>(),
+        ]) {
+          p.setStatusFilter(statuses);
+        }
       }
       context.read<AuditsProvider>().fetchMyAudits();
     });
@@ -187,6 +207,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
       return;
     }
     final offset = _scroll.offset;
+    _saved.scroll = offset;
     if (offset > _jumpThreshold) {
       _jump.value = _JumpTarget.up;
     } else if (offset < -_jumpThreshold) {
@@ -293,29 +314,14 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     _scrollToPastTop();
   }
 
-  Future<void> _refresh() => context.read<AuditsProvider>().fetchMyAudits();
-
-  // Pushes a sheet result to every provider this filter state is shared
-  // with — see this file's own header doc for why DashboardProvider is
-  // included even though this screen never reads from it.
-  Future<void> _applyFilters(AuditFilterSelection selection) {
-    final audits = context.read<AuditsProvider>();
-    final dashboard = context.read<DashboardProvider>();
-    return Future.wait([
-      audits.applyFilters(
-        isTeam: selection.isTeam,
-        employees: selection.employees,
-        locations: selection.locations,
-        auditTypes: selection.auditTypes,
-      ),
-      dashboard.applyFilters(
-        isTeam: selection.isTeam,
-        employees: selection.employees,
-        locations: selection.locations,
-        auditTypes: selection.auditTypes,
-      ),
-    ]);
+  // Tapping the Today header is the accordion's reset: every other expanded
+  // group folds and the list returns to Today.
+  void _onTodayTapped() {
+    setState(() => _expansion.collapseAll());
+    _jumpToToday();
   }
+
+  Future<void> _refresh() => context.read<AuditsProvider>().fetchMyAudits();
 
   @override
   Widget build(BuildContext context) {
@@ -333,15 +339,10 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
     // bucketing (see the note below) so headers, counts and the Today
     // anchor all describe what is actually on screen.
     final String query = _search.trim().toLowerCase();
-    final List<AuditModel> filtered =
-        (_statusFilter == 'All' && query.isEmpty)
-        ? provider.audits
-        : provider.audits.where((a) {
-            if (!auditMatchesStatusFilter(a, _statusFilter)) {
-              return false;
-            }
-            return query.isEmpty || _matchesSearch(a, query);
-          }).toList();
+    final List<AuditModel> visible = provider.visibleAudits;
+    final List<AuditModel> filtered = query.isEmpty
+        ? visible
+        : visible.where((a) => _matchesSearch(a, query)).toList();
 
     // The status chips filter BEFORE bucketing, so every section header's
     // count and the Today anchor itself describe what is actually on
@@ -395,6 +396,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
                         tooltip: 'Clear search',
                         onPressed: () {
                           _searchController.clear();
+                          _saved.search = '';
                           setState(() => _search = '');
                         },
                       ),
@@ -402,34 +404,35 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
                   borderRadius: BorderRadius.circular(10),
                 ),
               ),
-              onChanged: (v) => setState(() => _search = v),
+              onChanged: (v) {
+                _saved.search = v;
+                setState(() => _search = v);
+              },
             ),
           ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: DashboardFilterBar(
-            isTeam: provider.isTeamScope,
-            employees: provider.employeeFilter,
-            locations: provider.locationFilter,
-            auditTypes: provider.auditTypeFilter,
-            activeCount: provider.activeFilterCount,
-            onScopeChanged: (isTeam) {
-              context.read<AuditsProvider>().setTeamScope(isTeam);
-              context.read<DashboardProvider>().setTeamScope(isTeam);
-            },
-            onApply: _applyFilters,
-          ),
+          // Status is offered here (the list is what it narrows) — and
+          // Include skipped, which asks the server for Skipped audits too.
+          child: const AuditFilterBar(showStatus: true),
         ),
         if (!showLoading && !showError && !showEmptyState)
-          StatusFilterChipRow(
-            options: _statusFilters,
-            selected: _statusFilter,
-            // readable(): the raw status tokens are dark by design (badge
-            // text on a light tint) and would sink into a dark-theme chip.
-            dotColorFor: (o) => o == 'All'
-                ? null
-                : AppColors.readable(context, AppColors.forAuditStatus(o)),
-            onSelected: (v) => setState(() => _statusFilter = v),
+          _StatusChipRow(
+            selected: provider.statusFilter,
+            onToggle: (status) {
+              final next = status == null
+                  ? const <String>[]
+                  : (provider.statusFilter.contains(status)
+                        ? provider.statusFilter.where((s) => s != status).toList()
+                        : [...provider.statusFilter, status]);
+              for (final AuditFilterScope p in [
+                context.read<AuditsProvider>(),
+                context.read<DashboardProvider>(),
+                context.read<NcProvider>(),
+              ]) {
+                p.setStatusFilter(next);
+              }
+            },
           ),
         if (agenda != null)
           AgendaPastBar(
@@ -522,29 +525,44 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
       // search reset here, not clearFilters().
       final searchTerm = _search.trim();
       final searching = searchTerm.isNotEmpty;
+      final statuses = context.read<AuditsProvider>().statusFilter;
+      final statusLabel = statuses.join(' / ');
       child = SizedBox(
         height: height * 0.5,
         child: EmptyState(
           icon: searching ? Icons.search_off : Icons.filter_alt_off_outlined,
           title: searching
               ? 'No audits match "$searchTerm"'
-              : auditStatusEmptyTitle(_statusFilter),
+              : auditStatusEmptyTitle(statusLabel),
           // Both narrowings active at once is the case most likely to
           // read as "the search is broken" — name the other one so the
           // user knows there is a second thing hiding results.
-          subtitle: searching && _statusFilter != 'All'
-              ? 'Also filtered to "$_statusFilter".'
+          subtitle: searching && statuses.isNotEmpty
+              ? 'Also filtered to "$statusLabel".'
               : null,
           action: searching
               ? OutlinedButton.icon(
                   onPressed: () {
                     _searchController.clear();
+                    _saved.search = '';
                     setState(() => _search = '');
                   },
                   icon: const Icon(Icons.clear),
                   label: const Text('Clear search'),
                 )
-              : null,
+              : OutlinedButton.icon(
+                  onPressed: () {
+                    for (final AuditFilterScope p in [
+                      context.read<AuditsProvider>(),
+                      context.read<DashboardProvider>(),
+                      context.read<NcProvider>(),
+                    ]) {
+                      p.setStatusFilter(const []);
+                    }
+                  },
+                  icon: const Icon(Icons.filter_alt_off_outlined),
+                  label: const Text('Show all statuses'),
+                ),
         ),
       );
     }
@@ -623,6 +641,7 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
                   audits: agenda.todayAudits,
                   hasHiddenPastContent: _onlyPastHasContent(agenda),
                   onViewPast: () => _viewPast(agenda),
+                  onTap: _onTodayTapped,
                 ),
               ),
             ),
@@ -859,6 +878,96 @@ class _TodayJumpButton extends StatelessWidget {
               ),
             );
           },
+        ),
+      ),
+    );
+  }
+}
+
+
+/// The status quick-filter row: "All" plus the eight lifecycle statuses
+/// (core/utils/audit_status.dart's AuditStatus.pipeline) as MULTI-select
+/// chips over the shared Status filter (AuditFilterScope.statusFilter — also
+/// editable in the Filters sheet, and what a dashboard tile jump sets).
+/// Skipped/Draft are deliberately not chips: Skipped has the sheet's Include
+/// skipped switch, and a Draft still shows under All.
+///
+/// Scrolls the newest pick into view, since the row is longer than the
+/// screen. A plain scrolling Row (one GlobalKey per chip) rather than a lazy
+/// ListView, whose off-screen chips have no context to scroll to.
+class _StatusChipRow extends StatefulWidget {
+  final List<String> selected;
+
+  /// null = "All" (clears the pick); otherwise toggles that status.
+  final ValueChanged<String?> onToggle;
+
+  const _StatusChipRow({required this.selected, required this.onToggle});
+
+  @override
+  State<_StatusChipRow> createState() => _StatusChipRowState();
+}
+
+class _StatusChipRowState extends State<_StatusChipRow> {
+  final Map<String, GlobalKey> _keys = {};
+
+  GlobalKey _key(String label) => _keys.putIfAbsent(label, GlobalKey.new);
+
+  @override
+  void didUpdateWidget(_StatusChipRow old) {
+    super.didUpdateWidget(old);
+    final added = widget.selected.where((s) => !old.selected.contains(s));
+    if (added.isEmpty) return;
+    final target = added.last;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _keys[target]?.currentContext;
+      if (!mounted || ctx == null) return;
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    Widget chip(String label, {required bool selected, Color? dot}) => Center(
+      key: _key(label),
+      child: FilterChip(
+        label: Text(label),
+        avatar: dot == null
+            ? null
+            : Container(
+                width: 9,
+                height: 9,
+                decoration: BoxDecoration(color: dot, shape: BoxShape.circle),
+              ),
+        selected: selected,
+        onSelected: (_) => widget.onToggle(label == 'All' ? null : label),
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        visualDensity: VisualDensity.compact,
+      ),
+    );
+    return SizedBox(
+      height: 44,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        child: Row(
+          children: [
+            chip('All', selected: widget.selected.isEmpty),
+            for (final status in AuditStatus.pipeline) ...[
+              const SizedBox(width: 8),
+              chip(
+                status,
+                selected: widget.selected.contains(status),
+                // readable(): the raw status tokens are dark by design
+                // (badge text on a light tint) and would sink into a dark chip.
+                dot: AppColors.readable(context, AppColors.forAuditStatus(status)),
+              ),
+            ],
+          ],
         ),
       ),
     );

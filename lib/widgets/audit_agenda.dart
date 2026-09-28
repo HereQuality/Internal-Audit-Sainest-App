@@ -220,9 +220,9 @@ class AuditAgenda {
   /// "there are 12 old audits" is background noise, "3 of them are still
   /// not done" is the reason to scroll up at all.
   int get pastOverdueCount => pastMonths.fold<int>(
-        0,
-        (sum, m) => sum + m.audits.where((a) => isAuditOverdue(a, today)).length,
-      );
+    0,
+    (sum, m) => sum + m.audits.where((a) => isAuditOverdue(a, today)).length,
+  );
 
   /// True when there is nothing at all to show — note Today itself is
   /// still rendered in that case (see AgendaTodaySection), so this is only
@@ -414,11 +414,23 @@ _MonthTiers _tierMonths(
       // oldest-at-top / nearest-to-Today-at-bottom overall.
       ? <AgendaRangeBucket>[
           if (older.isNotEmpty)
-            AgendaRangeBucket(label: 'Older', groupKey: '$prefix:older', months: older),
+            AgendaRangeBucket(
+              label: 'Older',
+              groupKey: '$prefix:older',
+              months: older,
+            ),
           if (yearRange.isNotEmpty)
-            AgendaRangeBucket(label: 'Past Year', groupKey: '$prefix:year', months: yearRange),
+            AgendaRangeBucket(
+              label: 'Past Year',
+              groupKey: '$prefix:year',
+              months: yearRange,
+            ),
           if (midRange.isNotEmpty)
-            AgendaRangeBucket(label: 'Past 6 Months', groupKey: '$prefix:6mo', months: midRange),
+            AgendaRangeBucket(
+              label: 'Past 6 Months',
+              groupKey: '$prefix:6mo',
+              months: midRange,
+            ),
         ]
       // Nearest bucket first: `recent` renders ABOVE these, so the
       // forward region reads nearest-to-Today-at-top / farthest-at-bottom
@@ -426,11 +438,23 @@ _MonthTiers _tierMonths(
       // scrolls.
       : <AgendaRangeBucket>[
           if (midRange.isNotEmpty)
-            AgendaRangeBucket(label: 'Next 6 Months', groupKey: '$prefix:6mo', months: midRange),
+            AgendaRangeBucket(
+              label: 'Next 6 Months',
+              groupKey: '$prefix:6mo',
+              months: midRange,
+            ),
           if (yearRange.isNotEmpty)
-            AgendaRangeBucket(label: 'Next Year', groupKey: '$prefix:year', months: yearRange),
+            AgendaRangeBucket(
+              label: 'Next Year',
+              groupKey: '$prefix:year',
+              months: yearRange,
+            ),
           if (older.isNotEmpty)
-            AgendaRangeBucket(label: 'Later', groupKey: '$prefix:older', months: older),
+            AgendaRangeBucket(
+              label: 'Later',
+              groupKey: '$prefix:older',
+              months: older,
+            ),
         ];
   return _MonthTiers(recent, buckets);
 }
@@ -551,52 +575,88 @@ String agendaMonthKey(DateTime month) => 'month:${month.year}-${month.month}';
 String agendaSeriesKey(String groupKey, String seriesId) =>
     '$groupKey/series:$seriesId';
 
-/// Which agenda groups the user has opened or closed.
+/// Which agenda groups the user has opened or closed — as an ACCORDION:
+/// at any one level only one group is open, so opening a day, a month, a
+/// range bucket or the past region folds whichever sibling was open (and
+/// everything nested inside it). A group nested in another (a day inside a
+/// month, a series inside a month, a month inside a bucket) is one level
+/// down: opening it folds only ITS siblings and leaves its parent open.
 ///
-/// Lives in MyAuditsScreen's State object, not in each section widget:
-/// AppShell keeps the Audits tab alive across tab swipes
-/// (screens/root/app_shell.dart#_KeepAlivePage), and this is exactly the
-/// kind of state that keep-alive is for — coming back to the tab and
-/// finding every group the user opened slammed shut again would make the
-/// whole PageView feel like it reloads on every swipe.
+/// Held as "parent key -> the one open child key" (the root's key is `''`),
+/// so the rule is one line in [_toggle] instead of a bespoke set per widget.
+///
+/// Lives in [ListViewMemory] (a process-lifetime provider), not in the
+/// screen's State or in each section widget: opening an audit and pressing
+/// Back must find the same group open, and a remount of the tab (a dashboard
+/// tile jump, a role switch) must not slam everything shut. It is wiped on
+/// logout with the rest of that provider.
 ///
 /// Everything defaults CLOSED except Today itself — Today isn't part of
 /// this class at all (AgendaTodaySection always renders every one of
-/// today's audits inline, with no collapse toggle of its own), so a set
-/// that starts empty is already a correct fresh state for every group
-/// this class DOES track: every day in the seven-day window, every month
-/// (past or future), and the past region as a whole all open collapsed,
-/// storing only which ones the user has explicitly opened.
+/// today's audits inline), so an empty map is already a correct fresh state.
 class AgendaExpansion {
-  final Set<String> expandedDays = <String>{};
-  final Set<String> expandedMonths = <String>{};
-  final Set<String> expandedSeries = <String>{};
+  /// The key of the top level — "no parent".
+  static const root = '';
+
+  /// The past region is one root-level group, so opening anything in the
+  /// forward part of the agenda folds it, and the months inside it are its
+  /// children (their `parent` is this key).
+  static const pastKey = 'past';
+
+  final Map<String, String> _open = {};
+
+  bool _isOpen(String key) => _open.containsValue(key);
 
   /// The past region stays shut until asked for — see AgendaPastRegion.
-  bool pastExpanded = false;
+  bool get pastExpanded => _open[root] == pastKey;
 
-  bool isDayExpanded(String key) => expandedDays.contains(key);
-
-  bool isMonthExpanded(String key) => expandedMonths.contains(key);
-
-  bool isSeriesExpanded(String key) => expandedSeries.contains(key);
-
-  void toggleDay(String key) {
-    if (!expandedDays.remove(key)) {
-      expandedDays.add(key);
+  set pastExpanded(bool value) {
+    if (value) {
+      _openChild(root, pastKey);
+    } else if (pastExpanded) {
+      _closeTree(pastKey);
+      _open.remove(root);
     }
   }
 
-  void toggleMonth(String key) {
-    if (!expandedMonths.remove(key)) {
-      expandedMonths.add(key);
+  bool isDayExpanded(String key) => _isOpen(key);
+
+  bool isMonthExpanded(String key) => _isOpen(key);
+
+  bool isSeriesExpanded(String key) => _isOpen(key);
+
+  void toggleDay(String key, {String parent = root}) => _toggle(key, parent);
+
+  void toggleMonth(String key, {String parent = root}) => _toggle(key, parent);
+
+  void toggleSeries(String key, {String parent = root}) => _toggle(key, parent);
+
+  /// Folds everything (Today's header does this: tapping it collapses every
+  /// other expanded group).
+  void collapseAll() => _open.clear();
+
+  /// True when at least one group is open.
+  bool get anyExpanded => _open.isNotEmpty;
+
+  void _toggle(String key, String parent) {
+    if (_open[parent] == key) {
+      _closeTree(key);
+      _open.remove(parent);
+    } else {
+      _openChild(parent, key);
     }
   }
 
-  void toggleSeries(String key) {
-    if (!expandedSeries.remove(key)) {
-      expandedSeries.add(key);
-    }
+  void _openChild(String parent, String key) {
+    final previous = _open[parent];
+    if (previous != null && previous != key) _closeTree(previous);
+    _open[parent] = key;
+  }
+
+  // Folds `key`'s own open child, and that child's, all the way down.
+  void _closeTree(String key) {
+    final child = _open.remove(key);
+    if (child != null) _closeTree(child);
   }
 }
 
@@ -664,10 +724,9 @@ class AgendaSectionHeader extends StatelessWidget {
             Expanded(
               child: Text(
                 label,
-                style: Theme.of(context)
-                    .textTheme
-                    .titleSmall
-                    ?.copyWith(fontWeight: FontWeight.w700),
+                style: Theme.of(
+                  context,
+                ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
               ),
             ),
             _CountPill(count: count),
@@ -743,12 +802,17 @@ class AgendaTodaySection extends StatelessWidget {
   /// only rendered) alongside [hasHiddenPastContent].
   final VoidCallback? onViewPast;
 
+  /// Tapping the Today header: the screen folds every other expanded group
+  /// (accordion — see AgendaExpansion) and brings Today back to the top.
+  final VoidCallback? onTap;
+
   const AgendaTodaySection({
     super.key,
     required this.today,
     required this.audits,
     this.hasHiddenPastContent = false,
     this.onViewPast,
+    this.onTap,
   });
 
   @override
@@ -757,43 +821,52 @@ class AgendaTodaySection extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          decoration: BoxDecoration(
-            color: scheme.primaryContainer,
+        Material(
+          color: scheme.primaryContainer,
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
             borderRadius: BorderRadius.circular(12),
-          ),
-          child: Row(
-            children: [
-              Icon(Icons.today_rounded, size: 18,
-                  color: scheme.onPrimaryContainer),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  'Today · ${_dayHeaderFormat.format(today)}',
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.today_rounded,
+                    size: 18,
+                    color: scheme.onPrimaryContainer,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Today · ${_dayHeaderFormat.format(today)}',
+                      style: Theme.of(context).textTheme.titleSmall?.copyWith(
                         fontWeight: FontWeight.w800,
                         color: scheme.onPrimaryContainer,
                       ),
-                ),
-              ),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
-                decoration: BoxDecoration(
-                  color: scheme.surface.withValues(alpha: 0.7),
-                  borderRadius: BorderRadius.circular(999),
-                ),
-                child: Text(
-                  '${audits.length}',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w800,
-                    color: scheme.onSurface,
+                    ),
                   ),
-                ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: scheme.surface.withValues(alpha: 0.7),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text(
+                      '${audits.length}',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w800,
+                        color: scheme.onSurface,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
         ),
         const SizedBox(height: 10),
@@ -809,15 +882,18 @@ class AgendaTodaySection extends StatelessWidget {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.arrow_upward_rounded,
-                        size: 15, color: scheme.primary),
+                    Icon(
+                      Icons.arrow_upward_rounded,
+                      size: 15,
+                      color: scheme.primary,
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       'Nothing scheduled today — past audits above',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: scheme.primary,
-                            fontWeight: FontWeight.w600,
-                          ),
+                        color: scheme.primary,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ],
                 ),
@@ -829,10 +905,9 @@ class AgendaTodaySection extends StatelessWidget {
             padding: const EdgeInsets.only(left: 4, bottom: 4),
             child: Text(
               'Nothing scheduled today.',
-              style: Theme.of(context)
-                  .textTheme
-                  .bodySmall
-                  ?.copyWith(color: scheme.outline),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: scheme.outline),
             ),
           )
         else
@@ -920,6 +995,11 @@ class AgendaMonthSection extends StatelessWidget {
   /// plain state living in MyAuditsScreen.
   final VoidCallback onChanged;
 
+  /// The accordion level this month sits at: [AgendaExpansion.root] for a
+  /// month on the main timeline, [AgendaExpansion.pastKey] inside the past
+  /// region, or a bucket's group key for a month nested in a range bucket.
+  final String parent;
+
   /// True for a month reached through an AgendaRangeBucketSection (see
   /// that class's own doc) — expanding breaks this month's own audits
   /// down by day (one nested AgendaDaySection per day that has anything)
@@ -939,6 +1019,7 @@ class AgendaMonthSection extends StatelessWidget {
     required this.expansion,
     required this.onChanged,
     this.nestDays = false,
+    this.parent = AgendaExpansion.root,
   });
 
   @override
@@ -947,8 +1028,9 @@ class AgendaMonthSection extends StatelessWidget {
     final entries = expanded && !nestDays
         ? collapseRecurringSeries(audits)
         : const <AgendaEntry>[];
-    final dayGroups =
-        expanded && nestDays ? _groupAuditsByDay(audits) : const <AuditDayGroup>[];
+    final dayGroups = expanded && nestDays
+        ? _groupAuditsByDay(audits)
+        : const <AuditDayGroup>[];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -961,7 +1043,7 @@ class AgendaMonthSection extends StatelessWidget {
           count: audits.length,
           expanded: expanded,
           onTap: () {
-            expansion.toggleMonth(groupKey);
+            expansion.toggleMonth(groupKey, parent: parent);
             onChanged();
           },
         ),
@@ -980,7 +1062,10 @@ class AgendaMonthSection extends StatelessWidget {
                 // way a bucket's own nested month keys need one.
                 expanded: expansion.isDayExpanded(agendaDayKey(group.day)),
                 onToggle: () {
-                  expansion.toggleDay(agendaDayKey(group.day));
+                  expansion.toggleDay(
+                    agendaDayKey(group.day),
+                    parent: groupKey,
+                  );
                   onChanged();
                 },
               ),
@@ -1022,12 +1107,16 @@ class AgendaRangeBucketSection extends StatelessWidget {
   final AgendaExpansion expansion;
   final VoidCallback onChanged;
 
+  /// The accordion level of the bucket itself — see AgendaMonthSection.parent.
+  final String parent;
+
   const AgendaRangeBucketSection({
     super.key,
     required this.bucket,
     required this.today,
     required this.expansion,
     required this.onChanged,
+    this.parent = AgendaExpansion.root,
   });
 
   @override
@@ -1042,7 +1131,7 @@ class AgendaRangeBucketSection extends StatelessWidget {
           expanded: expanded,
           icon: Icons.calendar_view_month_outlined,
           onTap: () {
-            expansion.toggleMonth(bucket.groupKey);
+            expansion.toggleMonth(bucket.groupKey, parent: parent);
             onChanged();
           },
         ),
@@ -1064,12 +1153,14 @@ class AgendaRangeBucketSection extends StatelessWidget {
                       // months from now as Today moves on, and this keeps
                       // its expand state from ever colliding with a
                       // same-named key used somewhere else in the agenda.
-                      groupKey: '${bucket.groupKey}/${agendaMonthKey(month.month)}',
+                      groupKey:
+                          '${bucket.groupKey}/${agendaMonthKey(month.month)}',
                       audits: month.audits,
                       today: today,
                       expansion: expansion,
                       onChanged: onChanged,
                       nestDays: true,
+                      parent: bucket.groupKey,
                     ),
                   ),
               ],
@@ -1124,7 +1215,7 @@ class AgendaSeriesGroup extends StatelessWidget {
           child: InkWell(
             borderRadius: BorderRadius.circular(12),
             onTap: () {
-              expansion.toggleSeries(key);
+              expansion.toggleSeries(key, parent: groupKey);
               onChanged();
             },
             child: Padding(
@@ -1134,17 +1225,18 @@ class AgendaSeriesGroup extends StatelessWidget {
                 children: [
                   Row(
                     children: [
-                      Icon(Icons.repeat_rounded,
-                          size: 16, color: scheme.primary),
+                      Icon(
+                        Icons.repeat_rounded,
+                        size: 16,
+                        color: scheme.primary,
+                      ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
                           entry.lead.title,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleSmall
+                          style: Theme.of(context).textTheme.titleSmall
                               ?.copyWith(fontWeight: FontWeight.w700),
                         ),
                       ),
@@ -1166,25 +1258,26 @@ class AgendaSeriesGroup extends StatelessWidget {
                   Text(
                     entry.seriesLabel,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: scheme.primary,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 12,
-                        ),
+                      color: scheme.primary,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 12,
+                    ),
                   ),
                   const SizedBox(height: 6),
                   Row(
                     children: [
-                      Icon(Icons.date_range_outlined,
-                          size: 14, color: scheme.outline),
+                      Icon(
+                        Icons.date_range_outlined,
+                        size: 14,
+                        color: scheme.outline,
+                      ),
                       const SizedBox(width: 4),
                       Expanded(
                         child: Text(
                           entry.dateSpan,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context)
-                              .textTheme
-                              .bodySmall
+                          style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: scheme.outline),
                         ),
                       ),
@@ -1193,10 +1286,10 @@ class AgendaSeriesGroup extends StatelessWidget {
                   const SizedBox(height: 2),
                   Text(
                     entry.statusSummary,
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodySmall
-                        ?.copyWith(color: scheme.outline, fontSize: 12),
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.outline,
+                      fontSize: 12,
+                    ),
                   ),
                 ],
               ),
@@ -1287,13 +1380,13 @@ class AgendaAuditCard extends StatelessWidget {
     final String? trailingMeta = showDate
         ? Formatters.date(audit.scheduledDate)
         : (audit.auditorNames.isNotEmpty
-            ? audit.auditorNames.join(', ')
-            : audit.auditType);
+              ? audit.auditorNames.join(', ')
+              : audit.auditType);
     final IconData trailingIcon = showDate
         ? Icons.event_outlined
         : (audit.auditorNames.isNotEmpty
-            ? Icons.person_outline
-            : Icons.category_outlined);
+              ? Icons.person_outline
+              : Icons.category_outlined);
 
     return Card(
       // Overdue gets a red-tinted border rather than a red fill: the card
@@ -1325,10 +1418,9 @@ class AgendaAuditCard extends StatelessWidget {
                   Expanded(
                     child: Text(
                       audit.title,
-                      style: Theme.of(context)
-                          .textTheme
-                          .titleMedium
-                          ?.copyWith(fontWeight: FontWeight.w700),
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -1344,10 +1436,9 @@ class AgendaAuditCard extends StatelessWidget {
                   audit.scope,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context)
-                      .textTheme
-                      .bodySmall
-                      ?.copyWith(color: scheme.outline),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(color: scheme.outline),
                 ),
               ],
               if (audit.auditType != null ||
@@ -1365,10 +1456,13 @@ class AgendaAuditCard extends StatelessWidget {
                     if (audit.auditType != null)
                       Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 2),
+                          horizontal: 8,
+                          vertical: 2,
+                        ),
                         decoration: BoxDecoration(
-                          color: scheme.surfaceContainerHighest
-                              .withValues(alpha: 0.7),
+                          color: scheme.surfaceContainerHighest.withValues(
+                            alpha: 0.7,
+                          ),
                           borderRadius: BorderRadius.circular(999),
                         ),
                         child: Text(
@@ -1401,12 +1495,13 @@ class AgendaAuditCard extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color:
-                                audit.location.isNotEmpty ? null : scheme.outline,
-                            fontWeight: audit.location.isNotEmpty
-                                ? FontWeight.w600
-                                : FontWeight.w400,
-                          ),
+                        color: audit.location.isNotEmpty
+                            ? null
+                            : scheme.outline,
+                        fontWeight: audit.location.isNotEmpty
+                            ? FontWeight.w600
+                            : FontWeight.w400,
+                      ),
                     ),
                   ),
                   if (trailingMeta != null) ...[
@@ -1495,16 +1590,17 @@ class AgendaPastBar extends StatelessWidget {
               Expanded(
                 child: Text(
                   'Past audits · ${agenda.pastCount}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .titleSmall
-                      ?.copyWith(fontWeight: FontWeight.w700),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
                 ),
               ),
               if (overdue > 0)
                 Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 2,
+                  ),
                   decoration: BoxDecoration(
                     color: AppColors.red.withValues(alpha: 0.12),
                     borderRadius: BorderRadius.circular(999),
@@ -1570,6 +1666,7 @@ class AgendaPastRegion extends StatelessWidget {
             today: agenda.today,
             expansion: expansion,
             onChanged: onChanged,
+            parent: AgendaExpansion.pastKey,
           ),
         for (final month in agenda.recentPastMonths)
           AgendaMonthSection(
@@ -1579,6 +1676,7 @@ class AgendaPastRegion extends StatelessWidget {
             today: agenda.today,
             expansion: expansion,
             onChanged: onChanged,
+            parent: AgendaExpansion.pastKey,
           ),
       ],
     );

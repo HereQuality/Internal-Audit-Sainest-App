@@ -19,8 +19,8 @@ import '../../models/nc_model.dart';
 /// audited location's people — the caller excludes the acting auditor, an
 /// NC is never raised against the raiser), a due date, a flag, plus the
 /// remark that's shared with the checkpoint's own text field. Same shape
-/// as the standalone raise_nc_sheet.dart's freeform flow, just scoped to
-/// one specific checkpoint instead of a blank NC.
+/// as the old standalone freeform Raise NC sheet did (removed — an NC is
+/// only ever raised on the specific checkpoint it's about).
 ///
 /// It doubles as the EDIT sheet for an already-raised NC (see
 /// [NcSheetMode.edit] and checkpoint_card.dart's `_openNcEditSheet`).

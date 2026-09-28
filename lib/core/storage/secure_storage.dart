@@ -52,12 +52,18 @@ class SecureStorage {
   /// retry, or after a week).
   Future<void> clear() async {
     String? pending;
+    String? theme;
     try {
       pending = await readPendingUnregister();
+      // The phone's own light/dark choice is not the account's: signing out
+      // must not flip the screen back to the default (ThemeProvider keeps it in
+      // memory, so it would also disagree with what is stored until relaunch).
+      theme = await readThemeMode();
     } catch (_) {
       // Unreadable storage is the case deleteAll below is the recovery for.
     }
     await _storage.deleteAll();
     if (pending != null) await savePendingUnregister(pending);
+    if (theme != null) await saveThemeMode(theme);
   }
 }

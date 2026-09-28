@@ -138,62 +138,163 @@ class _AuditListSection extends StatelessWidget {
   final List<AuditModel> audits;
   final VoidCallback? onSeeAll;
 
-  const _AuditListSection({required this.icon, required this.title, required this.audits, this.onSeeAll});
+  /// Accordion hooks (see [AuditAttentionPanel]): when [onToggle] is set the
+  /// header is tappable, shows a chevron and hides the cards while
+  /// [expanded] is false. Left null (the standalone use), the section is
+  /// always open exactly as before.
+  final bool expanded;
+  final VoidCallback? onToggle;
+
+  const _AuditListSection({
+    required this.icon,
+    required this.title,
+    required this.audits,
+    this.onSeeAll,
+    this.expanded = true,
+    this.onToggle,
+  });
 
   @override
   Widget build(BuildContext context) {
     if (audits.isEmpty) return const SizedBox.shrink();
 
     final scheme = Theme.of(context).colorScheme;
+    final header = Row(
+      children: [
+        Icon(icon, size: 18, color: scheme.primary),
+        const SizedBox(width: 6),
+        // Expanded + a Flexible title (and no Spacer): at the larger Dynamic Type
+        // sizes title + count + "See all" no longer fit one line and this Row
+        // overflowed (yellow/black stripes, cut-off text).
+        Expanded(
+          child: Row(
+            children: [
+              Flexible(
+                child: Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                decoration: BoxDecoration(
+                  color: scheme.primaryContainer.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(999),
+                ),
+                child: Text(
+                  '${audits.length}',
+                  style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: scheme.onPrimaryContainer),
+                ),
+              ),
+              if (onToggle != null) ...[
+                const SizedBox(width: 4),
+                AnimatedRotation(
+                  turns: expanded ? 0.5 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  child: Icon(Icons.keyboard_arrow_down_rounded, size: 20, color: scheme.outline),
+                ),
+              ],
+            ],
+          ),
+        ),
+        if (onSeeAll != null)
+          TextButton(
+            onPressed: onSeeAll,
+            style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(48, 44), tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+            child: const Text('See all', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700)),
+          ),
+      ],
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Icon(icon, size: 18, color: scheme.primary),
-            const SizedBox(width: 6),
-            // Expanded + a Flexible title (and no Spacer): at the larger Dynamic Type
-            // sizes title + count + "See all" no longer fit one line and this Row
-            // overflowed (yellow/black stripes, cut-off text).
-            Expanded(
-              child: Row(
-                children: [
-                  Flexible(
-                    child: Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: scheme.primaryContainer.withValues(alpha: 0.5),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Text(
-                      '${audits.length}',
-                      style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w700, color: scheme.onPrimaryContainer),
-                    ),
-                  ),
-                ],
-              ),
+        if (onToggle == null)
+          header
+        else
+          Semantics(
+            button: true,
+            expanded: expanded,
+            child: InkWell(
+              onTap: onToggle,
+              borderRadius: BorderRadius.circular(8),
+              child: ConstrainedBox(constraints: const BoxConstraints(minHeight: 44), child: header),
             ),
-            if (onSeeAll != null)
-              TextButton(
-                onPressed: onSeeAll,
-                style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(48, 44), tapTargetSize: MaterialTapTargetSize.shrinkWrap),
-                child: const Text('See all', style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700)),
-              ),
-          ],
-        ),
-        const SizedBox(height: 10),
-        for (final audit in audits) ...[
-          RepaintBoundary(child: _AuditListCard(audit: audit)),
+          ),
+        if (expanded) ...[
           const SizedBox(height: 10),
+          for (final audit in audits) ...[
+            RepaintBoundary(child: _AuditListCard(audit: audit)),
+            const SizedBox(height: 10),
+          ],
         ],
+      ],
+    );
+  }
+}
+
+/// The dashboard's "What needs attention" body: Today's / In Progress /
+/// Overdue audits as an ACCORDION — opening one folds the other two, so only
+/// one list is ever expanded (tapping "Today's Audits" collapses In Progress
+/// and Overdue; tapping the open one closes it). Today's is open first, or the
+/// first non-empty list when nothing is scheduled today. The open list is held
+/// in this State, which lives as long as the (kept-alive) Dashboard tab, so
+/// coming Back from an audit finds the same list open.
+class AuditAttentionPanel extends StatefulWidget {
+  final List<AuditModel> audits;
+  final VoidCallback? onSeeAll;
+
+  const AuditAttentionPanel({super.key, required this.audits, this.onSeeAll});
+
+  @override
+  State<AuditAttentionPanel> createState() => _AuditAttentionPanelState();
+}
+
+class _AuditAttentionPanelState extends State<AuditAttentionPanel> {
+  // Null = "not chosen yet" (falls back to the first non-empty list); the
+  // empty string = the user closed everything.
+  String? _open;
+
+  void _toggle(String key) => setState(() => _open = _open == key ? '' : key);
+
+  @override
+  Widget build(BuildContext context) {
+    final today = _todaysAudits(widget.audits);
+    final inProgress = _inProgressAudits(widget.audits);
+    final overdue = _overdueAudits(widget.audits);
+    final open = _open ??
+        (today.isNotEmpty ? 'today' : inProgress.isNotEmpty ? 'progress' : 'overdue');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _AuditListSection(
+          icon: Icons.today_rounded,
+          title: "Today's Audits",
+          audits: today,
+          onSeeAll: widget.onSeeAll,
+          expanded: open == 'today',
+          onToggle: () => _toggle('today'),
+        ),
+        if (today.isNotEmpty) const SizedBox(height: 14),
+        _AuditListSection(
+          icon: Icons.autorenew_rounded,
+          title: 'In Progress Audits',
+          audits: inProgress,
+          onSeeAll: widget.onSeeAll,
+          expanded: open == 'progress',
+          onToggle: () => _toggle('progress'),
+        ),
+        if (inProgress.isNotEmpty) const SizedBox(height: 14),
+        _AuditListSection(
+          icon: Icons.report_problem_outlined,
+          title: 'Overdue Audits',
+          audits: overdue,
+          onSeeAll: widget.onSeeAll,
+          expanded: open == 'overdue',
+          onToggle: () => _toggle('overdue'),
+        ),
       ],
     );
   }

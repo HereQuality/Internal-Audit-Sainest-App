@@ -267,6 +267,7 @@ void main() {
         for (var i = 0; i < 3; i++) DioClient.instance.dio.get('/audits/$i').then((_) {}, onError: (_) {}),
       ]);
       await waitFor(() => auth.status == AuthStatus.unauthenticated);
+      await settle(30); // the screen leaves first; the teardown finishes behind it
 
       expect(adapter.where('DELETE', _register), hasLength(1));
       expect(adapter.where('DELETE', _register).single.headers['Authorization'], 'Bearer jwt-A');
@@ -283,6 +284,7 @@ void main() {
 
       await DioClient.instance.dio.get('/audits/mine').then((_) {}, onError: (_) {});
       await waitFor(() => auth.status == AuthStatus.unauthenticated);
+      await settle(30);
 
       expect(await SecureStorage.instance.readToken(), isNull);
       expect(adapter.where('DELETE', _register).single.headers['Authorization'], 'Bearer jwt-A');
@@ -404,7 +406,10 @@ void main() {
       parkTeardown();
       final leaving = auth.logout();
       await settle();
-      expect(auth.status, AuthStatus.offline, reason: 'the teardown must still be running');
+      // The screen has already left (Log out must not look frozen while the
+      // unregister is parked); the teardown itself is still running.
+      expect(auth.status, AuthStatus.unauthenticated);
+      expect(await SecureStorage.instance.readToken(), isNotNull, reason: 'the teardown must still be running');
 
       meGate.complete(); // GET /auth/me answers 200, mid-teardown
       await settle();

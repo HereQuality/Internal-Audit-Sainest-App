@@ -4,9 +4,18 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../core/theme/app_colors.dart';
+import '../core/utils/audit_status.dart';
 import '../models/employee_option.dart';
+import '../models/nc_model.dart' show kNcFlags;
+import '../providers/audit_filter_scope.dart';
+import '../providers/audits_provider.dart';
 import '../providers/auth_provider.dart';
+import '../providers/dashboard_provider.dart';
 import '../providers/filter_options_provider.dart';
+import '../providers/nc_provider.dart';
+import 'location_filter_sheet.dart';
+import 'picker_sheet.dart';
 
 // Only ever rendered as "September 2025" in the Month stepper — kept at
 // file scope (not rebuilt per frame inside build) because DateFormat
@@ -14,38 +23,56 @@ import '../providers/filter_options_provider.dart';
 // chevron tap. Not in Formatters because nothing else in the app shows a
 // bare month; Formatters.date stays the one date format everywhere else.
 final _monthLabel = DateFormat('MMMM yyyy');
+final _dayLabel = DateFormat('d MMM yyyy');
 
 /// widgets/filter_sheet.dart
 /// ───────────────────────────────────────
-/// The one filter surface for every audit-scoped screen (Dashboard,
-/// Audits, Calendar) — the phone's answer to the web app's row of
-/// TeamFilterPanel + LocationFilterSelect + audit-type select, folded into
-/// a single bottom sheet because there is no room on a 360px screen for
-/// three always-open pickers.
+/// The one filter surface for every audit/NC screen (Dashboard, Audits, NC,
+/// Calendar, Final Report) — the phone's answer to the web portal's filter
+/// bar: Team, Members, Location (+ Department, grouped Area / Zone / Sub
+/// Zone), Audit Type, Date range, Status (multi-select, with Include
+/// skipped) and, for NCs, Flag. Folded into a single bottom sheet because
+/// there is no room on a 360px screen for a row of always-open pickers; the
+/// long lists (teams, members, locations) open their own searchable pickers.
 ///
 /// Nothing here touches a provider's filter state. The sheet hands back
-/// what was picked and the CALLING screen applies it — to BOTH
-/// AuditsProvider and DashboardProvider, exactly as ScopeToggle already
-/// calls setTeamScope on both (see providers/audit_filter_scope.dart's own
-/// class doc for why the two hold separate copies). That keeps the sheet
-/// free of any "which providers exist on this screen" knowledge and makes
-/// Cancel genuinely free: dismissing without Apply has changed nothing.
+/// what was picked and the CALLING screen applies it with
+/// [applyAuditFilterSelection] — which pushes it to Audits, Dashboard AND
+/// NC providers so the state is shared across every screen, like the web's
+/// "filters follow you from page to page". That makes Cancel genuinely
+/// free: dismissing without Apply has changed nothing.
 class AuditFilterSelection {
-  /// The coarse Me/Team scope. Ignored server-side whenever [employees] is
-  /// non-empty — see the precedence note on AuditFilterScope.employeeFilter
-  /// — but still carried, so backing out of a specific-people pick lands
-  /// on whichever end of the toggle the user was last on.
+  /// "All Members" (true) vs "Me" (false). Ignored server-side whenever
+  /// [employees] or [teams] narrow the people — see AuditFilterScope.
   final bool isTeam;
 
-  /// Employee ids, empty for "no specific people".
+  /// Explicit Members picks (employee ids), empty for "no specific people".
   final List<String> employees;
 
-  /// Location ids, empty for "everywhere I can see".
+  /// Team ids, and everyone in those teams (resolved by the sheet from the
+  /// hierarchy directory — see AuditFilterScope.teamMemberIds).
+  final List<String> teams;
+  final List<String> teamMembers;
+
+  /// Location ids and department ids — one "where" facet (empty both = All).
   final List<String> locations;
+  final List<String> departments;
 
   /// Audit type NAMES, not ids — Audit.auditType stores the name and the
   /// server's `?auditType=` matches on it (models/audit_type_option.dart).
   final List<String> auditTypes;
+
+  /// Inclusive scheduled-date window; null = open end.
+  final DateTime? dateFrom;
+  final DateTime? dateTo;
+
+  /// Picked statuses (AuditStatus.pipeline) and the Include skipped switch —
+  /// only meaningful on an audit list.
+  final List<String> statuses;
+  final bool includeSkipped;
+
+  /// NC flag picks (only NC lists read them).
+  final List<String> flags;
 
   /// First-of-month, and non-null ONLY when the sheet was opened with a
   /// month (i.e. by the Calendar). Every other caller gets null and can
@@ -54,58 +81,155 @@ class AuditFilterSelection {
   final DateTime? month;
 
   const AuditFilterSelection({
-    required this.isTeam,
-    required this.employees,
-    required this.locations,
-    required this.auditTypes,
+    this.isTeam = false,
+    this.employees = const [],
+    this.teams = const [],
+    this.teamMembers = const [],
+    this.locations = const [],
+    this.departments = const [],
+    this.auditTypes = const [],
+    this.dateFrom,
+    this.dateTo,
+    this.statuses = const [],
+    this.includeSkipped = false,
+    this.flags = const [],
     this.month,
   });
+
+  /// The resting state: just me, everywhere, every type, any date.
+  static const cleared = AuditFilterSelection();
+
+  /// What a provider holds right now, as a selection.
+  factory AuditFilterSelection.fromScope(
+    AuditFilterScope scope, {
+    DateTime? month,
+  }) {
+    return AuditFilterSelection(
+      isTeam: scope.isTeamScope,
+      employees: scope.employeeFilter,
+      teams: scope.teamFilter,
+      teamMembers: scope.teamMemberIds,
+      locations: scope.locationFilter,
+      departments: scope.departmentFilter,
+      auditTypes: scope.auditTypeFilter,
+      dateFrom: scope.dateFrom,
+      dateTo: scope.dateTo,
+      statuses: scope.statusFilter,
+      includeSkipped: scope.includeSkipped,
+      flags: scope.flagFilter,
+      month: month,
+    );
+  }
+
+  AuditFilterSelection copyWith({
+    bool? isTeam,
+    List<String>? employees,
+    List<String>? teams,
+    List<String>? teamMembers,
+    List<String>? locations,
+    List<String>? departments,
+    List<String>? auditTypes,
+    (DateTime?, DateTime?)? dateRange,
+    List<String>? statuses,
+    bool? includeSkipped,
+    List<String>? flags,
+    DateTime? month,
+  }) {
+    return AuditFilterSelection(
+      isTeam: isTeam ?? this.isTeam,
+      employees: employees ?? this.employees,
+      teams: teams ?? this.teams,
+      teamMembers: teamMembers ?? this.teamMembers,
+      locations: locations ?? this.locations,
+      departments: departments ?? this.departments,
+      auditTypes: auditTypes ?? this.auditTypes,
+      dateFrom: dateRange != null ? dateRange.$1 : dateFrom,
+      dateTo: dateRange != null ? dateRange.$2 : dateTo,
+      statuses: statuses ?? this.statuses,
+      includeSkipped: includeSkipped ?? this.includeSkipped,
+      flags: flags ?? this.flags,
+      month: month ?? this.month,
+    );
+  }
 }
 
-/// Opens the filter sheet seeded with the caller's current filter state.
+/// Pushes [selection] into every filter-holding provider (Audits, Dashboard,
+/// NC) and refetches them — the filters are one shared state across the app,
+/// not per-screen, so a filter set on the Audits tab is the one the Dashboard
+/// tiles and the NC list are computed under too (the web keeps filters across
+/// pages the same way).
 ///
-/// Pass a non-null [month] to switch the Month section on; leave it null
-/// (Dashboard, Audits) and the section is not built at all and the result's
-/// `month` comes back null.
+/// Providers are read before the first await so there is no `context` use
+/// afterwards.
+Future<void> applyAuditFilterSelection(
+  BuildContext context,
+  AuditFilterSelection selection,
+) {
+  final providers = <AuditFilterScope>[
+    context.read<AuditsProvider>(),
+    context.read<DashboardProvider>(),
+    context.read<NcProvider>(),
+  ];
+  return Future.wait([
+    for (final p in providers)
+      p.applyFilters(
+        isTeam: selection.isTeam,
+        employees: selection.employees,
+        teams: selection.teams,
+        teamMembers: selection.teamMembers,
+        locations: selection.locations,
+        departments: selection.departments,
+        auditTypes: selection.auditTypes,
+        dateRange: (selection.dateFrom, selection.dateTo),
+        statuses: selection.statuses,
+        includeSkipped: selection.includeSkipped,
+        flags: selection.flags,
+      ),
+  ]);
+}
+
+/// Opens the filter sheet seeded with [initial].
+///
+/// Which sections show is per screen: [showStatus] (audit lists — Status +
+/// Include skipped), [showFlag] (NC lists), [showDateRange]. Pass a non-null
+/// `initial.month` to switch the Month section on (the Calendar); leave it
+/// null everywhere else.
 ///
 /// Returns null if dismissed without applying — back button, tap-outside
 /// and drag-to-close all land there, so a null result means "leave every
 /// filter exactly as it was", never "clear them".
 Future<AuditFilterSelection?> showAuditFilterSheet(
   BuildContext context, {
-  required bool isTeam,
-  required List<String> employees,
-  required List<String> locations,
-  required List<String> auditTypes,
-  DateTime? month,
+  required AuditFilterSelection initial,
+  bool showStatus = false,
+  bool showFlag = false,
+  bool showDateRange = true,
 }) {
   return showModalBottomSheet<AuditFilterSelection>(
     context: context,
     isScrollControlled: true,
+    useSafeArea: true,
     backgroundColor: Colors.transparent,
     builder: (_) => _AuditFilterSheet(
-      isTeam: isTeam,
-      employees: employees,
-      locations: locations,
-      auditTypes: auditTypes,
-      initialMonth: month,
+      initial: initial,
+      showStatus: showStatus,
+      showFlag: showFlag,
+      showDateRange: showDateRange,
     ),
   );
 }
 
 class _AuditFilterSheet extends StatefulWidget {
-  final bool isTeam;
-  final List<String> employees;
-  final List<String> locations;
-  final List<String> auditTypes;
-  final DateTime? initialMonth;
+  final AuditFilterSelection initial;
+  final bool showStatus;
+  final bool showFlag;
+  final bool showDateRange;
 
   const _AuditFilterSheet({
-    required this.isTeam,
-    required this.employees,
-    required this.locations,
-    required this.auditTypes,
-    this.initialMonth,
+    required this.initial,
+    required this.showStatus,
+    required this.showFlag,
+    required this.showDateRange,
   });
 
   @override
@@ -114,158 +238,218 @@ class _AuditFilterSheet extends StatefulWidget {
 
 class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   // The whole selection is local until Apply — the sheet is a draft of a
-  // filter, not a live control. Sets rather than Lists because every
-  // interaction here is a membership toggle; Dart's Set keeps insertion
-  // order, so `toList()` at Apply time is still stable.
-  late bool _isTeam;
-  late final Set<String> _employees;
-  late final Set<String> _locations;
-  late final Set<String> _auditTypes;
-  DateTime? _month;
+  // filter, not a live control.
+  late bool _isTeam = widget.initial.isTeam;
+  late List<String> _teams = [...widget.initial.teams];
+  late List<String> _members = [...widget.initial.employees];
+  late List<String> _locations = [...widget.initial.locations];
+  late List<String> _departments = [...widget.initial.departments];
+  late List<String> _auditTypes = [...widget.initial.auditTypes];
+  late DateTime? _from = widget.initial.dateFrom;
+  late DateTime? _to = widget.initial.dateTo;
+  late List<String> _statuses = [...widget.initial.statuses];
+  late bool _includeSkipped = widget.initial.includeSkipped;
+  late List<String> _flags = [...widget.initial.flags];
+  late DateTime? _month = _normaliseMonth(widget.initial.month);
 
-  final TextEditingController _searchController = TextEditingController();
-  String _personSearch = '';
-
-  // The per-person list is the secondary, opt-in half of the People
-  // section — collapsed unless the caller arrived with people already
-  // picked, in which case hiding the very thing that is narrowing their
-  // data would be actively misleading.
-  late bool _peopleExpanded;
-
-  // Used only to relabel the logged-in user's own row "Me" instead of
-  // their name, matching the web TeamFilterPanel.jsx's `isSelf ? "Me"`.
-  // The id is the same one main.dart's _RootGate feeds each provider as
-  // selfEmployeeId, so it lines up with the ids in the employee list.
+  // The Me/All Members ids are relabelled "Me" in the Members list, matching
+  // the web MemberFilterSelect's `isSelf ? "Me"`.
   String? _selfId;
 
-  bool get _showMonth => widget.initialMonth != null;
+  bool get _showMonth => widget.initial.month != null;
 
   @override
   void initState() {
     super.initState();
-    _isTeam = widget.isTeam;
-    _employees = {...widget.employees};
-    _locations = {...widget.locations};
-    _auditTypes = {...widget.auditTypes};
-    _month = _normaliseMonth(widget.initialMonth);
-    _peopleExpanded = _employees.isNotEmpty;
     _selfId = context.read<AuthProvider>().user?.id;
     // load() is idempotent and coalesces concurrent callers, so firing it
     // on every open is free — but it flips isLoading and notifies
     // synchronously, which during this first build would be a
-    // setState-during-build crash. Post-frame is the cheap fix; the
-    // sections render their own loading line for the one frame (or the
-    // one request) it takes.
+    // setState-during-build crash. Post-frame is the cheap fix.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
       context.read<FilterOptionsProvider>().load();
     });
   }
 
-  @override
-  void dispose() {
-    _searchController.dispose();
-    super.dispose();
-  }
+  static DateTime? _normaliseMonth(DateTime? value) =>
+      value == null ? null : DateTime(value.year, value.month, 1);
 
-  static DateTime? _normaliseMonth(DateTime? value) {
-    if (value == null) {
-      return null;
-    }
-    return DateTime(value.year, value.month, 1);
-  }
-
-  /// Back to the resting default — Me, everywhere, every type, this month
-  /// — WITHOUT closing the sheet, so "reset then pick two things" is one
-  /// continuous gesture instead of reset-apply-reopen. Nothing is pushed
-  /// to the providers until Apply, same as every other control here.
+  /// Back to the resting default WITHOUT closing the sheet, so "reset then
+  /// pick two things" is one continuous gesture. Nothing is pushed to the
+  /// providers until Apply.
   void _reset() {
     setState(() {
       _isTeam = false;
-      _employees.clear();
-      _locations.clear();
-      _auditTypes.clear();
-      _searchController.clear();
-      _personSearch = '';
+      _teams = [];
+      _members = [];
+      _locations = [];
+      _departments = [];
+      _auditTypes = [];
+      _from = null;
+      _to = null;
+      _statuses = [];
+      _includeSkipped = false;
+      _flags = [];
       final now = DateTime.now();
       _month = _showMonth ? DateTime(now.year, now.month, 1) : null;
     });
   }
 
-  /// Me / My team. Both CLEAR the specific-people pick: the two controls
-  /// are one decision ("who am I looking at"), and leaving a stale person
-  /// list behind would mean tapping "Me" visibly selected the chip while
-  /// the query kept returning someone else's audits — the precedence rule
-  /// on AuditFilterScope.employeeFilter says the list wins.
+  int get _draftCount =>
+      (_teams.isNotEmpty ? 1 : 0) +
+      (_members.isNotEmpty || (_teams.isEmpty && _isTeam) ? 1 : 0) +
+      (_locations.isNotEmpty || _departments.isNotEmpty ? 1 : 0) +
+      (_auditTypes.isNotEmpty ? 1 : 0) +
+      (widget.showDateRange && (_from != null || _to != null) ? 1 : 0) +
+      (widget.showStatus && _statuses.isNotEmpty ? 1 : 0) +
+      (widget.showStatus && _includeSkipped ? 1 : 0) +
+      (widget.showFlag && _flags.isNotEmpty ? 1 : 0);
+
+  /// Me / All Members. Both CLEAR the Team and Members picks: the controls
+  /// are one decision ("who am I looking at"), and leaving a stale list
+  /// behind would mean tapping "Me" visibly selected the chip while the
+  /// query kept returning someone else's audits — a specific pick wins.
   void _pickScope(bool isTeam) {
     setState(() {
       _isTeam = isTeam;
-      _employees.clear();
+      _teams = [];
+      _members = [];
     });
   }
 
-  void _togglePerson(String id, bool checked) {
+  Future<void> _pickTeams(FilterOptionsProvider options) async {
+    final picked = await showMultiPickerSheet<String>(
+      context,
+      title: 'Team',
+      subtitle: 'Everyone in the picked teams.',
+      searchHint: 'Search teams',
+      selected: _teams,
+      confirmLabel: 'Apply teams',
+      items: [
+        for (final t in options.teams)
+          PickerItem(
+            value: t.id,
+            label: t.name,
+            sublabel: '${t.count} ${t.count == 1 ? 'person' : 'people'}',
+          ),
+      ],
+    );
+    if (picked == null || !mounted) return;
     setState(() {
-      if (checked) {
-        _employees.add(id);
-      } else {
-        _employees.remove(id);
+      _teams = picked;
+      // Members cascades from Team: keep only people still inside the teams;
+      // if none remain the new team simply means "all of it".
+      if (picked.isNotEmpty && _members.isNotEmpty) {
+        final inTeams = options.membersOfTeams(picked).map((e) => e.id).toSet();
+        _members = _members.where(inTeams.contains).toList();
       }
     });
   }
 
-  void _toggleLocation(FilterOptionsProvider options, String id, bool checked) {
+  List<EmployeeOption> _memberPool(FilterOptionsProvider options) {
+    final pool = [...options.membersOfTeams(_teams)];
+    // 'Me' first, then active people by name, then the deactivated ones.
+    pool.sort((a, b) {
+      if (a.id == _selfId) return -1;
+      if (b.id == _selfId) return 1;
+      if (a.isActive != b.isActive) return a.isActive ? -1 : 1;
+      return a.name.toLowerCase().compareTo(b.name.toLowerCase());
+    });
+    return pool;
+  }
+
+  Future<void> _pickMembers(FilterOptionsProvider options) async {
+    final pool = _memberPool(options);
+    final picked = await showMultiPickerSheet<String>(
+      context,
+      title: 'Members',
+      searchHint: 'Search members',
+      selected: _members,
+      confirmLabel: 'Apply members',
+      items: [
+        for (final e in pool)
+          PickerItem(
+            value: e.id,
+            label: e.id == _selfId
+                ? 'Me'
+                : (e.isActive ? e.name : '${e.name} (inactive)'),
+            sublabel: e.teams.isEmpty
+                ? null
+                : e.teams.map((t) => t.name).join(', '),
+          ),
+      ],
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _members = picked);
+  }
+
+  Future<void> _pickWhere(FilterOptionsProvider options) async {
+    final result = await showLocationFilterSheet(
+      context,
+      locations: options.locations,
+      departments: options.departments,
+      departmentsByLocation: options.departmentsByLocation,
+      selectedLocations: _locations,
+      selectedDepartments: _departments,
+      loading: options.isLoading,
+      failed: options.locationsFailed,
+      fullAccess: options.fullAccess,
+    );
+    if (result == null || !mounted) return;
     setState(() {
-      if (checked) {
-        _locations.add(id);
-      } else {
-        _locations.remove(id);
-      }
-      _reconcilePeople(options);
+      _locations = result.locations;
+      _departments = result.departments;
     });
   }
 
-  /// Drops any picked person who is no longer offered under the current
-  /// location selection. Without this, narrowing to a location the person
-  /// isn't at leaves their id in `employeeFilter` with no row on screen
-  /// showing it — an invisible filter that keeps silently narrowing every
-  /// list and stat, and that the user has no control left to undo.
-  ///
-  /// Deliberately a no-op while the option list is still empty: employeesAt
-  /// on an empty roster returns an empty list for ANY location set, so
-  /// reconciling before the fetch lands would read as "none of these people
-  /// exist" and wipe the very selection the caller passed in.
-  void _reconcilePeople(FilterOptionsProvider options) {
-    if (_employees.isEmpty || options.employees.isEmpty) {
-      return;
-    }
-    final visible = options
-        .employeesAt(_locations.toList())
-        .map((e) => e.id)
-        .toSet();
-    _employees.removeWhere((id) => !visible.contains(id));
+  Future<void> _pickDate({required bool from}) async {
+    final now = DateTime.now();
+    final initial = (from ? _from : _to) ?? now;
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(now.year + 5, 12, 31),
+      helpText: from ? 'From date' : 'To date',
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      if (from) {
+        _from = picked;
+        if (_to != null && _to!.isBefore(picked)) _to = picked;
+      } else {
+        _to = picked;
+        if (_from != null && _from!.isAfter(picked)) _from = picked;
+      }
+    });
   }
 
-  void _toggleAuditType(String name, bool checked) {
+  void _datePreset(String which) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
     setState(() {
-      if (checked) {
-        _auditTypes.add(name);
-      } else {
-        _auditTypes.remove(name);
+      switch (which) {
+        case 'month':
+          _from = DateTime(now.year, now.month, 1);
+          _to = DateTime(now.year, now.month + 1, 0);
+        case 'last-month':
+          _from = DateTime(now.year, now.month - 1, 1);
+          _to = DateTime(now.year, now.month, 0);
+        case '30':
+          _from = today.subtract(const Duration(days: 29));
+          _to = today;
+        case 'year':
+          _from = DateTime(now.year, 1, 1);
+          _to = DateTime(now.year, 12, 31);
       }
     });
   }
 
   void _stepMonth(int delta) {
     final current = _month;
-    if (current == null) {
-      return;
-    }
-    // DateTime normalises an out-of-range month itself — month 13 rolls
-    // into next January, month 0 into last December — so stepping needs no
-    // year carry of its own.
+    if (current == null) return;
+    // DateTime normalises an out-of-range month itself.
     setState(() => _month = DateTime(current.year, current.month + delta, 1));
   }
 
@@ -275,12 +459,31 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   }
 
   void _apply() {
+    final options = context.read<FilterOptionsProvider>();
+    // Team → people, resolved here from the directory the sheet already
+    // holds; a team the directory can't resolve (not loaded) keeps the
+    // previous resolution so an unrelated Apply never wipes it.
+    final teamMembers = _teams.isEmpty
+        ? const <String>[]
+        : (options.employees.isEmpty
+              ? widget.initial.teamMembers
+              : options.membersOfTeams(_teams).map((e) => e.id).toList());
     Navigator.of(context).pop(
       AuditFilterSelection(
         isTeam: _isTeam,
-        employees: _employees.toList(),
-        locations: _locations.toList(),
-        auditTypes: _auditTypes.toList(),
+        employees: _members,
+        teams: _teams,
+        teamMembers: teamMembers,
+        locations: _locations,
+        departments: _departments,
+        auditTypes: _auditTypes,
+        dateFrom: widget.showDateRange ? _from : widget.initial.dateFrom,
+        dateTo: widget.showDateRange ? _to : widget.initial.dateTo,
+        statuses: widget.showStatus ? _statuses : widget.initial.statuses,
+        includeSkipped: widget.showStatus
+            ? _includeSkipped
+            : widget.initial.includeSkipped,
+        flags: widget.showFlag ? _flags : widget.initial.flags,
         // Null whenever the section wasn't shown — a caller that never
         // offered a month must not be handed one it would then have to
         // know to ignore.
@@ -296,36 +499,31 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     final media = MediaQuery.of(context);
 
     // Height-bounded and internally scrollable, so the Apply button is
-    // pinned and can never end up below the fold — the people list alone
-    // can be dozens of rows on a manager's account. Capped at 85% of the
-    // screen, but never taller than what's actually left once the keyboard
-    // (the people search) and the status bar have taken their share;
-    // taking the smaller of the two is what stops the sheet overflowing
-    // while the search field is focused.
+    // pinned and can never end up below the fold. Never taller than what's
+    // actually left once the keyboard and the status bar have taken their
+    // share.
     final maxSheetHeight = math.min(
-      media.size.height * 0.85,
-      media.size.height - media.viewInsets.bottom - media.padding.top,
+      media.size.height * 0.9,
+      media.size.height - media.viewInsets.bottom - media.padding.top - 8,
     );
 
     return Padding(
       padding: EdgeInsets.only(bottom: media.viewInsets.bottom),
-      // A Material, not a decorated Container: the location checkboxes and the
-      // people rows below are ListTiles, which paint their ink on the nearest
-      // Material — under a coloured Container that ink (and Flutter's
-      // "ListTile background color or ink splashes may be invisible"
-      // assertion) is lost.
+      // A Material, not a decorated Container: the rows below paint ink on
+      // the nearest Material — under a coloured Container that ink is lost.
       child: Material(
         color: scheme.surface,
         shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
         ),
+        clipBehavior: Clip.antiAlias,
         child: ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: maxSheetHeight),
+          constraints: BoxConstraints(maxHeight: math.max(maxSheetHeight, 260)),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
               Center(
                 child: Container(
                   width: 40,
@@ -337,23 +535,38 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
                 ),
               ),
               _buildHeader(context),
-              // Flexible, not Expanded: a sheet with three short sections
-              // should wrap its content instead of stretching to 85% of
-              // the screen with a band of empty surface above the footer.
               Flexible(
                 child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                  keyboardDismissBehavior:
+                      ScrollViewKeyboardDismissBehavior.onDrag,
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      if (options.anyFailed && !options.isLoading)
+                        _RetryBanner(
+                          onRetry: () => options.load(force: true),
+                        ),
                       _buildPeopleSection(context, options),
-                      const Divider(height: 28),
-                      _buildLocationSection(context, options),
-                      const Divider(height: 28),
+                      const _SectionGap(),
+                      _buildWhereSection(context, options),
+                      const _SectionGap(),
                       _buildAuditTypeSection(context, options),
+                      if (widget.showDateRange) ...[
+                        const _SectionGap(),
+                        _buildDateSection(context),
+                      ],
+                      if (widget.showStatus) ...[
+                        const _SectionGap(),
+                        _buildStatusSection(context),
+                      ],
+                      if (widget.showFlag) ...[
+                        const _SectionGap(),
+                        _buildFlagSection(context),
+                      ],
                       if (_showMonth) ...[
-                        const Divider(height: 28),
+                        const _SectionGap(),
                         _buildMonthSection(context),
                       ],
                     ],
@@ -369,63 +582,86 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   }
 
   Widget _buildHeader(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 8, 4),
+      padding: const EdgeInsets.fromLTRB(20, 12, 8, 4),
       child: Row(
         children: [
-          Expanded(
-            child: Text(
-              'Filters',
-              style: Theme.of(
-                context,
-              ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-            ),
+          Text(
+            'Filters',
+            style: Theme.of(
+              context,
+            ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
           ),
-          TextButton(onPressed: _reset, child: const Text('Reset')),
+          if (_draftCount > 0) ...[
+            const SizedBox(width: 8),
+            _CountPill(count: _draftCount),
+          ],
+          const Spacer(),
+          TextButton(
+            onPressed: _draftCount == 0 && !_showMonth ? null : _reset,
+            style: TextButton.styleFrom(foregroundColor: scheme.primary),
+            child: const Text('Clear all'),
+          ),
         ],
       ),
     );
   }
 
-  // ── People ────────────────────────────────────────────────────────────
+  // ── People: Me / All Members, Team, Members ───────────────────────────
   Widget _buildPeopleSection(
     BuildContext context,
     FilterOptionsProvider options,
   ) {
     final scheme = Theme.of(context).colorScheme;
-    // A specific-people pick outranks the coarse toggle, so while one is
-    // active NEITHER chip may read as selected — showing "Me" highlighted
-    // next to a list that is actually returning three other people is the
-    // exact confusion the caption below spells out.
-    final specific = _employees.isNotEmpty;
-    // Live-narrowed by whatever locations are ticked in THIS sheet right
-    // now (not by what the providers currently hold) — ticking a location
-    // in the section below shortens this list on the same frame.
-    final pickable = options.employeesAt(_locations.toList());
-    final query = _personSearch.trim().toLowerCase();
+    final specific = _members.isNotEmpty || _teams.isNotEmpty;
+    final loading = options.isLoading && options.employees.isEmpty;
+
+    String teamSummary() {
+      if (_teams.isEmpty) return 'All teams';
+      if (_teams.length == 1) {
+        for (final t in options.teams) {
+          if (t.id == _teams.first) return t.name;
+        }
+        return '1 team';
+      }
+      return '${_teams.length} teams';
+    }
+
+    String memberSummary() {
+      if (_members.isEmpty) {
+        return _teams.isEmpty ? 'Choose specific people' : 'Everyone in the team';
+      }
+      if (_members.length == 1) {
+        if (_members.first == _selfId) return 'Only me';
+        for (final e in options.employees) {
+          if (e.id == _members.first) return e.name;
+        }
+        return '1 member';
+      }
+      return '${_members.length} members';
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const _SectionTitle('People'),
+        const _SectionTitle('Who'),
         const SizedBox(height: 8),
-        // Wrap, not Row: "My team" plus a translated/longer label must be
-        // free to fall onto a second line rather than overflow at 360px.
-        // These keep Material's default (padded) tap target instead of the
-        // shrinkWrap StatusFilterChipRow uses — that row is inside a fixed
-        // 44px band, these sit in an open column where the full 48px
-        // target is the accessible option.
+        // Wrap, not Row: a longer/translated label must be free to fall onto
+        // a second line rather than overflow at 360px.
         Wrap(
           spacing: 8,
           runSpacing: 8,
           children: [
             ChoiceChip(
+              avatar: const Icon(Icons.person_outline, size: 16),
               label: const Text('Me'),
               selected: !specific && !_isTeam,
               onSelected: (_) => _pickScope(false),
             ),
             ChoiceChip(
-              label: const Text('My team'),
+              avatar: const Icon(Icons.groups_outlined, size: 16),
+              label: const Text('All Members'),
               selected: !specific && _isTeam,
               onSelected: (_) => _pickScope(true),
             ),
@@ -434,186 +670,86 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
         if (specific) ...[
           const SizedBox(height: 6),
           Text(
-            'Showing the people picked below — tap Me or My team to go back.',
+            'Showing the team / people picked below — tap Me or All Members to go back.',
             style: Theme.of(
               context,
             ).textTheme.bodySmall?.copyWith(color: scheme.outline),
           ),
         ],
-        const SizedBox(height: 4),
-        // Hand-rolled rather than ExpandableSection: that widget hides
-        // itself entirely at count 0 (by design, for the dashboard's
-        // "Overdue (0)" panels), which here would mean the disclosure
-        // disappears in precisely the state you need it — nobody picked
-        // yet and you want to pick someone.
-        InkWell(
-          onTap: () => setState(() => _peopleExpanded = !_peopleExpanded),
-          borderRadius: BorderRadius.circular(10),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.person_search_outlined,
-                  size: 18,
-                  color: scheme.primary,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'Choose specific people',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-                if (specific) ...[
-                  _CountPill(count: _employees.length),
-                  const SizedBox(width: 6),
-                ],
-                AnimatedRotation(
-                  turns: _peopleExpanded ? 0.5 : 0,
-                  duration: const Duration(milliseconds: 180),
-                  child: Icon(
-                    Icons.keyboard_arrow_down_rounded,
-                    size: 20,
-                    color: scheme.outline,
-                  ),
-                ),
-              ],
-            ),
-          ),
+        const SizedBox(height: 10),
+        _PickTile(
+          icon: Icons.diversity_3_outlined,
+          title: 'Team',
+          summary: loading ? 'Loading…' : teamSummary(),
+          active: _teams.isNotEmpty,
+          onTap: loading || options.teams.isEmpty
+              ? (loading ? null : () => options.load(force: true))
+              : () => _pickTeams(options),
+          disabledHint: !loading && options.teams.isEmpty
+              ? 'No teams available — tap to retry'
+              : null,
         ),
-        if (_peopleExpanded) ...[
-          TextField(
-            controller: _searchController,
-            textInputAction: TextInputAction.search,
-            onChanged: (v) => setState(() => _personSearch = v),
-            decoration: InputDecoration(
-              isDense: true,
-              hintText: 'Search people',
-              prefixIcon: const Icon(Icons.search, size: 18),
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 12,
-              ),
-            ),
-          ),
-          const SizedBox(height: 4),
-          if (options.isLoading && options.employees.isEmpty)
-            const _LoadingLine('Loading people…')
-          else
-            _buildPeopleList(context, pickable, query),
-        ],
+        const SizedBox(height: 8),
+        _PickTile(
+          icon: Icons.person_search_outlined,
+          title: 'Members',
+          summary: loading ? 'Loading…' : memberSummary(),
+          active: _members.isNotEmpty,
+          onTap: loading || options.employees.isEmpty
+              ? (loading ? null : () => options.load(force: true))
+              : () => _pickMembers(options),
+          disabledHint: !loading && options.employees.isEmpty
+              ? 'No people available — tap to retry'
+              : null,
+        ),
       ],
     );
   }
 
-  Widget _buildPeopleList(
-    BuildContext context,
-    List<EmployeeOption> pickable,
-    String query,
-  ) {
-    // Matched against the displayed LABEL as well as the stored name: the
-    // self row reads "Me", so typing "me" has to find yourself rather than
-    // every colleague with those two letters in their name and not you.
-    final matches = pickable.where((e) {
-      if (query.isEmpty) {
-        return true;
-      }
-      final name = e.name.toLowerCase();
-      return name.contains(query) || (e.id == _selfId && 'me'.contains(query));
-    }).toList();
-
-    if (matches.isEmpty) {
-      return _MutedLine(
-        pickable.isEmpty
-            ? 'No people available to filter by.'
-            : 'No one matches that search.',
-      );
-    }
-    return ConstrainedBox(
-      // Capped and scrollable: a hierarchy can run to dozens of people and
-      // this is only the second of four sections — an uncapped list would
-      // push Location and Audit Type out of sight behind a long scroll.
-      constraints: const BoxConstraints(maxHeight: 220),
-      child: ListView.builder(
-        shrinkWrap: true,
-        padding: EdgeInsets.zero,
-        itemCount: matches.length,
-        itemBuilder: (_, i) {
-          final person = matches[i];
-          final isSelf = person.id == _selfId;
-          return CheckboxListTile(
-            value: _employees.contains(person.id),
-            onChanged: (v) => _togglePerson(person.id, v ?? false),
-            title: Text(
-              isSelf ? 'Me' : person.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            controlAffinity: ListTileControlAffinity.leading,
-            contentPadding: EdgeInsets.zero,
-            // Left non-dense on purpose: ListTile's standard 56px row is
-            // comfortably over the 44px minimum tap target, and the extra
-            // pixels are worth it in a list people tick several rows of in
-            // one pass.
-            visualDensity: VisualDensity.standard,
-          );
-        },
-      ),
-    );
-  }
-
-  // ── Location ──────────────────────────────────────────────────────────
-  Widget _buildLocationSection(
+  // ── Where: Location + Department ─────────────────────────────────────
+  Widget _buildWhereSection(
     BuildContext context,
     FilterOptionsProvider options,
   ) {
-    // No search box here on purpose: this list is only the locations THIS
-    // user is scoped to (GET /locations/my-scope), typically a handful,
-    // and a second search field in the same sheet costs more attention
-    // than it saves. The people list gets one because a hierarchy is the
-    // list that actually gets long.
+    String summary() {
+      final picked = _locations.length + _departments.length;
+      if (picked == 0) return 'All locations';
+      if (picked == 1) {
+        if (_locations.length == 1) {
+          for (final l in options.locations) {
+            if (l.id == _locations.first) return l.name;
+          }
+          return '1 location';
+        }
+        for (final d in options.departments) {
+          if (d.id == _departments.first) return d.name;
+        }
+        return '1 department';
+      }
+      return [
+        if (_locations.isNotEmpty)
+          '${_locations.length} location${_locations.length == 1 ? '' : 's'}',
+        if (_departments.isNotEmpty)
+          '${_departments.length} dept${_departments.length == 1 ? '' : 's'}',
+      ].join(', ');
+    }
+
+    final loading =
+        options.isLoading &&
+        options.locations.isEmpty &&
+        options.departments.isEmpty;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const _SectionTitle('Location'),
-        const SizedBox(height: 4),
-        if (options.isLoading && options.locations.isEmpty)
-          const _LoadingLine('Loading locations…')
-        else if (options.locations.isEmpty)
-          const _MutedLine('No locations available to filter by.')
-        else
-          ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 200),
-            child: ListView.builder(
-              shrinkWrap: true,
-              padding: EdgeInsets.zero,
-              itemCount: options.locations.length,
-              itemBuilder: (_, i) {
-                final loc = options.locations[i];
-                return CheckboxListTile(
-                  value: _locations.contains(loc.id),
-                  onChanged: (v) =>
-                      _toggleLocation(options, loc.id, v ?? false),
-                  // `display` already folds the code into the name
-                  // ("Plant A (PA-01)") — one ellipsised line instead of a
-                  // name/code Row that would overflow at 360px.
-                  title: Text(
-                    loc.display,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  controlAffinity: ListTileControlAffinity.leading,
-                  contentPadding: EdgeInsets.zero,
-                  visualDensity: VisualDensity.standard,
-                );
-              },
-            ),
-          ),
+        const _SectionTitle('Where'),
+        const SizedBox(height: 8),
+        _PickTile(
+          icon: Icons.place_outlined,
+          title: 'Location & Department',
+          summary: loading ? 'Loading…' : summary(),
+          active: _locations.isNotEmpty || _departments.isNotEmpty,
+          onTap: loading ? null : () => _pickWhere(options),
+        ),
       ],
     );
   }
@@ -626,15 +762,11 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     // Selection travels by NAME (the server matches Audit.auditType, a
     // plain string), so two types configured with the same name are one
     // and the same filter — deduped here rather than rendering two chips
-    // that mysteriously toggle together. The source list is already
-    // activeOnly (ApiConstants.auditTypes), so a retired type stops being
-    // offered without anything here having to know about it.
+    // that mysteriously toggle together.
     final names = <String>[];
     final seen = <String>{};
     for (final type in options.auditTypes) {
-      if (type.name.isNotEmpty && seen.add(type.name)) {
-        names.add(type.name);
-      }
+      if (type.name.isNotEmpty && seen.add(type.name)) names.add(type.name);
     }
 
     return Column(
@@ -645,7 +777,11 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
         if (options.isLoading && options.auditTypes.isEmpty)
           const _LoadingLine('Loading audit types…')
         else if (names.isEmpty)
-          const _MutedLine('No audit types available to filter by.')
+          _MutedLine(
+            options.auditTypesFailed
+                ? "Couldn't load audit types."
+                : 'No audit types available to filter by.',
+          )
         else
           Wrap(
             spacing: 8,
@@ -653,13 +789,13 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
             children: [
               for (final name in names)
                 FilterChip(
-                  label: Text(
-                    name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  label: Text(name),
                   selected: _auditTypes.contains(name),
-                  onSelected: (v) => _toggleAuditType(name, v),
+                  onSelected: (v) => setState(() {
+                    _auditTypes = v
+                        ? [..._auditTypes, name]
+                        : _auditTypes.where((n) => n != name).toList();
+                  }),
                 ),
             ],
           ),
@@ -667,12 +803,145 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     );
   }
 
+  // ── Date range ────────────────────────────────────────────────────────
+  Widget _buildDateSection(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Expanded(child: _SectionTitle('Date range')),
+            if (_from != null || _to != null)
+              TextButton(
+                onPressed: () => setState(() {
+                  _from = null;
+                  _to = null;
+                }),
+                child: const Text('Clear'),
+              ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Expanded(
+              child: _DateField(
+                label: 'From',
+                value: _from,
+                onTap: () => _pickDate(from: true),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _DateField(
+                label: 'To',
+                value: _to,
+                onTap: () => _pickDate(from: false),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [
+            for (final (id, label) in const [
+              ('month', 'This month'),
+              ('last-month', 'Last month'),
+              ('30', 'Last 30 days'),
+              ('year', 'This year'),
+            ])
+              ActionChip(
+                label: Text(label),
+                side: BorderSide(color: scheme.outlineVariant),
+                onPressed: () => _datePreset(id),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  // ── Status (audit lists) ──────────────────────────────────────────────
+  Widget _buildStatusSection(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionTitle('Status'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final status in AuditStatus.pipeline)
+              FilterChip(
+                avatar: Container(
+                  width: 9,
+                  height: 9,
+                  decoration: BoxDecoration(
+                    // readable(): the raw status tokens are dark by design
+                    // (badge text on a light tint) and sink into dark mode.
+                    color: AppColors.readable(
+                      context,
+                      AppColors.forAuditStatus(status),
+                    ),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                label: Text(status),
+                selected: _statuses.contains(status),
+                onSelected: (v) => setState(() {
+                  _statuses = v
+                      ? [..._statuses, status]
+                      : _statuses.where((s) => s != status).toList();
+                }),
+              ),
+          ],
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: const Text('Include skipped / reassigned audits'),
+          value: _includeSkipped,
+          onChanged: (v) => setState(() => _includeSkipped = v),
+        ),
+      ],
+    );
+  }
+
+  // ── Flag (NC lists) ───────────────────────────────────────────────────
+  Widget _buildFlagSection(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const _SectionTitle('Flag'),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final flag in kNcFlags)
+              FilterChip(
+                label: Text(flag),
+                selected: _flags.contains(flag),
+                onSelected: (v) => setState(() {
+                  _flags = v
+                      ? [..._flags, flag]
+                      : _flags.where((f) => f != flag).toList();
+                }),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+
   // ── Month (Calendar only) ─────────────────────────────────────────────
   Widget _buildMonthSection(BuildContext context) {
     final month = _month;
-    if (month == null) {
-      return const SizedBox.shrink();
-    }
+    if (month == null) return const SizedBox.shrink();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -718,9 +987,8 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   Widget _buildFooter(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     // Outside the scroll view entirely — the one thing in this sheet that
-    // must never need a scroll to reach. The hairline is what reads it as
-    // a pinned bar once the body scrolls under it.
-    return Container(
+    // must never need a scroll to reach.
+    return DecoratedBox(
       decoration: BoxDecoration(
         border: Border(
           top: BorderSide(color: scheme.outlineVariant.withValues(alpha: 0.5)),
@@ -729,12 +997,152 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          child: ElevatedButton(onPressed: _apply, child: const Text('Apply')),
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+          child: FilledButton(
+            onPressed: _apply,
+            child: Text(_draftCount == 0 ? 'Apply' : 'Apply ($_draftCount)'),
+          ),
         ),
       ),
     );
   }
+}
+
+/// A tappable summary row that opens one of the searchable pickers: icon,
+/// title, the current pick as a muted line, chevron. Tinted while a pick is
+/// active so it is clear at a glance which filters are on.
+class _PickTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String summary;
+  final bool active;
+  final VoidCallback? onTap;
+  final String? disabledHint;
+
+  const _PickTile({
+    required this.icon,
+    required this.title,
+    required this.summary,
+    required this.active,
+    required this.onTap,
+    this.disabledHint,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: active
+          ? scheme.primaryContainer.withValues(alpha: 0.4)
+          : scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 56),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          child: Row(
+            children: [
+              Icon(icon, size: 20, color: active ? scheme.primary : scheme.outline),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                        color: scheme.outline,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    Text(
+                      disabledHint ?? summary,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, color: scheme.outline),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DateField extends StatelessWidget {
+  final String label;
+  final DateTime? value;
+  final VoidCallback onTap;
+
+  const _DateField({
+    required this.label,
+    required this.value,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: InputDecorator(
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          prefixIcon: const Icon(Icons.event_outlined, size: 18),
+        ),
+        isEmpty: value == null,
+        child: Text(
+          value == null ? 'Any' : _dayLabel.format(value!),
+          style: TextStyle(color: value == null ? scheme.outline : null),
+        ),
+      ),
+    );
+  }
+}
+
+class _RetryBanner extends StatelessWidget {
+  final VoidCallback onRetry;
+
+  const _RetryBanner({required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              "Some filter options couldn't load.",
+              style: TextStyle(color: scheme.onErrorContainer, fontSize: 13),
+            ),
+          ),
+          TextButton(onPressed: onRetry, child: const Text('Retry')),
+        ],
+      ),
+    );
+  }
+}
+
+class _SectionGap extends StatelessWidget {
+  const _SectionGap();
+
+  @override
+  Widget build(BuildContext context) => const SizedBox(height: 22);
 }
 
 /// The trigger that opens [showAuditFilterSheet] — sized to sit in a

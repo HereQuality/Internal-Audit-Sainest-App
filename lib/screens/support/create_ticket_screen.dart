@@ -36,14 +36,15 @@ class _CreateTicketScreenState extends State<CreateTicketScreen> {
       return;
     }
     final picked = await ImagePicker().pickMultiImage(imageQuality: 80);
-    if (picked.isEmpty) return;
+    if (picked.isEmpty || !mounted) return;
     setState(() {
       _attachments.addAll(picked.map((x) => File(x.path)).take(5 - _attachments.length));
     });
   }
 
   Future<void> _submit() async {
-    if (!_formKey.currentState!.validate()) return;
+    // A second tap while the first is on the wire would raise the ticket twice.
+    if (_isSubmitting || !_formKey.currentState!.validate()) return;
     setState(() => _isSubmitting = true);
     final error = await context.read<TicketsProvider>().createTicket(
           subject: _subjectController.text.trim(),

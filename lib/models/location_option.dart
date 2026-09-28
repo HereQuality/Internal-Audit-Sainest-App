@@ -8,8 +8,19 @@ class LocationOption {
   final String name;
   final String? code;
   final String locationType; // "Area" | "Zone" | "SubZone"
+  // A Sub Zone's parent Zone (id + name), as GET /locations/my-scope sends
+  // them — lets the filter group Sub Zones under their Zone. Null for the rest.
+  final String? parentZoneId;
+  final String? parentZoneName;
 
-  const LocationOption({required this.id, required this.name, this.code, required this.locationType});
+  const LocationOption({
+    required this.id,
+    required this.name,
+    this.code,
+    required this.locationType,
+    this.parentZoneId,
+    this.parentZoneName,
+  });
 
   String get display => (code != null && code!.isNotEmpty) ? '$name ($code)' : name;
 
@@ -19,6 +30,16 @@ class LocationOption {
       name: json['name']?.toString() ?? 'Location',
       code: json['code']?.toString(),
       locationType: json['locationType']?.toString() ?? 'Area',
+      parentZoneId: _refId(json['parentZoneId']),
+      parentZoneName: json['parentZoneName']?.toString() ??
+          (json['parentZoneId'] is Map ? (json['parentZoneId'] as Map)['name']?.toString() : null),
     );
   }
+}
+
+// The server may send a parent as a bare id or populated — accept either.
+String? _refId(Object? ref) {
+  final v = ref is Map ? ref['_id'] : ref;
+  final s = v?.toString();
+  return s == null || s.isEmpty ? null : s;
 }

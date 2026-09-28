@@ -157,6 +157,12 @@ class FcmService {
   // being POSTed once per login (this used to be attached inside
   // registerToken, so every login added another subscription).
   static StreamSubscription<String>? _tokenRefreshSubscription;
+  // The other two listeners, kept so a second run of the core (a hot restart
+  // re-runs main() in the same process; an init that half-failed and is tried
+  // again) replaces them instead of stacking — every foreground push would
+  // otherwise be handled, and its banner claimed, once per subscription.
+  static StreamSubscription<RemoteMessage>? _onMessageSubscription;
+  static StreamSubscription<RemoteMessage>? _onOpenedSubscription;
   // True once the current token has been accepted by the server for the
   // signed-in account; cleared on unregister. Its persisted, cross-isolate
   // counterpart (which the polls and the iOS socket path actually read) is
@@ -240,6 +246,10 @@ class FcmService {
     _initRun = null;
     initCore = _initCore;
     getInitialMessage = () => FirebaseMessaging.instance.getInitialMessage();
+    _onMessageSubscription?.cancel();
+    _onMessageSubscription = null;
+    _onOpenedSubscription?.cancel();
+    _onOpenedSubscription = null;
     _tokenRegistered = false;
     _serverCanSend = true;
     _serverProblem = null;
@@ -359,8 +369,10 @@ class FcmService {
   static Future<void> _initCore() async {
     try {
       await Firebase.initializeApp();
-      FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
-      FirebaseMessaging.onMessageOpenedApp.listen(_handleOpenedAppMessage);
+      await _onMessageSubscription?.cancel();
+      await _onOpenedSubscription?.cancel();
+      _onMessageSubscription = FirebaseMessaging.onMessage.listen(_handleForegroundMessage);
+      _onOpenedSubscription = FirebaseMessaging.onMessageOpenedApp.listen(_handleOpenedAppMessage);
       // Must be a top-level function reference, not a closure/method —
       // the plugin passes it to a background isolate by reference, which
       // can't capture instance/closure state. See its own doc comment, and

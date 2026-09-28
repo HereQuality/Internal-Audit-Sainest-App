@@ -85,25 +85,35 @@ class _TicketDetailScreenState extends State<TicketDetailScreen> {
       return;
     }
     final picked = await ImagePicker().pickMultiImage(imageQuality: 80);
-    if (picked.isEmpty) return;
+    if (picked.isEmpty || !mounted) return;
     setState(() {
       _pendingAttachments.addAll(picked.map((x) => File(x.path)).take(5 - _pendingAttachments.length));
     });
   }
 
   Future<void> _send() async {
+    final provider = context.read<TicketsProvider>();
+    // The keyboard's send key fires this too, and is not disabled while a reply
+    // is on the wire: a second press would post the same message twice.
+    if (provider.isSendingReply) return;
     final text = _messageController.text.trim();
     if (text.isEmpty && _pendingAttachments.isEmpty) return;
     final attachments = List<File>.from(_pendingAttachments);
     _messageController.clear();
     setState(() => _pendingAttachments.clear());
-    final error = await context.read<TicketsProvider>().reply(
+    final error = await provider.reply(
           ticketId: widget.ticketId,
           message: text.isEmpty ? '(attachment)' : text,
           attachments: attachments,
         );
     if (!mounted) return;
     if (error != null) {
+      // Not sent: give the person their words (and photos) back instead of
+      // an empty box, unless they have already started typing something else.
+      if (_messageController.text.isEmpty && _pendingAttachments.isEmpty) {
+        _messageController.text = text;
+        setState(() => _pendingAttachments.addAll(attachments));
+      }
       showErrorSnackBar(context, error);
     } else {
       _scrollToBottom();

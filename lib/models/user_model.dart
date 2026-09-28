@@ -192,7 +192,7 @@ class UserModel {
       country: json['country']?.toString(),
       remark: json['remark']?.toString(),
       preferences: UserPreferences.fromJson(
-        json['preferences'] as Map<String, dynamic>?,
+        json['preferences'] is Map ? Map<String, dynamic>.from(json['preferences'] as Map) : null,
       ),
     );
   }

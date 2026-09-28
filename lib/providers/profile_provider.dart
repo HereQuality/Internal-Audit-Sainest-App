@@ -48,6 +48,11 @@ class ProfileProvider extends ChangeNotifier {
       return UserModel.fromJson(Map<String, dynamic>.from(res.data['data']));
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not update your profile.');
+    } catch (e, st) {
+      // A picked photo that can no longer be read, or an answer without the
+      // updated profile: the person is told, and Save is released.
+      debugPrint('ProfileProvider.updateProfile failed: $e\n$st');
+      return 'Could not update your profile.';
     } finally {
       isSaving = false;
       notifyListeners();
@@ -71,6 +76,9 @@ class ProfileProvider extends ChangeNotifier {
         e,
         fallback: 'Could not change your password.',
       );
+    } catch (e, st) {
+      debugPrint('ProfileProvider.changePassword failed: $e\n$st');
+      return 'Could not change your password.';
     } finally {
       isSaving = false;
       notifyListeners();
@@ -116,6 +124,9 @@ class ProfileProvider extends ChangeNotifier {
       );
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not update preferences.');
+    } catch (e, st) {
+      debugPrint('ProfileProvider.updatePreferences failed: $e\n$st');
+      return 'Could not update preferences.';
     }
   }
 }

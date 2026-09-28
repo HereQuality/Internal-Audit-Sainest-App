@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:printing/printing.dart';
@@ -7,14 +9,20 @@ import '../../core/network/dio_client.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_status.dart';
 import '../../core/utils/formatters.dart';
+import '../../core/utils/report_stats.dart';
 import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
 import '../../models/audit_model.dart';
 import '../../providers/audits_provider.dart';
+import '../../providers/filter_options_provider.dart';
+import '../../providers/list_view_memory.dart';
 import '../../utils/report_pdf_builder.dart';
 import '../../utils/report_sections.dart';
 import '../../widgets/app_loading.dart';
+import '../../widgets/audit_agenda.dart' show AgendaEntry;
+import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
+import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/status_badge.dart';
 import '../../widgets/status_filter_chip_row.dart';
 import '../audits/audit_detail_screen.dart';
@@ -96,6 +104,8 @@ const _statusFilters = [
 ];
 
 class _ReportsScreenState extends State<ReportsScreen> {
+  static const _memoryId = 'reports';
+
   // Which row's PDF is currently generating — gates that one row's download
   // button (spinner in place of the icon) without blocking the rest of the
   // list.
@@ -104,56 +114,126 @@ class _ReportsScreenState extends State<ReportsScreen> {
   // audit state above since a batch card's own download button sits
   // alongside its members' individual ones.
   String? _downloadingBatchId;
-  final Set<String> _expandedBatchIds = {};
+
+  // Everything the user can set on this screen is remembered in
+  // ListViewMemory, so opening a report and pressing Back — or leaving and
+  // returning — finds the same view, chip, search, expanded card and scroll
+  // position (wiped on logout).
+  late final ListScreenMemory _saved;
+  late final ScrollController _scroll;
+
   // Defaults to Completed — this screen's pre-existing behavior and the
   // web Final Report page's own default view — the other stages
   // (mirroring MyAuditsScreen's status chips) are one tap away. This is the
   // raw stored-Completed gate (see _statusFilters), not a display status.
-  String _statusFilter = AuditStatus.completed;
-  final TextEditingController _searchController = TextEditingController();
-  String _search = '';
-  // Inclusive day-precision bounds, same convention as the web page's own
-  // DateRangeFilter — matched below against each audit's completedDate,
-  // falling back to scheduledDate for anything not finished yet (a Draft/
-  // Not Started/In Progress row has no completedDate at all).
-  DateTime? _fromDate;
-  DateTime? _toDate;
+  late String _statusFilter;
+  late final TextEditingController _searchController;
+  late String _search;
+  // false = "My audits", true = "My locations" (audits at places I lead —
+  // only offered to a leader).
+  late bool _led;
+  // Location-wise view: one header per location above its audits.
+  late bool _byLocation;
+  // Accordion: the key of the ONE bundle / series card that is open.
+  String? _expandedKey;
+  Timer? _statsDebounce;
 
   @override
   void initState() {
     super.initState();
+    _saved = context.read<ListViewMemory>().screen(_memoryId);
+    _statusFilter = _saved.extra['status'] as String? ?? AuditStatus.completed;
+    _led = _saved.extra['led'] == true;
+    _byLocation = _saved.extra['grouped'] == true;
+    _expandedKey = _saved.extra['expanded'] as String?;
+    _search = _saved.search;
+    _searchController = TextEditingController(text: _saved.search);
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
+      ..addListener(() {
+        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
+      });
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
   }
 
   @override
   void dispose() {
+    _statsDebounce?.cancel();
     _searchController.dispose();
+    _scroll.dispose();
+    // No context.read here (the tree is being torn down) — the provider is
+    // told through the reference captured while mounted.
+    _provider?.reportsInUse = false;
     super.dispose();
   }
 
-  Future<void> _load() => context.read<AuditsProvider>().fetchReportAudits();
+  AuditsProvider? _provider;
 
-  Future<void> _pickDateRange() async {
-    final now = DateTime.now();
-    final firstDate = DateTime(now.year - 5);
-    final lastDate = now.add(const Duration(days: 365));
-    final picked = await showDateRangePicker(
-      context: context,
-      firstDate: firstDate,
-      lastDate: lastDate,
-      initialDateRange: _fromDate != null && _toDate != null
-          ? DateTimeRange(start: _fromDate!, end: _toDate!)
-          : null,
-    );
-    if (picked == null) return;
+  // The status chip as the server understands it, for the stat tiles: 'All'
+  // means no status filter, the rest are the same labels the list endpoints
+  // take (the legacy 'Completed' is stored-status equality there).
+  String? get _statsStatus => _statusFilter == 'All' ? null : _statusFilter;
+
+  void _syncQuery(AuditsProvider p) {
+    p.reportsInUse = true;
+    p.reportsLed = _led;
+    p.reportsStatus = _statsStatus;
+    p.reportsSearch = _search;
+  }
+
+  Future<void> _load() async {
+    final provider = _provider = context.read<AuditsProvider>();
+    _syncQuery(provider);
+    // Who leads what decides whether "My locations" exists at all — fetched
+    // alongside the first list, not before it, so the screen isn't held up.
+    final led = provider.fetchLedPlaces();
+    await Future.wait([
+      provider.fetchReportAudits(),
+      provider.fetchReportStats(),
+    ]);
+    await led;
+    if (!mounted) return;
+    // A remembered "My locations" view for someone who no longer leads
+    // anything falls back to their own audits.
+    if (_led && !provider.isPlaceLeader) {
+      _setLed(false);
+    }
+  }
+
+  void _remember() {
+    _saved
+      ..extra['status'] = _statusFilter
+      ..extra['led'] = _led
+      ..extra['grouped'] = _byLocation
+      ..extra['expanded'] = _expandedKey;
+  }
+
+  void _setLed(bool led) {
+    if (led == _led) return;
     setState(() {
-      _fromDate = DateTime(
-        picked.start.year,
-        picked.start.month,
-        picked.start.day,
-      );
-      _toDate = DateTime(picked.end.year, picked.end.month, picked.end.day);
+      _led = led;
+      _expandedKey = null;
     });
+    _remember();
+    final p = context.read<AuditsProvider>();
+    _syncQuery(p);
+    p.fetchReportAudits();
+    p.fetchReportStats();
+  }
+
+  // The chip and the search text are client-side filters over the loaded rows
+  // (as ever); the stat tiles ask the server for the same population, so they
+  // are re-requested — the search debounced, it changes on every keystroke.
+  void _refreshTiles({bool debounce = false}) {
+    final p = context.read<AuditsProvider>();
+    _syncQuery(p);
+    _statsDebounce?.cancel();
+    if (debounce) {
+      _statsDebounce = Timer(const Duration(milliseconds: 450), () {
+        if (mounted) p.fetchReportStats();
+      });
+    } else {
+      p.fetchReportStats();
+    }
   }
 
   bool _matchesSearch(AuditModel a) {
@@ -163,16 +243,6 @@ class _ReportsScreenState extends State<ReportsScreen> {
         a.location.toLowerCase().contains(q) ||
         (a.auditee.name?.toLowerCase().contains(q) ?? false) ||
         a.auditorNames.any((n) => n.toLowerCase().contains(q));
-  }
-
-  bool _matchesDateRange(AuditModel a) {
-    if (_fromDate == null && _toDate == null) return true;
-    final d = a.completedDate ?? a.scheduledDate;
-    if (d == null) return false;
-    final day = DateTime(d.year, d.month, d.day);
-    if (_fromDate != null && day.isBefore(_fromDate!)) return false;
-    if (_toDate != null && day.isAfter(_toDate!)) return false;
-    return true;
   }
 
   String _sanitizedFileName(String title) {
@@ -278,69 +348,111 @@ class _ReportsScreenState extends State<ReportsScreen> {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<AuditsProvider>();
-    final bool showEmptyState =
-        !provider.isLoadingReports &&
-        provider.reportsError == null &&
-        provider.reportAudits.isEmpty;
-    final bool showError =
-        provider.reportsError != null && provider.reportAudits.isEmpty;
+    final source = _led ? provider.ledReportAudits : provider.reportAudits;
+    final bool showError = provider.reportsError != null && source.isEmpty;
     final bool showLoading =
-        provider.isLoadingReports &&
-        provider.reportAudits.isEmpty &&
-        !showError;
-    final filtered = provider.reportAudits
+        provider.isLoadingReports && source.isEmpty && !showError;
+    final filtered = source
         .where((a) => auditMatchesStatusFilter(a, _statusFilter))
         .where(_matchesSearch)
-        .where(_matchesDateRange)
         .toList();
-    final items = _groupByBatch(filtered);
-    final hasActiveTextOrDateFilter =
-        _search.trim().isNotEmpty || _fromDate != null;
+    final items = _groupTopLevel(filtered);
+    final bool showEmptyState =
+        !showLoading && !showError && source.isEmpty;
+    final hasFilters =
+        provider.activeFilterCountFor(status: false, flag: false) > 0;
+    // The tiles are the server's (same population as the list, see
+    // AuditsProvider.fetchReportStats), but only while they agree with the
+    // rows on screen: a planner's server tiles cover every audit while this
+    // list is /audits/mine, and the device's search can be narrower than the
+    // server's. When they differ — or that endpoint isn't open to this role —
+    // the tiles are worked out from the rows, so numbers match what is listed.
+    final rowStats = ReportStats.fromAudits(filtered);
+    final serverStats = provider.reportStats;
+    final stats = serverStats != null &&
+            (showLoading || serverStats.totalAudits == rowStats.totalAudits)
+        ? serverStats
+        : rowStats;
+    final scheme = Theme.of(context).colorScheme;
+    const gutter = EdgeInsets.symmetric(horizontal: 16);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Final Report')),
-      body: Column(
-        children: [
-          if (!showLoading && !showError && !showEmptyState) ...[
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _searchController,
-                      textInputAction: TextInputAction.search,
-                      decoration: InputDecoration(
-                        isDense: true,
-                        prefixIcon: const Icon(Icons.search, size: 20),
-                        hintText: 'Search reports...',
-                        suffixIcon: _search.isEmpty
-                            ? null
-                            : IconButton(
-                                icon: const Icon(Icons.clear, size: 18),
-                                onPressed: () {
-                                  _searchController.clear();
-                                  setState(() => _search = '');
-                                },
-                              ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                      ),
-                      onChanged: (v) => setState(() => _search = v),
+      body: RefreshIndicator(
+        onRefresh: _load,
+        child: ListView(
+          controller: _scroll,
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.only(bottom: 24),
+          children: [
+            // A leader's second view, like the web's My audits / Audits at
+            // places I lead switch. Nobody else ever sees it.
+            if (provider.isPlaceLeader)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                child: SegmentedButton<bool>(
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment(
+                      value: false,
+                      icon: Icon(Icons.person_outline, size: 16),
+                      label: Text('My audits'),
                     ),
+                    ButtonSegment(
+                      value: true,
+                      icon: Icon(Icons.location_city_outlined, size: 16),
+                      label: Text('My locations'),
+                    ),
+                  ],
+                  selected: {_led},
+                  onSelectionChanged: (s) => _setLed(s.first),
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: AuditFilterBar(
+                footnote: _led
+                    ? "Every audit at the places you lead, whoever the auditor is. Team and Members don't apply here."
+                    : null,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: _ReportStatTiles(
+                stats: stats,
+                scopeLabel: _scopeLabel(provider),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+              child: TextField(
+                controller: _searchController,
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  isDense: true,
+                  prefixIcon: const Icon(Icons.search, size: 20),
+                  hintText: 'Search reports...',
+                  suffixIcon: _search.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear, size: 18),
+                          tooltip: 'Clear search',
+                          onPressed: () {
+                            _searchController.clear();
+                            _saved.search = '';
+                            setState(() => _search = '');
+                            _refreshTiles();
+                          },
+                        ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
                   ),
-                  const SizedBox(width: 8),
-                  _DateFilterButton(
-                    fromDate: _fromDate,
-                    toDate: _toDate,
-                    onTap: _pickDateRange,
-                    onClear: () => setState(() {
-                      _fromDate = null;
-                      _toDate = null;
-                    }),
-                  ),
-                ],
+                ),
+                onChanged: (v) {
+                  _saved.search = v;
+                  setState(() => _search = v);
+                  _refreshTiles(debounce: true);
+                },
               ),
             ),
             StatusFilterChipRow(
@@ -351,66 +463,181 @@ class _ReportsScreenState extends State<ReportsScreen> {
               dotColorFor: (o) => o == 'All' || o == AuditStatus.completed
                   ? null
                   : AppColors.readable(context, AppColors.forAuditStatus(o)),
-              onSelected: (v) => setState(() => _statusFilter = v),
+              onSelected: (v) {
+                setState(() => _statusFilter = v);
+                _remember();
+                _refreshTiles();
+              },
             ),
-          ],
-          Expanded(
-            child: RefreshIndicator(
-              onRefresh: _load,
-              child: ListView(
-                physics: const AlwaysScrollableScrollPhysics(),
-                padding: showLoading || showEmptyState || showError
-                    ? EdgeInsets.zero
-                    : const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                children: [
-                  if (showLoading)
-                    SizedBox(
-                      height: MediaQuery.of(context).size.height * 0.6,
-                      child: const AppLoading(),
-                    )
-                  else if (showError)
-                    SizedBox(
-                      height: MediaQuery.of(context).size.height * 0.6,
-                      child: ErrorState(
-                        message: provider.reportsError!,
-                        onRetry: _load,
+            if (items.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '${items.length} ${items.length == 1 ? 'report' : 'reports'}',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: scheme.outline,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    )
-                  else if (showEmptyState)
-                    SizedBox(
-                      height: MediaQuery.of(context).size.height * 0.6,
-                      child: const EmptyState(
-                        icon: Icons.description_outlined,
-                        title: 'No reports yet',
-                        subtitle:
-                            'Your audits will show up here once they\'re scheduled.',
-                      ),
-                    )
-                  else if (items.isEmpty)
-                    SizedBox(
-                      height: MediaQuery.of(context).size.height * 0.5,
-                      child: EmptyState(
-                        icon: Icons.filter_alt_off_outlined,
-                        title: hasActiveTextOrDateFilter
-                            ? 'No audits match your filters'
-                            : auditStatusEmptyTitle(_statusFilter),
-                      ),
-                    )
-                  else
-                    for (int i = 0; i < items.length; i++) ...[
-                      _buildItem(items[i]),
-                      if (i != items.length - 1) const SizedBox(height: 10),
-                    ],
-                ],
+                    ),
+                    FilterChip(
+                      avatar: const Icon(Icons.place_outlined, size: 16),
+                      label: const Text('Group by location'),
+                      selected: _byLocation,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      visualDensity: VisualDensity.compact,
+                      onSelected: (v) {
+                        setState(() => _byLocation = v);
+                        _remember();
+                      },
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ),
-        ],
+            if (showLoading)
+              SizedBox(
+                height: MediaQuery.of(context).size.height * 0.4,
+                child: const AppLoading(),
+              )
+            else if (showError)
+              SizedBox(
+                height: MediaQuery.of(context).size.height * 0.4,
+                child: ErrorState(
+                  message: provider.reportsError!,
+                  onRetry: _load,
+                ),
+              )
+            else if (showEmptyState)
+              SizedBox(
+                height: MediaQuery.of(context).size.height * 0.4,
+                child: hasFilters
+                    ? EmptyState(
+                        icon: Icons.filter_alt_off_outlined,
+                        title: 'No audits match your filters',
+                        subtitle:
+                            'Try widening the people, place or date range.',
+                        action: OutlinedButton.icon(
+                          onPressed: () => applyAuditFilterSelection(
+                            context,
+                            AuditFilterSelection.cleared,
+                          ),
+                          icon: const Icon(Icons.filter_alt_off_outlined),
+                          label: const Text('Clear filters'),
+                        ),
+                      )
+                    : EmptyState(
+                        icon: Icons.description_outlined,
+                        title: _led ? 'No audits at your locations' : 'No reports yet',
+                        subtitle: _led
+                            ? 'Audits scheduled at the places you lead will show up here.'
+                            : "Your audits will show up here once they're scheduled.",
+                      ),
+              )
+            else if (items.isEmpty)
+              SizedBox(
+                height: MediaQuery.of(context).size.height * 0.4,
+                child: EmptyState(
+                  icon: Icons.filter_alt_off_outlined,
+                  title: _search.trim().isNotEmpty
+                      ? 'No audits match your filters'
+                      : auditStatusEmptyTitle(_statusFilter),
+                ),
+              )
+            else
+              Padding(
+                padding: gutter,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: _byLocation
+                      ? _locationSections(items)
+                      : [
+                          for (int i = 0; i < items.length; i++) ...[
+                            _buildItem(items[i]),
+                            if (i != items.length - 1) const SizedBox(height: 10),
+                          ],
+                        ],
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
 
+  // What the tiles are "of": the picked places (or the ones I lead).
+  String? _scopeLabel(AuditsProvider p) {
+    final options = context.watch<FilterOptionsProvider>();
+    final names = <String>[
+      for (final id in p.locationFilter)
+        options.locations.where((l) => l.id == id).map((l) => l.name).firstOrNull ??
+            'Location',
+      for (final id in p.departmentFilter)
+        options.departments.where((d) => d.id == id).map((d) => d.name).firstOrNull ??
+            'Department',
+    ];
+    if (names.isNotEmpty) return names.join(', ');
+    if (_led && p.ledPlaceNames.isNotEmpty) return p.ledPlaceNames.join(', ');
+    return null;
+  }
+
+  // The location-wise view: one header per location — its name, how many
+  // reports and its cumulative score (Σ achieved / Σ possible of its finished
+  // ones, never an average of percentages) — above its rows. A bundle spans
+  // several locations, so bundles sit together under their own header.
+  List<Widget> _locationSections(List<_TopLevelItem> items) {
+    final groups = <String, List<_TopLevelItem>>{};
+    for (final item in items) {
+      final key = item.batchId != null
+          ? 'Multi-location bundles'
+          : (item.members.first.location.isNotEmpty
+                ? item.members.first.location
+                : 'No location');
+      groups.putIfAbsent(key, () => []).add(item);
+    }
+    final keys = groups.keys.toList()
+      ..sort((a, b) {
+        // Bundles last, the rest alphabetical.
+        final ab = a == 'Multi-location bundles';
+        final bb = b == 'Multi-location bundles';
+        if (ab != bb) return ab ? 1 : -1;
+        return a.toLowerCase().compareTo(b.toLowerCase());
+      });
+    return [
+      for (final key in keys) ...[
+        _LocationHeader(
+          label: key,
+          count: groups[key]!.length,
+          stats: ReportStats.fromAudits([
+            for (final i in groups[key]!) ...i.members,
+          ]),
+        ),
+        for (final item in groups[key]!) ...[
+          _buildItem(item),
+          const SizedBox(height: 10),
+        ],
+      ],
+    ];
+  }
+
+  void _toggleExpanded(String key) {
+    setState(() => _expandedKey = _expandedKey == key ? null : key);
+    _remember();
+  }
+
   Widget _buildItem(_TopLevelItem item) {
+    if (item.seriesId != null) {
+      final key = 'series:${item.seriesId}';
+      return _SeriesReportCard(
+        entry: AgendaEntry(item.members),
+        isExpanded: _expandedKey == key,
+        onToggle: () => _toggleExpanded(key),
+        downloadingId: _downloadingAuditId,
+        onDownload: _download,
+      );
+    }
     if (item.batchId == null) {
       final audit = item.members.first;
       if (audit.hasMultipleZones) {
@@ -427,13 +654,12 @@ class _ReportsScreenState extends State<ReportsScreen> {
       );
     }
     final batchId = item.batchId!;
+    final key = 'batch:$batchId';
     return _BatchReportCard(
       batchId: batchId,
       members: item.members,
-      isExpanded: _expandedBatchIds.contains(batchId),
-      onToggle: () => setState(() {
-        if (!_expandedBatchIds.remove(batchId)) _expandedBatchIds.add(batchId);
-      }),
+      isExpanded: _expandedKey == key,
+      onToggle: () => _toggleExpanded(key),
       isDownloadingCombined: _downloadingBatchId == batchId,
       onDownloadCombined: () =>
           _downloadCombined(batchId, item.members, item.members.first.title),
@@ -444,101 +670,454 @@ class _ReportsScreenState extends State<ReportsScreen> {
 }
 
 class _TopLevelItem {
-  final String? batchId; // null = single audit; item.members has exactly 1
+  final String? batchId; // set = a multi-zone bundle; members has 2+
+  final String? seriesId; // set = a recurring series; members has 2+
+  // A single audit has exactly one member and neither id.
   final List<AuditModel> members;
-  const _TopLevelItem({this.batchId, required this.members});
+  const _TopLevelItem({this.batchId, this.seriesId, required this.members});
 }
 
 // Same grouping the web Final Report page's own batchGroups/topLevelAudits
 // use: a batch where only ONE of this employee's own zones shows up here
 // renders as a plain single card, not a "1 location" expandable one; a
 // batch with more than one of this employee's own zones visible renders
-// once, at its first-seen position, as one expandable card.
-List<_TopLevelItem> _groupByBatch(List<AuditModel> audits) {
+// once, at its first-seen position, as one expandable card. On top of that,
+// the occurrences of one recurring series (same recurrence.seriesId — never
+// just the same frequency word) that are not part of a bundle collapse into
+// one expandable series row, exactly like the web's series rows.
+List<_TopLevelItem> _groupTopLevel(List<AuditModel> audits) {
   final byBatch = <String, List<AuditModel>>{};
   for (final a in audits) {
     final bId = a.scheduleBatchId;
     if (bId == null) continue;
     byBatch.putIfAbsent(bId, () => []).add(a);
   }
+  final bySeries = <String, List<AuditModel>>{};
+  for (final a in audits) {
+    final sId = a.seriesId;
+    if (sId == null || a.scheduleBatchId != null) continue;
+    bySeries.putIfAbsent(sId, () => []).add(a);
+  }
   final seen = <String>{};
   final result = <_TopLevelItem>[];
   for (final a in audits) {
     final bId = a.scheduleBatchId;
     final group = bId != null ? byBatch[bId] : null;
-    if (group == null || group.length <= 1) {
-      result.add(_TopLevelItem(members: [a]));
+    if (group != null && group.length > 1) {
+      if (seen.add('b:$bId')) {
+        result.add(_TopLevelItem(batchId: bId, members: group));
+      }
       continue;
     }
-    if (seen.contains(bId)) continue;
-    seen.add(bId!);
-    result.add(_TopLevelItem(batchId: bId, members: group));
+    final sId = bId == null ? a.seriesId : null;
+    final series = sId != null ? bySeries[sId] : null;
+    if (series != null && series.length > 1) {
+      if (seen.add('s:$sId')) {
+        // Oldest occurrence first, like the agenda's series row.
+        final ordered = [...series]..sort((x, y) {
+          final xd = x.scheduledDate;
+          final yd = y.scheduledDate;
+          if (xd == null || yd == null) return 0;
+          return xd.compareTo(yd);
+        });
+        result.add(_TopLevelItem(seriesId: sId, members: ordered));
+      }
+      continue;
+    }
+    result.add(_TopLevelItem(members: [a]));
   }
   return result;
 }
 
-// Opens the range picker; once a range is set, shows it as a small dated
-// chip instead of a bare icon so the active filter stays visible without
-// having to reopen the picker — same "show what's active" idea as the
-// status ChoiceChips above it, just for a range instead of one value.
-class _DateFilterButton extends StatelessWidget {
-  final DateTime? fromDate;
-  final DateTime? toDate;
-  final VoidCallback onTap;
-  final VoidCallback onClear;
+// ── Stat tiles ──────────────────────────────────────────────────────────
 
-  const _DateFilterButton({
-    required this.fromDate,
-    required this.toDate,
-    required this.onTap,
-    required this.onClear,
+/// The four Final Report tiles, for whatever is in view: cumulative Total
+/// Score (Σ achieved / Σ possible — never an average of each audit's %),
+/// Total Audits, On-Time Completed and Delayed Completed. A 2x2 grid whose
+/// tiles size to their text, so nothing clips at large text sizes.
+class _ReportStatTiles extends StatelessWidget {
+  final ReportStats stats;
+  final String? scopeLabel;
+
+  const _ReportStatTiles({required this.stats, this.scopeLabel});
+
+  String _points(double v) => v == v.roundToDouble() ? '${v.round()}' : v.toStringAsFixed(1);
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final pct = stats.percentage;
+    final scoreColor = pct == null
+        ? scheme.outline
+        : pct >= 75
+        ? Colors.green
+        : pct >= 50
+        ? Colors.orange
+        : Colors.red;
+    final tiles = [
+      _StatTileData(
+        icon: Icons.emoji_events_outlined,
+        label: 'Total Score',
+        value: pct == null ? '—' : '$pct%',
+        sub: stats.maxPossible > 0
+            ? '${_points(stats.achieved)} / ${_points(stats.maxPossible)} pts'
+            : null,
+        color: scoreColor,
+      ),
+      _StatTileData(
+        icon: Icons.assignment_outlined,
+        label: 'Total Audits',
+        value: '${stats.totalAudits}',
+        color: scheme.primary,
+      ),
+      _StatTileData(
+        icon: Icons.check_circle_outline,
+        label: 'On-Time Completed',
+        value: '${stats.onTimeCompleted}',
+        color: AppColors.forAuditStatus(AuditStatus.onTimeCompleted),
+      ),
+      _StatTileData(
+        icon: Icons.history_toggle_off_rounded,
+        label: 'Delayed Completed',
+        value: '${stats.delayedCompleted}',
+        color: AppColors.forAuditStatus(AuditStatus.delayedCompleted),
+      ),
+    ];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (scopeLabel != null) ...[
+          Row(
+            children: [
+              Icon(Icons.place_outlined, size: 14, color: scheme.outline),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(
+                  scopeLabel!,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.outline,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+        ],
+        // Two per row; IntrinsicHeight keeps a pair the same height when one
+        // tile wraps its label at a large text size.
+        for (int r = 0; r < tiles.length; r += 2) ...[
+          if (r > 0) const SizedBox(height: 8),
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(child: _StatTile(data: tiles[r])),
+                const SizedBox(width: 8),
+                Expanded(child: _StatTile(data: tiles[r + 1])),
+              ],
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _StatTileData {
+  final IconData icon;
+  final String label;
+  final String value;
+  final String? sub;
+  final Color color;
+
+  const _StatTileData({
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.color,
+    this.sub,
+  });
+}
+
+class _StatTile extends StatelessWidget {
+  final _StatTileData data;
+
+  const _StatTile({required this.data});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    // readable(): the palette colours are tuned for a light card and sink
+    // into the dark theme's surface.
+    final color = AppColors.readable(context, data.color);
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: scheme.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.5)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(data.icon, size: 16, color: color),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  data.label,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.outline,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            data.value,
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+              fontWeight: FontWeight.w800,
+              color: color,
+            ),
+          ),
+          if (data.sub != null)
+            Text(
+              data.sub!,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: scheme.outline,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A location's header in the location-wise view.
+class _LocationHeader extends StatelessWidget {
+  final String label;
+  final int count;
+  final ReportStats stats;
+
+  const _LocationHeader({
+    required this.label,
+    required this.count,
+    required this.stats,
   });
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final active = fromDate != null && toDate != null;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
-      child: Container(
-        height: 44,
-        padding: EdgeInsets.symmetric(horizontal: active ? 10 : 12),
-        decoration: BoxDecoration(
-          color: active ? scheme.primaryContainer.withValues(alpha: 0.4) : null,
-          border: Border.all(
-            color: active ? Colors.transparent : scheme.outlineVariant,
-          ),
-          borderRadius: BorderRadius.circular(10),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.calendar_month_outlined,
-              size: 18,
-              color: active ? scheme.primary : scheme.outline,
+    final pct = stats.percentage;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 8),
+      child: Row(
+        children: [
+          Icon(Icons.place_outlined, size: 16, color: scheme.primary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              label,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w800,
+              ),
             ),
-            if (active) ...[
-              const SizedBox(width: 6),
-              Text(
-                '${Formatters.date(fromDate)} – ${Formatters.date(toDate)}',
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: scheme.primary,
-                ),
-              ),
-              const SizedBox(width: 2),
-              InkWell(
-                onTap: onClear,
-                borderRadius: BorderRadius.circular(999),
-                child: Icon(Icons.close, size: 15, color: scheme.primary),
-              ),
-            ],
-          ],
-        ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            [
+              '$count',
+              if (pct != null) '$pct%',
+            ].join(' · '),
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: scheme.outline,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
       ),
+    );
+  }
+}
+
+/// The small "this audit repeats" marker every list uses (the web's
+/// RecurringBadge): a repeat icon plus the short repeat type ("Weekly"), or a
+/// bare "Recurring" when the frequency word is missing. Nothing for an audit
+/// that is not part of a series.
+class _RecurringBadge extends StatelessWidget {
+  final String? frequency;
+
+  const _RecurringBadge({required this.frequency});
+
+  static bool isRecurring(AuditModel a) => a.seriesId != null || a.frequency != null;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final label = (frequency == null || frequency!.isEmpty) ? 'Recurring' : frequency!;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: scheme.tertiaryContainer.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.repeat_rounded, size: 11, color: scheme.onTertiaryContainer),
+          const SizedBox(width: 3),
+          Flexible(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                color: scheme.onTertiaryContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The one repeat type a group of audits shares ("Weekly"), "Mixed" when
+  /// they differ, null when none of them repeats — the web's bundleFrequency.
+  static String? sharedFrequency(List<AuditModel> members) {
+    final recurring = members.where(isRecurring).toList();
+    if (recurring.isEmpty) return null;
+    final all = {for (final m in recurring) if (m.frequency != null) m.frequency!};
+    if (all.length > 1) return 'Mixed';
+    return all.isEmpty ? '' : all.first;
+  }
+}
+
+/// A recurring series collapsed into one row: the series title, "Weekly
+/// series · N occurrences" (or another frequency), the span of dates, a per-status tally (a series
+/// has no single status of its own), the cumulative score of its finished
+/// occurrences and a Recurring badge — expanding to the occurrences' own
+/// report cards. Like the web's series row it never opens anything itself:
+/// there is no single occurrence a tap could unambiguously mean.
+class _SeriesReportCard extends StatelessWidget {
+  final AgendaEntry entry;
+  final bool isExpanded;
+  final VoidCallback onToggle;
+  final String? downloadingId;
+  final ValueChanged<AuditModel> onDownload;
+
+  const _SeriesReportCard({
+    required this.entry,
+    required this.isExpanded,
+    required this.onToggle,
+    required this.downloadingId,
+    required this.onDownload,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final stats = ReportStats.fromAudits(entry.occurrences);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Card(
+          clipBehavior: Clip.antiAlias,
+          child: InkWell(
+            onTap: onToggle,
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          entry.lead.title,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 15,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _scoreBadge(
+                        context,
+                        stats.percentage?.toDouble(),
+                      ),
+                      Icon(
+                        isExpanded ? Icons.expand_less : Icons.expand_more,
+                        color: scheme.outline,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      _RecurringBadge(frequency: entry.lead.frequency),
+                      Text(
+                        entry.seriesLabel,
+                        style: TextStyle(
+                          color: scheme.primary,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Icon(Icons.date_range_outlined, size: 14, color: scheme.outline),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          entry.dateSpan,
+                          style: TextStyle(color: scheme.outline, fontSize: 12.5),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    entry.statusSummary,
+                    style: TextStyle(color: scheme.outline, fontSize: 12),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (isExpanded)
+          // Indented so the occurrences read as belonging to the row above.
+          Padding(
+            padding: const EdgeInsets.only(left: 12, top: 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final a in entry.occurrences) ...[
+                  _ReportCard(
+                    audit: a,
+                    isDownloading: downloadingId == a.id,
+                    onDownload: () => onDownload(a),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ],
+            ),
+          ),
+      ],
     );
   }
 }
@@ -683,12 +1262,18 @@ class _ReportCard extends StatelessWidget {
                         // NC-stage badge on the right rather than instead of
                         // it. Under the left column's text (not the badge
                         // column) so the right column keeps its two rows.
-                        if (TimelinessPill.shortLabel(audit.timeliness) !=
-                            null) ...[
+                        if (TimelinessPill.shortLabel(audit.timeliness) != null ||
+                            _RecurringBadge.isRecurring(audit)) ...[
                           const SizedBox(height: 4),
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: TimelinessPill(timeliness: audit.timeliness),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 4,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: [
+                              if (_RecurringBadge.isRecurring(audit))
+                                _RecurringBadge(frequency: audit.frequency),
+                              TimelinessPill(timeliness: audit.timeliness),
+                            ],
                           ),
                         ],
                       ],
@@ -867,6 +1452,32 @@ class _BatchReportCard extends StatelessWidget {
                                     ],
                                   ),
                                 ),
+                                // The web's "Bundle" marker: this row stands
+                                // in for several locations' audits.
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: scheme.primary.withValues(alpha: 0.5),
+                                    ),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    'Bundle',
+                                    style: TextStyle(
+                                      color: scheme.primary,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                                if (_RecurringBadge.sharedFrequency(members) != null)
+                                  _RecurringBadge(
+                                    frequency: _RecurringBadge.sharedFrequency(members),
+                                  ),
                                 // The whole batch's On-Time / Delayed —
                                 // set by the server only once every zone is
                                 // completed (batchTimeliness), so it never

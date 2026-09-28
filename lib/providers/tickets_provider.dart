@@ -72,6 +72,9 @@ class TicketsProvider extends ChangeNotifier {
       if (epoch == _epoch) {
         listError = extractErrorMessage(e, fallback: 'Could not load your tickets.');
       }
+    } catch (e, st) {
+      debugPrint('TicketsProvider.fetchTickets: unreadable answer: $e\n$st');
+      if (epoch == _epoch) listError = 'Could not load your tickets.';
     } finally {
       if (epoch == _epoch) {
         isLoadingList = false;
@@ -110,6 +113,11 @@ class TicketsProvider extends ChangeNotifier {
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not create the ticket.');
+    } catch (e, st) {
+      // An attachment that can no longer be read, or an answer without the new
+      // ticket: the screen must get a message back or its Submit stays locked.
+      debugPrint('TicketsProvider.createTicket failed: $e\n$st');
+      return 'Could not create the ticket.';
     }
   }
 
@@ -125,6 +133,9 @@ class TicketsProvider extends ChangeNotifier {
       unawaited(_dio.patch(ApiConstants.ticketRead(id)).then((_) {}, onError: (_) {}));
     } on DioException catch (e) {
       if (seq == _detailSeq) detailError = extractErrorMessage(e, fallback: 'Could not load this ticket.');
+    } catch (e, st) {
+      debugPrint('TicketsProvider.fetchTicketDetail: unreadable answer: $e\n$st');
+      if (seq == _detailSeq) detailError = 'Could not load this ticket.';
     } finally {
       if (seq == _detailSeq) {
         isLoadingDetail = false;
@@ -149,6 +160,9 @@ class TicketsProvider extends ChangeNotifier {
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not send your reply.');
+    } catch (e, st) {
+      debugPrint('TicketsProvider.reply failed: $e\n$st');
+      return 'Could not send your reply.';
     } finally {
       if (epoch == _epoch) {
         isSendingReply = false;
@@ -171,6 +185,9 @@ class TicketsProvider extends ChangeNotifier {
       );
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not update this ticket.');
+    } catch (e, st) {
+      debugPrint('TicketsProvider.verifyTicket failed: $e\n$st');
+      return 'Could not update this ticket.';
     }
     // The account that asked has since left: refreshing now would fetch for
     // whoever signed in next.

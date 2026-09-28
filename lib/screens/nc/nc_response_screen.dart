@@ -80,6 +80,7 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
   }
 
   Future<void> _submit() async {
+    if (_isSubmitting) return;
     final missing = _fields.where((f) => _controllers[f.$1]!.text.trim().isEmpty).toList();
     if (missing.isNotEmpty) {
       showErrorSnackBar(context, 'All four fields are required.');
@@ -98,18 +99,25 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
           keepPhotoUrls: _existingPhotos,
         );
     if (!mounted) return;
-    setState(() => _isSubmitting = false);
     if (error != null) {
+      setState(() => _isSubmitting = false);
       showErrorSnackBar(context, error);
       return;
     }
+    // Stays "submitting" through the refresh below and the pop: releasing the
+    // button here would let a second tap resubmit an already-answered NC.
     // respond() only refreshes activeNc — the socket-driven refetch in
     // NcProvider only fires for the OTHER party's notification (the
     // auditor who raised this NC), never the auditee acting here, so
     // raisedAgainstMe and the dashboard's NC tallies need an explicit
     // refresh to show "Response Submitted" right away (same pattern as
     // nc_review_screen.dart's _handle).
-    await Future.wait([ncProvider.fetchAgainstMe(), dashboardProvider.refreshAll()]);
+    try {
+      await Future.wait([ncProvider.fetchAgainstMe(), dashboardProvider.refreshAll()]);
+    } catch (_) {
+      // The response itself is saved; a failed refresh must not leave the
+      // button stuck on "submitting" — the lists refresh on their next load.
+    }
     if (!mounted) return;
     Navigator.of(context).pop();
     showSuccessSnackBar(context, 'Response submitted!');

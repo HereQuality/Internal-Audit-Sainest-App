@@ -215,6 +215,10 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
   void _onSessionEstablished(String token, UserModel signedIn) {
     _sessionId++;
     _sessionRetryAttempt = 0;
+    // The first 'connect' of THIS session's socket is the one that already has
+    // fresh preferences; a flag left over from the previous session would make
+    // it look like a reconnect.
+    _socketConnectedOnce = false;
     user = signedIn;
     status = AuthStatus.authenticated;
     // Before anything awaits: the previous sign-out stopped push registration
@@ -225,6 +229,9 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<String?> login({required String username, required String password}) async {
+    // A second tap (or Enter) while the first request is on the wire would
+    // start a second session over it: two tokens, the later one stored.
+    if (isBusy) return null;
     isBusy = true;
     notifyListeners();
     try {
@@ -238,14 +245,21 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
         'password': password,
       });
       final token = res.data['token'] as String;
+      final signedIn = UserModel.fromJson(Map<String, dynamic>.from(res.data['data']['user']));
       await SecureStorage.instance.saveToken(token);
-      _onSessionEstablished(
-        token,
-        UserModel.fromJson(Map<String, dynamic>.from(res.data['data']['user'])),
-      );
+      _onSessionEstablished(token, signedIn);
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Login failed. Please try again.');
+    } catch (e, st) {
+      // An answer the app cannot read (a 200 with an unexpected body) or a
+      // token that cannot be stored: without this it escaped as an unhandled
+      // error from the button's handler and the person saw nothing at all. The
+      // user is parsed BEFORE the token is stored so a bad body never leaves a
+      // saved token behind for the next launch to trust.
+      debugPrint('AuthProvider.login failed: $e\n$st');
+      if (status != AuthStatus.authenticated) await _clearStorageQuietly();
+      return 'Login failed. Please try again.';
     } finally {
       isBusy = false;
       notifyListeners();
@@ -263,6 +277,20 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
       _loggingOut ??= _endSession(notifyServer: notifyServer).whenComplete(() => _loggingOut = null);
 
   Future<void> _endSession({required bool notifyServer}) async {
+    // The screen leaves the session first: the unregister below can take up
+    // to 10s offline, and a Log out that looks frozen for that long is worse
+    // than the (bounded) time the stored token outlives the UI. What stays
+    // ordered is the teardown itself — [_loggingOut] only completes when it
+    // is done, and login() waits for it, so a re-login still can't be wiped.
+    var left = false;
+    void leaveUi() {
+      if (left) return;
+      left = true;
+      user = null;
+      status = AuthStatus.unauthenticated;
+      notifyListeners();
+    }
+
     try {
       _sessionId++;
       _sessionRetryTimer?.cancel();
@@ -279,6 +307,7 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
       // No more live events (banners, badge bumps) for the account leaving.
       SocketService.instance.disconnect();
       _socketConnectedOnce = false;
+      leaveUi();
       await NotificationScheduler.onLoggedOut(jwt: jwt);
       if (notifyServer && jwt != null && jwt.isNotEmpty) unawaited(_tellServerLoggedOut(jwt));
       await _clearStorageQuietly();
@@ -286,9 +315,7 @@ class AuthProvider extends ChangeNotifier with WidgetsBindingObserver {
       // Whatever went wrong, the UI still has to leave the session.
       debugPrint('AuthProvider: sign-out teardown failed: $e\n$st');
     }
-    user = null;
-    status = AuthStatus.unauthenticated;
-    notifyListeners();
+    leaveUi();
   }
 
   Future<void> _tellServerLoggedOut(String jwt) async {

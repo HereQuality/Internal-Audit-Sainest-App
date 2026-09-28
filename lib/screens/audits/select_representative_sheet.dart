@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../models/employee_option.dart';
+import '../../widgets/picker_sheet.dart';
 
 /// The "select representative auditee" step — a hard gate before an
 /// assigned auditor can start scoring (see
@@ -25,124 +26,47 @@ import '../../models/employee_option.dart';
 /// pre-checked, as the "Change" action once a representative is already
 /// set. Returns the picked employee ids (at least one, if Confirm was
 /// tapped), or null if dismissed any way.
+///
+/// The body is the shared searchable multi picker (widgets/picker_sheet.dart):
+/// a search box once the list is long, a pinned Confirm that stays above the
+/// keyboard, rows that wrap at large text, and a clearly ticked state. (The
+/// previous hand-rolled sheet had no search and a fixed 320dp list; the caller
+/// (audit_detail_screen.dart) now also looks people up for department-scoped
+/// audits, retries an empty lookup and tells the auditor when there really is
+/// nobody to pick from, instead of silently skipping the step.)
 Future<List<String>?> showSelectRepresentativeSheet(
   BuildContext context, {
   required List<EmployeeOption> employees,
   List<String> initiallySelected = const [],
 }) {
-  return showModalBottomSheet<List<String>>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    builder: (_) => _SelectRepresentativeSheet(
-      employees: employees,
-      initiallySelected: initiallySelected,
-    ),
+  // Sorted by name and de-duplicated by id: /employees/by-location can list
+  // a person once per matching location/department.
+  final seen = <String>{};
+  final sorted = [
+    for (final e in employees)
+      if (seen.add(e.id)) e,
+  ]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  final changing = initiallySelected.isNotEmpty;
+  return showMultiPickerSheet<String>(
+    context,
+    title: changing
+        ? 'Change Representative Auditee'
+        : 'Select Representative Auditee',
+    subtitle:
+        'Pick who represents this location for this audit before you continue — you can pick more than one. '
+        'You can still pick anyone at this location when raising an individual NC.',
+    searchHint: 'Search people',
+    minSelected: 1,
+    items: [
+      for (final e in sorted)
+        PickerItem<String>(
+          value: e.id,
+          label: e.name,
+          sublabel: e.teams.isEmpty
+              ? null
+              : e.teams.map((t) => t.name).join(', '),
+        ),
+    ],
+    selected: initiallySelected,
   );
-}
-
-class _SelectRepresentativeSheet extends StatefulWidget {
-  final List<EmployeeOption> employees;
-  final List<String> initiallySelected;
-
-  const _SelectRepresentativeSheet({
-    required this.employees,
-    this.initiallySelected = const [],
-  });
-
-  @override
-  State<_SelectRepresentativeSheet> createState() =>
-      _SelectRepresentativeSheetState();
-}
-
-class _SelectRepresentativeSheetState
-    extends State<_SelectRepresentativeSheet> {
-  late final Set<String> _selected = {...widget.initiallySelected};
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: EdgeInsets.only(
-        bottom: MediaQuery.of(context).viewInsets.bottom,
-      ),
-      // Ink, not Container: the sheet's own Material is transparent, so a
-      // decorated Container sat on top of the CheckboxListTiles' ink (Flutter's
-      // "ListTile background color or ink splashes may be invisible"
-      // assertion, and no tap feedback).
-      child: Ink(
-        decoration: BoxDecoration(
-          color: scheme.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        // + the home-indicator inset: the Confirm button used to sit 12px from
-        // the bottom edge, i.e. right on top of the iPhone home indicator.
-        padding: EdgeInsets.fromLTRB(16, 20, 16, 12 + MediaQuery.paddingOf(context).bottom),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text(
-              widget.initiallySelected.isEmpty
-                  ? 'Select Representative Auditee${_selected.length > 1 ? 's' : ''}'
-                  : 'Change Representative Auditee${_selected.length > 1 ? 's' : ''}',
-              style: Theme.of(
-                context,
-              ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              'Pick who represents this location for this audit before you continue — you can pick more than one. '
-              'You can still pick anyone at this location when raising an individual NC.',
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(color: scheme.outline),
-            ),
-            const SizedBox(height: 8),
-            // Same capped-height, scrollable list convention as every
-            // other multi-select in this app (e.g. the web's
-            // TeamFilterPanel/LocationFilterSelect) — a long employee list
-            // shouldn't push the Confirm button off-screen.
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 320),
-              child: ListView.separated(
-                shrinkWrap: true,
-                itemCount: widget.employees.length,
-                separatorBuilder: (_, _) => const Divider(height: 1),
-                itemBuilder: (_, i) {
-                  final e = widget.employees[i];
-                  final checked = _selected.contains(e.id);
-                  return CheckboxListTile(
-                    value: checked,
-                    onChanged: (v) => setState(() {
-                      if (v ?? false) {
-                        _selected.add(e.id);
-                      } else {
-                        _selected.remove(e.id);
-                      }
-                    }),
-                    title: Text(e.name, overflow: TextOverflow.ellipsis),
-                    controlAffinity: ListTileControlAffinity.leading,
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                  );
-                },
-              ),
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: _selected.isEmpty
-                  ? null
-                  : () => Navigator.of(context).pop(_selected.toList()),
-              child: Text(
-                _selected.isEmpty
-                    ? 'Select at least one'
-                    : 'Confirm (${_selected.length})',
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }

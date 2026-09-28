@@ -7,14 +7,12 @@ import '../../models/audit_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/dashboard_provider.dart';
-import '../../providers/filter_options_provider.dart';
-import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/expandable_section.dart';
+import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/filter_sheet.dart';
-import '../../widgets/score_row.dart';
-import '../../widgets/scope_toggle.dart';
+import '../../widgets/auditor_scorecard.dart';
 import '../../widgets/stat_card.dart';
 import '../../widgets/today_audits_section.dart';
 
@@ -61,43 +59,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  /// Pushes one filter selection — whether it came from the sheet, from a
-  /// chip's X, or from "Clear all" — into BOTH providers.
-  ///
-  /// Both, always: DashboardProvider owns the stat tiles and the ATS/OTC
-  /// score while AuditsProvider owns the "what needs attention" lists, and
-  /// a dashboard whose tallies say "Zone A only" above three sections
-  /// still listing every zone is worse than no filter at all. Same reason
-  /// the plain ScopeToggle has always called setTeamScope on both.
-  ///
-  /// The two providers are read BEFORE the first await and the refetches
-  /// run together rather than one after the other: reading them up front
-  /// means there is no post-await `context` use to guard at all (the
-  /// use_build_context_synchronously trap this codebase keeps hitting),
-  /// and the two GETs are independent, so serialising them would just
-  /// double how long the spinner is up.
-  Future<void> _applyFilters(AuditFilterSelection selection) {
-    final dashboard = context.read<DashboardProvider>();
-    final audits = context.read<AuditsProvider>();
-    return Future.wait([
-      dashboard.applyFilters(
-        isTeam: selection.isTeam,
-        employees: selection.employees,
-        locations: selection.locations,
-        auditTypes: selection.auditTypes,
-      ),
-      audits.applyFilters(
-        isTeam: selection.isTeam,
-        employees: selection.employees,
-        locations: selection.locations,
-        auditTypes: selection.auditTypes,
-      ),
-    ]);
-  }
-
   @override
   Widget build(BuildContext context) {
     final dashboard = context.watch<DashboardProvider>();
+    final showFullLoader = dashboard.isLoading && !dashboard.hasLoadedStats && dashboard.errorMessage == null;
     final user = context.watch<AuthProvider>().user;
     final auditsProvider = context.watch<AuditsProvider>();
 
@@ -147,31 +112,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
           SliverPadding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
             sliver: SliverToBoxAdapter(
-              child: DashboardFilterBar(
-                isTeam: dashboard.isTeamScope,
-                employees: dashboard.employeeFilter,
-                locations: dashboard.locationFilter,
-                auditTypes: dashboard.auditTypeFilter,
-                activeCount: dashboard.activeFilterCount,
-                onScopeChanged: (isTeam) {
-                  // The coarse toggle keeps its own cheap path (one flag,
-                  // no sheet round-trip) but still has to move every
-                  // provider this filter concept is shared with — NOT just
-                  // the two THIS screen reads from. NcProvider is a single
-                  // root-scoped instance shared with the NC Monitoring tab
-                  // (NcListMode.auditorOnly); skipping it here would leave
-                  // that tab's own Me/Team stuck on whatever it was last
-                  // set to elsewhere, disagreeing with the dashboard/
-                  // audits scope this same toggle just changed.
-                  context.read<DashboardProvider>().setTeamScope(isTeam);
-                  context.read<AuditsProvider>().setTeamScope(isTeam);
-                  context.read<NcProvider>().setTeamScope(isTeam);
-                },
-                onApply: _applyFilters,
-              ),
+              // The shared filter bar (widgets/audit_filter_bar.dart): Me /
+              // All Members, the Filters sheet and the active-filter pills.
+              // Status is left off — the tiles below always count every
+              // status (the web dashboard only applies Status to its table).
+              child: const AuditFilterBar(),
             ),
           ),
-          if (dashboard.isLoading && dashboard.errorMessage == null)
+          // Full-page loader only until the first answer: later refreshes
+          // (filters, socket events) keep the page — and its scroll — as is.
+          if (showFullLoader)
             const SliverFillRemaining(child: AppLoading())
           else if (dashboard.errorMessage != null)
             SliverFillRemaining(
@@ -189,17 +139,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
             // identical GET /audits/auditor-stats response — NOT the
             // NC-closure-based score (that one's AuditeeStats, the
             // auditee's own dashboard below).
-            if (!dashboard.isLoading &&
-                dashboard.errorMessage == null &&
-                (dashboard.stats.auditAtsScore != null ||
-                    dashboard.stats.auditOtcScore != null))
+            // ATS/OTC are the auditee's (for their NCs) — an auditor's own
+            // scorecard is plan vs actual + scoring (AuditorScorecard).
+            if (!showFullLoader && dashboard.errorMessage == null)
               SliverPadding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 sliver: SliverToBoxAdapter(
-                  child: ScoreRow(
-                    atsScore: dashboard.stats.auditAtsScore,
-                    otcScore: dashboard.stats.auditOtcScore,
-                  ),
+                  child: AuditorScorecard(stats: dashboard.stats),
                 ),
               ),
             // Secondary operational tallies — deliberately smaller
@@ -232,36 +178,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   title: "What needs attention",
                   icon: Icons.checklist_rounded,
                   count: auditActivityCount(auditsProvider.audits),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      TodayAuditsSection(
-                        audits: auditsProvider.audits,
-                        onSeeAll: widget.onNavigateToTab == null
-                            ? null
-                            : () => widget.onNavigateToTab!(1),
-                      ),
-                      const SizedBox(height: 14),
-                      InProgressAuditsSection(
-                        audits: auditsProvider.audits,
-                        onSeeAll: widget.onNavigateToTab == null
-                            ? null
-                            : () => widget.onNavigateToTab!(1),
-                      ),
-                      const SizedBox(height: 14),
-                      OverdueAuditsSection(
-                        audits: auditsProvider.audits,
-                        onSeeAll: widget.onNavigateToTab == null
-                            ? null
-                            : () => widget.onNavigateToTab!(1),
-                      ),
-                    ],
+                  // Accordion: opening one of Today's / In Progress /
+                  // Overdue folds the others (see AuditAttentionPanel).
+                  child: AuditAttentionPanel(
+                    audits: auditsProvider.audits,
+                    onSeeAll: widget.onNavigateToTab == null
+                        ? null
+                        : () => widget.onNavigateToTab!(1),
                   ),
                 ),
               ),
             ),
           ],
-          if (!dashboard.isLoading &&
+          if (!showFullLoader &&
               dashboard.errorMessage == null &&
               dashboard.stats.assignedAudits == 0)
             SliverFillRemaining(
@@ -278,7 +207,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           'Nothing is assigned under the people, locations '
                           'and audit types you picked.',
                       action: OutlinedButton.icon(
-                        onPressed: () => _applyFilters(_clearedSelection),
+                        onPressed: () => applyAuditFilterSelection(
+                          context,
+                          AuditFilterSelection.cleared,
+                        ),
                         icon: const Icon(Icons.filter_alt_off_outlined),
                         label: const Text('Clear filters'),
                       ),
@@ -290,383 +222,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
             ),
         ],
-      ),
-    );
-  }
-}
-
-/// The resting state as a [AuditFilterSelection] — just me, everywhere,
-/// every type. Mirrors AuditFilterScope.clearFilters' own arguments; kept
-/// here so "Clear all" and the filtered empty state can't drift apart on
-/// what "cleared" means.
-const _clearedSelection = AuditFilterSelection(
-  isTeam: false,
-  employees: [],
-  locations: [],
-  auditTypes: [],
-);
-
-/// The filter control both dashboards share: the Me/Team [ScopeToggle] on
-/// the left (or, once specific people are picked, a chip naming them), the
-/// [FilterButton] that opens the sheet on the right, and — whenever
-/// anything is actually narrowing the numbers — a wrap of removable chips
-/// underneath spelling out what.
-///
-/// It lives in this file rather than lib/widgets/ only because the two
-/// dashboards are its only callers today (AuditeeDashboardScreen imports
-/// it from here); the moment a third screen wants it, move it out —
-/// widgets/status_filter_chip_row.dart exists precisely because the
-/// copy-of-a-copy version of this idea got out of hand once already.
-///
-/// Deliberately stateless and provider-free apart from the id→name lookup:
-/// the two screens push a selection into DIFFERENT pairs of providers
-/// (Dashboard+Audits vs Dashboard+Nc) and only they know which dimensions
-/// their own endpoints honour. Everything leaves through [onApply] as one
-/// whole [AuditFilterSelection] — the same shape the sheet returns — so a
-/// chip's X and a sheet apply travel the identical code path.
-class DashboardFilterBar extends StatelessWidget {
-  final bool isTeam;
-
-  /// Employee ids, location ids and audit type NAMES — straight off
-  /// AuditFilterScope's fields, same units the sheet and the server use
-  /// (audit types travel by name; see AuditTypeOption's own doc).
-  final List<String> employees;
-  final List<String> locations;
-  final List<String> auditTypes;
-
-  /// Badge on the Filters button — DashboardProvider.activeFilterCount.
-  final int activeCount;
-
-  /// The cheap Me/Team path, which each screen wires to its own pair of
-  /// providers' setTeamScope.
-  final ValueChanged<bool> onScopeChanged;
-
-  /// Every other change — sheet result, one chip removed, "Clear all".
-  final Future<void> Function(AuditFilterSelection selection) onApply;
-
-  /// A caveat rendered under the chips, e.g. the auditee dashboard's note
-  /// that location does not narrow its NC numbers. Null on a screen where
-  /// every chip on show really is filtering what is on screen.
-  final String? footnote;
-
-  const DashboardFilterBar({
-    super.key,
-    required this.isTeam,
-    required this.employees,
-    required this.locations,
-    required this.auditTypes,
-    required this.activeCount,
-    required this.onScopeChanged,
-    required this.onApply,
-    this.footnote,
-  });
-
-  Future<void> _openSheet(BuildContext context) async {
-    final result = await showAuditFilterSheet(
-      context,
-      isTeam: isTeam,
-      employees: employees,
-      locations: locations,
-      auditTypes: auditTypes,
-      // month deliberately omitted: passing it non-null is what makes the
-      // sheet show its Month section, and neither dashboard has a month
-      // dimension to show one for (that section is the Calendar's).
-    );
-    if (result == null) return;
-    // The sheet can outlive this widget — a socket-driven rebuild, an
-    // AppMode switch or a logout can all tear the dashboard down while it
-    // is open, and applying then would touch providers on behalf of a
-    // screen that is gone.
-    if (!context.mounted) return;
-    await onApply(result);
-  }
-
-  /// Re-emits the whole selection with one dimension replaced — the chips
-  /// each change exactly one thing, and [onApply] only ever deals in
-  /// complete selections.
-  Future<void> _applyChange({
-    bool? isTeam,
-    List<String>? employees,
-    List<String>? locations,
-    List<String>? auditTypes,
-  }) {
-    return onApply(
-      AuditFilterSelection(
-        isTeam: isTeam ?? this.isTeam,
-        employees: employees ?? this.employees,
-        locations: locations ?? this.locations,
-        auditTypes: auditTypes ?? this.auditTypes,
-      ),
-    );
-  }
-
-  /// Names the person when exactly one is picked — "Asha Menon" beats
-  /// "1 person" and the name is already in the cache the sheet filled —
-  /// and counts them otherwise.
-  String _peopleLabel(FilterOptionsProvider options) {
-    if (employees.length == 1) {
-      for (final e in options.employees) {
-        if (e.id == employees.first) return e.name;
-      }
-      return '1 person';
-    }
-    return '${employees.length} people';
-  }
-
-  /// Resolves a location id through the sheet's cached option list.
-  /// Falls back to a generic word rather than showing the raw ObjectId:
-  /// the cache is loaded before anything can be picked, so an unresolved
-  /// id means the cache was dropped, and a hex string on a chip reads as
-  /// a bug to the user.
-  String _locationLabel(FilterOptionsProvider options, String id) {
-    for (final l in options.locations) {
-      if (l.id == id) return l.name;
-    }
-    return 'Location';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    // watch, not read: this cache fills in asynchronously the first time
-    // the sheet is opened, and these chips are what turn its ids back into
-    // names.
-    final options = context.watch<FilterOptionsProvider>();
-    // Same rule as AuditFilterScope.hasActiveFilters — plain "Me" is the
-    // resting state and shows no chips; Team is a deliberate widening and
-    // does. Recomputed rather than passed in so the two screens have one
-    // less field to keep in sync with the provider they already read the
-    // four selections from.
-    final hasActive =
-        isTeam ||
-        employees.isNotEmpty ||
-        locations.isNotEmpty ||
-        auditTypes.isNotEmpty;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          // Scope control hard left, Filters hard right, leftover width
-          // absorbed as the gap between them. The left child is Flexible
-          // and scrolls horizontally, so on a 360px phone — where a
-          // SegmentedButton plus the Filters button come within a few
-          // pixels of the whole 328px content width — the toggle gives way
-          // instead of the row overflowing.
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Flexible(
-              child: Padding(
-                // Guarantees a gap even at the width where spaceBetween
-                // has none left to hand out.
-                padding: const EdgeInsets.only(right: 12),
-                child: employees.isEmpty
-                    ? SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: ScopeToggle(
-                          isTeam: isTeam,
-                          onChanged: onScopeChanged,
-                        ),
-                      )
-                    // Picking specific people WINS over Me/Team server-side
-                    // (AuditFilterScope.filterParams sends employeeIds and
-                    // ignores the flag entirely), so a segmented button
-                    // still sitting on "Me" would be asserting a scope that
-                    // is not in force. Hidden rather than disabled: a
-                    // greyed-out toggle still reads as a statement about
-                    // the current scope, and the honest statement is the
-                    // list of people. This chip is also where the people
-                    // dimension is REMOVED, which is why the wrap below
-                    // skips its own people chip in this state — one
-                    // dimension, one control.
-                    // The people PILL, not a full Material InputChip — see
-                    // _FilterPill's own doc for why every active-filter
-                    // affordance on this bar moved off InputChip/ActionChip:
-                    // their built-in padding/avatar slot made even one
-                    // active filter read as heavier than it needed to, and
-                    // several of them wrapping onto a second/third line
-                    // (the old `Wrap` below) is exactly what made this bar
-                    // feel oversized on a phone.
-                    : Align(
-                        alignment: Alignment.centerLeft,
-                        child: _FilterPill(
-                          label: _peopleLabel(options),
-                          onTap: () => _openSheet(context),
-                          onRemove: () => _applyChange(employees: const []),
-                        ),
-                      ),
-              ),
-            ),
-            FilterButton(
-              activeCount: activeCount,
-              onTap: () => _openSheet(context),
-            ),
-          ],
-        ),
-        // What is narrowing the numbers, spelled out. A surprising tally
-        // has to be explainable without reopening the sheet to go looking
-        // for why — and each pill removes just its own dimension, so
-        // widening back out is one tap rather than a round trip.
-        //
-        // Fixed-HEIGHT, horizontally-scrolling single row — deliberately
-        // NOT a `Wrap` (which is what this used to be): a Wrap grows
-        // downward, one more line per overflowed pill, so three or four
-        // active filters could push this row to two or three lines tall
-        // and shove the actual page content down with it. A single
-        // scrollable row caps the vertical cost at exactly one row no
-        // matter how many filters are active — reach the ones that don't
-        // fit by scrolling sideways, same as Calendar's own active-filter
-        // strip (screens/calendar/calendar_screen.dart#_ActiveFilterBar),
-        // which this now matches instead of diverging from.
-        //
-        // "Clear" sits OUTSIDE that scrollable ListView, not as its last
-        // item — with enough active filters (team + a few audit types +
-        // a few locations easily runs to 6-8 pills), the row scrolls well
-        // past one screen's width and Clear used to be all the way at the
-        // far end of it, behind however many pills happened to be picked.
-        // Pinned to the left instead: always exactly one tap away
-        // regardless of how many pills are active or how far the pill row
-        // itself has been scrolled.
-        if (hasActive) ...[
-          const SizedBox(height: 8),
-          SizedBox(
-            height: 30,
-            child: Row(
-              children: [
-                TextButton(
-                  onPressed: () => onApply(_clearedSelection),
-                  style: TextButton.styleFrom(
-                    minimumSize: const Size(0, 30),
-                    padding: const EdgeInsets.symmetric(horizontal: 10),
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  child: const Text('Clear', style: TextStyle(fontSize: 12.5)),
-                ),
-                Expanded(
-                  child: ListView(
-                    scrollDirection: Axis.horizontal,
-                    children: [
-                      for (final type in auditTypes)
-                        _FilterPill(
-                          label: type,
-                          onRemove: () => _applyChange(
-                            auditTypes: [...auditTypes]..remove(type),
-                          ),
-                        ),
-                      for (final id in locations)
-                        _FilterPill(
-                          label: _locationLabel(options, id),
-                          // Employee selections are left alone when a
-                          // location goes: the two are independent params
-                          // server-side (employeeIds ∩ locationIds), and
-                          // silently dropping people because their
-                          // location was removed would be a second,
-                          // invisible edit to a filter the user did not
-                          // ask to change.
-                          onRemove: () => _applyChange(
-                            locations: [...locations]..remove(id),
-                          ),
-                        ),
-                      // Only in the Team case — the specific-people state
-                      // is already represented by the pill that replaced
-                      // the toggle above, and showing the same "3 people"
-                      // twice in one bar would just raise the question of
-                      // what the difference is.
-                      if (employees.isEmpty && isTeam)
-                        _FilterPill(
-                          label: 'Team',
-                          onRemove: () => _applyChange(isTeam: false),
-                        ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (footnote != null) ...[
-            const SizedBox(height: 6),
-            Text(
-              footnote!,
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(color: scheme.outline),
-            ),
-          ],
-        ],
-      ],
-    );
-  }
-}
-
-/// One active filter as a small, self-themed pill — a plain Container/
-/// InkWell, not a Material InputChip/ActionChip. A Chip widget carries
-/// real fixed overhead (an avatar slot, delete-icon spacing, the theme's
-/// own chipTheme padding — 14/8 horizontal/vertical, see AppTheme) that
-/// stays roughly the same size REGARDLESS of density overrides, which is
-/// what made even a single active filter read as a big, heavy pill; a few
-/// of them stacked (the old `Wrap`) made the whole bar feel oversized.
-/// This is deliberately tiny: no icon, 11.5px text, a hairline border
-/// instead of a filled Material shape, matching Calendar's own compact
-/// filter strip so every screen's "what's currently narrowing this" UI
-/// looks and costs the same.
-///
-/// [onTap] is optional — the people pill (the one spot in the header row
-/// this also replaces) reopens the sheet on tap; the ones in the strip
-/// below are remove-only, same split as before this rewrite.
-class _FilterPill extends StatelessWidget {
-  final String label;
-  final VoidCallback onRemove;
-  final VoidCallback? onTap;
-
-  const _FilterPill({required this.label, required this.onRemove, this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(right: 6),
-      child: Material(
-        color: scheme.primaryContainer.withValues(alpha: 0.6),
-        borderRadius: BorderRadius.circular(999),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(999),
-          child: Padding(
-            padding: const EdgeInsets.only(left: 10, right: 6),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // A long audit type or location name must not push this
-                // pill (and the whole scrollable row) arbitrarily wide —
-                // capped rather than left to size to its content.
-                ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 140),
-                  child: Text(
-                    label,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.w600,
-                      color: scheme.onPrimaryContainer,
-                    ),
-                  ),
-                ),
-                InkWell(
-                  onTap: onRemove,
-                  borderRadius: BorderRadius.circular(999),
-                  child: Padding(
-                    padding: const EdgeInsets.all(4),
-                    child: Icon(
-                      Icons.close_rounded,
-                      size: 13,
-                      color: scheme.onPrimaryContainer,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
       ),
     );
   }
@@ -722,6 +277,17 @@ class AuditStatsGrid extends StatelessWidget {
     // from the audit tiles) and is this dashboard's only way straight into
     // the NC Monitoring tab.
     final cards = [
+      // Total first: every planned audit; opens the unfiltered Audits tab.
+      (
+        label: 'Total',
+        value: stats.totalAudits,
+        icon: Icons.assignment_outlined,
+        color: AppColors.primary,
+        tab: 1,
+        // 'All', not null: a null filter leaves the Audits tab on whatever
+        // status was picked there last.
+        filter: 'All' as String?,
+      ),
       for (final status in AuditStatus.pipeline)
         // An older server sends no NC-stage tallies: hide those tiles rather
         // than print zeros that contradict the timeliness tiles (see

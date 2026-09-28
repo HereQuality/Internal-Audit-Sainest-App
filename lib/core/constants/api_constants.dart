@@ -39,6 +39,14 @@ class ApiConstants {
   // personally the assigned auditor/auditee — powers the Auditee Calendar's
   // blue "someone's coming to audit your location" markers.
   static const auditsAtMyLocation = '/audits/at-my-location';
+  // Places I lead (Zone / Sub Zone / Area leader, a department's HOD) and the
+  // audits at them, whoever they are assigned to — the Final Report's
+  // "My locations" view (audit.controller.js#getLedPlacesSummary /
+  // getAuditsAtPlacesILead).
+  static const ledPlaces = '/audits/led-places';
+  static const auditsAtPlacesILead = '/audits/at-places-i-lead';
+  // The Final Report tiles (audit.controller.js#getCompletedAuditStats).
+  static const completedStats = '/audits/stats/completed';
   static const auditorStats = '/audits/stats/auditor';
   static const ncs = '/ncs';
   static String auditById(String id) => '/audits/$id';
@@ -97,8 +105,16 @@ class ApiConstants {
   // list (see AuditsProvider.fetchLocationEmployees), deliberately not
   // scoped by manager-hierarchy or audit type — an auditee is whoever is
   // actually at the zone being audited.
-  static String employeesByLocation(List<String> locationIds) =>
-      '/employees/by-location?locationIds=${locationIds.join(",")}';
+  static String employeesByLocation(
+    List<String> locationIds, {
+    List<String> departmentIds = const [],
+  }) {
+    final params = <String>[
+      if (locationIds.isNotEmpty) 'locationIds=${locationIds.join(",")}',
+      if (departmentIds.isNotEmpty) 'departmentIds=${departmentIds.join(",")}',
+    ];
+    return '/employees/by-location?${params.join("&")}';
+  }
 
   static const ncsRaised = '/ncs/raised'; // auditor: NCs I raised
   static const ncsMine = '/ncs/mine'; // auditee: NCs raised against me
