@@ -221,7 +221,7 @@ void main() {
               readOnly: true,
               maxScore: 5,
               onSave: ({
-                required String findingType,
+                String? findingType,
                 double? score,
                 required String remark,
                 String? auditeeEmployeeId,

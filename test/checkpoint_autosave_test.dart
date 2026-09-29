@@ -12,7 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// never overlap, retry after a failure, flush on demand, and a remark typed
 /// with no finding kept as an on-device draft.
 class _Call {
-  final String findingType;
+  final String? findingType;
   final double? score;
   final String remark;
   _Call(this.findingType, this.score, this.remark);
@@ -59,7 +59,7 @@ void main() {
     final states = <CheckpointSyncState>[];
 
     Future<String?> onSave({
-      required String findingType,
+      String? findingType,
       double? score,
       required String remark,
       String? auditeeEmployeeId,
@@ -214,7 +214,7 @@ void main() {
       await tester.pump();
       expect(calls, isEmpty);
       expect(states.where((s) => s != CheckpointSyncState.clean), isEmpty);
-      expect(find.textContaining('Draft kept on this device'), findsOneWidget);
+      expect(find.textContaining('Draft saved on this device'), findsOneWidget);
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getString('draft:p1'), 'only a remark');
     });

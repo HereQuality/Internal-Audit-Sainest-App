@@ -54,6 +54,13 @@ class NotificationTopic {
   final String description;
   // False only for a topic that has no email at all (audit_reminder).
   final bool emailApplies;
+  // Additional REAL preference keys this one display row also controls —
+  // never rename a key (see this file's own header doc), so two topics that
+  // are really one event with two outcomes (NC approved / rejected) stay
+  // two separately-tracked keys under the hood; this just stops showing
+  // them as two confusingly-separate rows. Both keys are read/written
+  // together everywhere a switch touches this topic.
+  final List<String> extraKeys;
 
   const NotificationTopic(
     this.key,
@@ -61,7 +68,11 @@ class NotificationTopic {
     this.label,
     this.description, {
     this.emailApplies = true,
+    this.extraKeys = const [],
   });
+
+  /// Every real preference key this row controls, this one included.
+  List<String> get keys => extraKeys.isEmpty ? [key] : [key, ...extraKeys];
 }
 
 const kNotificationGroupAudits = 'Audits';
@@ -143,14 +154,9 @@ const kNotificationTopics = [
   NotificationTopic(
     NotificationTypes.ncApproved,
     kNotificationGroupNcs,
-    'NC response approved',
-    'When your response to an NC is accepted and the NC is closed.',
-  ),
-  NotificationTopic(
-    NotificationTypes.ncRejected,
-    kNotificationGroupNcs,
-    'NC response rejected',
-    'When your response to an NC is rejected and you need to rework it.',
+    'NC response reviewed',
+    'When your response to an NC is approved and the NC is closed, or rejected and sent back for rework.',
+    extraKeys: [NotificationTypes.ncRejected],
   ),
   NotificationTopic(
     NotificationTypes.ncOverdue,

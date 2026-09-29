@@ -10,6 +10,7 @@ import '../../widgets/empty_state.dart';
 import '../../widgets/expandable_section.dart';
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/filter_sheet.dart';
+import '../../widgets/nc_summary_bar.dart';
 import '../../widgets/score_row.dart';
 import '../../widgets/stat_card.dart';
 import '../../widgets/today_ncs_section.dart';
@@ -125,7 +126,7 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
               ),
             )
           else ...[
-            if (stats.total > 0)
+            if (stats.total > 0) ...[
               SliverPadding(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
                 sliver: SliverToBoxAdapter(
@@ -135,6 +136,11 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
                   ),
                 ),
               ),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                sliver: SliverToBoxAdapter(child: NcSummaryBar(stats: stats)),
+              ),
+            ],
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
               sliver: SliverToBoxAdapter(
@@ -162,17 +168,23 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
                     children: [
                       TodayNcsSection(
                         ncs: ncProvider.raisedAgainstMe,
-                        onSeeAll: widget.onNavigateToTab == null ? null : () => widget.onNavigateToTab!(1),
+                        onSeeAll: widget.onNavigateToTab == null
+                            ? null
+                            : () => widget.onNavigateToTab!(1),
                       ),
                       const SizedBox(height: 14),
                       OngoingNcsSection(
                         ncs: ncProvider.raisedAgainstMe,
-                        onSeeAll: widget.onNavigateToTab == null ? null : () => widget.onNavigateToTab!(1),
+                        onSeeAll: widget.onNavigateToTab == null
+                            ? null
+                            : () => widget.onNavigateToTab!(1),
                       ),
                       const SizedBox(height: 14),
                       OverdueNcsSection(
                         ncs: ncProvider.raisedAgainstMe,
-                        onSeeAll: widget.onNavigateToTab == null ? null : () => widget.onNavigateToTab!(1),
+                        onSeeAll: widget.onNavigateToTab == null
+                            ? null
+                            : () => widget.onNavigateToTab!(1),
                       ),
                     ],
                   ),
@@ -305,7 +317,9 @@ class _AuditeeStatsGrid extends StatelessWidget {
           // only Dashboard + NCs — no separate per-status screen to send
           // each tile to individually), now with that tab's own filter
           // chip pre-applied instead of just landing there unfiltered.
-          onTap: onNavigateToTab == null ? null : () => onNavigateToTab!(1, filter: c.filter),
+          onTap: onNavigateToTab == null
+              ? null
+              : () => onNavigateToTab!(1, filter: c.filter),
         );
       },
     );

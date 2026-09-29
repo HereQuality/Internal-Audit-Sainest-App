@@ -279,14 +279,16 @@ class _SettingsScreenState extends State<SettingsScreen>
     final pushValues = <String, bool>{};
     var changes = false;
     for (final topic in topics) {
-      final emailNow = _emailValue(prefs, topic.key);
-      final pushNow = _pushValue(prefs, topic.key);
-      if (topic.emailApplies) {
-        emailValues[topic.key] = email ?? emailNow;
-        if (email != null && email != emailNow) changes = true;
+      for (final key in topic.keys) {
+        final emailNow = _emailValue(prefs, key);
+        final pushNow = _pushValue(prefs, key);
+        if (topic.emailApplies) {
+          emailValues[key] = email ?? emailNow;
+          if (email != null && email != emailNow) changes = true;
+        }
+        pushValues[key] = push ?? pushNow;
+        if (push != null && push != pushNow) changes = true;
       }
-      pushValues[topic.key] = push ?? pushNow;
-      if (push != null && push != pushNow) changes = true;
     }
     if (!changes) return;
 
@@ -771,8 +773,11 @@ class _TopicGroupCard extends StatelessWidget {
             const Divider(height: 1),
             _TopicRow(
               topic: topic,
-              emailOn: emailValue(topic.key),
-              pushOn: pushValue(topic.key),
+              // A combined row (topic.keys has more than one) reads as ON
+              // only while EVERY one of its real keys is — same rule the
+              // web app's Settings.jsx uses for its own combined row.
+              emailOn: topic.keys.every(emailValue),
+              pushOn: topic.keys.every(pushValue),
               emailEnabled: emailEnabled,
               pushEnabled: pushEnabled,
               onEmail: (on) => onTopic(topic, email: on),

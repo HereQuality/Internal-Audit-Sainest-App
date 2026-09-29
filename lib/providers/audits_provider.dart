@@ -941,7 +941,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   Future<String?> scoreCheckpoint({
     required String auditId,
     required String nodeId,
-    required String findingType,
+    // Null = no finding picked yet — a remark-only save (server:
+    // audit.controller.js#scoreParameter's isRemarkOnly branch), same as a
+    // photo already saves independent of the finding.
+    String? findingType,
     double? score,
     required String remark,
     String? locationId,
@@ -953,7 +956,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       await _dio.patch(
         ApiConstants.scoreParameter(auditId, nodeId),
         data: {
-          'findingType': findingType,
+          'findingType': ?findingType,
           'score': ?score,
           'remark': remark,
           'locationId': ?locationId,

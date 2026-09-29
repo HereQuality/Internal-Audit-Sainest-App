@@ -1333,7 +1333,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                       // pick/photo would just spam the screen.
                       onSave:
                           ({
-                            required findingType,
+                            findingType,
                             score,
                             required remark,
                             auditeeEmployeeId,

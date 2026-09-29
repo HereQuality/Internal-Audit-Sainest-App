@@ -247,7 +247,14 @@ void main() {
     test('the catalog covers every type once, in the four groups', () {
       final keys = kNotificationTopics.map((t) => t.key).toList();
       expect(keys.toSet().length, keys.length);
-      expect(keys.length, 18);
+      // 17 display rows now that NC approved/rejected are one combined row
+      // (still 18 REAL preference keys underneath it — see
+      // NotificationTopic.keys / extraKeys).
+      expect(keys.length, 17);
+      expect(
+        kNotificationTopics.expand((t) => t.keys).toSet().length,
+        18,
+      );
       expect(
         kNotificationTopics.where((t) => !t.emailApplies).map((t) => t.key),
         ['audit_reminder'],
@@ -332,7 +339,7 @@ void main() {
       server
         ..hold = Completer<void>()
         ..refuse = true;
-      final row = _rowSwitches('NC response rejected');
+      final row = _rowSwitches('NC response reviewed');
 
       await tester.tap(row.at(0));
       await tester.pump();

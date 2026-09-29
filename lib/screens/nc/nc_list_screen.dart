@@ -13,7 +13,6 @@ import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/status_badge.dart';
-import '../../widgets/status_filter_chip_row.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
 
@@ -280,12 +279,6 @@ class _NcListHeader extends StatelessWidget {
               border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
             ),
           ),
-        ),
-        StatusFilterChipRow(
-          options: filters,
-          selected: statusFilter,
-          labelFor: (o) => labels[o] ?? o,
-          onSelected: onStatusChanged,
         ),
       ],
     );

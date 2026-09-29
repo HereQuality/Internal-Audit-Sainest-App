@@ -44,15 +44,17 @@ import 'nc_details_sheet.dart';
 ///    (WidgetsBindingObserver) and when it is removed from the tree (a
 ///    location-tab switch), and the screen can [CheckpointCardState.flush]
 ///    it before Submit/Final Submit.
-///  - the server refuses a score with no finding, so a remark typed BEFORE
-///    any finding is picked is kept as a draft on this device (see
-///    _writeDraft) and folded into the first save once a finding is chosen.
+///  - a remark typed BEFORE any finding is picked saves to the server on its
+///    own too (findingType omitted — see _payload/_canSave), the same way a
+///    photo already does independent of the finding; it is also kept as a
+///    device draft (_writeDraft) purely as an offline fallback.
 /// `onSave`/`onUploadPhotos` return an error message on failure (null on
 /// success) — same shape as AuditsProvider#scoreCheckpoint/
 /// uploadCheckpointEvidence so this widget never needs to know about Dio/
 /// HTTP directly.
 typedef SaveCheckpoint = Future<String?> Function({
-  required String findingType,
+  // Null = no finding picked yet — a remark-only save (see _canSave/_payload).
+  String? findingType,
   double? score,
   required String remark,
   String? auditeeEmployeeId,
@@ -365,7 +367,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _photoRetryTimer?.cancel();
     var report = CheckpointSyncState.clean;
     if (_dirty && !widget.readOnly && (widget.shouldFlushOnDispose?.call() ?? true)) {
-      if (_isComplete) {
+      if (_canSave) {
         // Removed from the tree with an edit still on its way (a location-tab
         // switch, a collapsed group): send the latest values anyway, a few
         // tries, queued behind whatever is already in flight.
@@ -422,15 +424,21 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   bool get _isComplete => _findingType != null && _missingFieldHint == null;
 
+  // Whether a save can actually go out right now: either a real finding is
+  // complete, or nothing's picked yet but there's a remark to save on its
+  // own (mirrors _uploadPhotos, which already saves independent of the
+  // finding). Does NOT count as "complete" for Submit purposes — _isComplete
+  // above still requires a real finding.
+  bool get _canSave => _isComplete || (_findingType == null && _remarkController.text.trim().isNotEmpty);
+
   CheckpointSyncState get _syncState {
     if (widget.readOnly) return CheckpointSyncState.clean;
     if (_error != null || _photoUploadError != null) return CheckpointSyncState.failed;
     if (_saving || _uploadingPhotos) return CheckpointSyncState.saving;
     if (_dirty) {
-      // Only a remark so far: the server can't take it without a finding,
-      // so it's kept as a draft on the device — nothing to lose.
-      if (_findingType == null) return CheckpointSyncState.clean;
-      return _isComplete ? CheckpointSyncState.saving : CheckpointSyncState.incomplete;
+      if (_canSave) return CheckpointSyncState.saving;
+      if (_findingType == null) return CheckpointSyncState.clean; // nothing typed yet to send
+      return CheckpointSyncState.incomplete;
     }
     return CheckpointSyncState.clean;
   }
@@ -478,7 +486,12 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   // What the next save carries: the fields as they are RIGHT NOW (read when
   // the save actually runs, not when it was scheduled).
-  ({String findingType, double score, String remark, String? auditee, DateTime? date, String? severity}) _payload() {
+  ({String? findingType, double? score, String remark, String? auditee, DateTime? date, String? severity}) _payload() {
+    if (_findingType == null) {
+      // Nothing picked yet — just the remark, same shape a photo's own
+      // independent save already uses.
+      return (findingType: null, score: null, remark: _remarkController.text.trim(), auditee: null, date: null, severity: null);
+    }
     final rule = _rule;
     final typed = double.tryParse(_scoreController.text.trim());
     // Strong / NC are fixed by the finding; Compliance / OFI carry what was
@@ -486,7 +499,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // the server rejects an NC save without one.
     final score = rule.fixed ? rule.fixedValue : (typed ?? rule.max);
     return (
-      findingType: _findingType!,
+      findingType: _findingType,
       score: score,
       remark: _remarkController.text.trim(),
       auditee: _needsNcDetails ? _auditeeEmployeeId : null,
@@ -499,7 +512,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // is what the server has.
   Future<void> _drain() => _exclusive(() async {
         var rounds = 0;
-        while (_dirty && !_disposed && _isComplete && rounds++ < 20) {
+        while (_dirty && !_disposed && _canSave && rounds++ < 20) {
           final version = _editVersion;
           final p = _payload();
           final save = widget.onSave;
@@ -583,7 +596,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   // The last chance for an edit made on a card that's already gone.
   void _detachedSave(
-    ({String findingType, double score, String remark, String? auditee, DateTime? date, String? severity}) p,
+    ({String? findingType, double? score, String remark, String? auditee, DateTime? date, String? severity}) p,
     SaveCheckpoint save,
     ValueChanged<CheckpointSyncState>? report,
   ) {
@@ -617,7 +630,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _debounce?.cancel();
     _retryTimer?.cancel();
     _photoRetryTimer?.cancel();
-    if (_findingType == null && _dirty) await _writeDraft();
+    if (!_canSave && _dirty) await _writeDraft();
     _retryAttempt = 0;
     if (_photoUploadError != null && _newPhotos.isNotEmpty && !_uploadingPhotos) {
       _photoRetryAttempt = 0;
@@ -1419,8 +1432,6 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     } else if (_justSaved && !_dirty) {
       content = line(const Icon(Icons.check_circle, size: 14, color: AppColors.green), 'Saved',
           color: AppColors.readable(context, AppColors.green), weight: FontWeight.w600);
-    } else if (_findingType == null && _remarkController.text.trim().isNotEmpty) {
-      content = line(Icon(Icons.phone_android, size: 14, color: scheme.outline), 'Draft kept on this device — pick a finding to submit it');
     } else if (_missingFieldHint != null && _scoreError == null) {
       content = Text(_missingFieldHint!, textAlign: TextAlign.end, style: small);
     } else {

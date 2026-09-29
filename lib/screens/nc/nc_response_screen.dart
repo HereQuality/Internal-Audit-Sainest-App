@@ -8,6 +8,7 @@ import '../../core/utils/snackbar.dart';
 import '../../models/nc_model.dart';
 import '../../providers/dashboard_provider.dart';
 import '../../providers/nc_provider.dart';
+import '../../widgets/nc_details_header.dart';
 import '../../widgets/photo_picker_sheet.dart';
 import '../../widgets/photo_viewer.dart';
 
@@ -152,11 +153,7 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
       body: ListView(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
         children: [
-          Text(widget.nc.title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
-          if (widget.nc.description.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Text(widget.nc.description, style: TextStyle(color: scheme.outline)),
-          ],
+          NcDetailsHeader(nc: widget.nc),
           if (widget.nc.reopenCount > 0 && (widget.nc.verificationNote ?? '').isNotEmpty) ...[
             const SizedBox(height: 14),
             Container(

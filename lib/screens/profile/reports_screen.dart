@@ -1287,7 +1287,11 @@ class _ReportCard extends StatelessWidget {
                         color: AppColors.forAuditStatus(audit.displayLabel),
                       ),
                       const SizedBox(height: 4),
-                      _scoreBadge(context, audit.scorePercentage),
+                      // No score shown until this audit has actually finished.
+                      _scoreBadge(
+                        context,
+                        audit.status == AuditStatus.completed ? audit.scorePercentage : null,
+                      ),
                     ],
                   ),
                 ],
@@ -1358,7 +1362,13 @@ class _BatchReportCard extends StatelessWidget {
   // hasn't come back yet, same "nothing to show" convention as a single
   // report's own null percentage.
   double? get _combinedPercentage {
-    if (members.any((m) => m.scoreAchieved == null || m.scoreMax == null))
+    // "Final Report" means a FINISHED score — a bundle still missing a zone
+    // is only scoring progress so far, not a final grade (its own status
+    // pill right beside this already says so), same rule the web's
+    // pages/CompletedAudits.jsx#groupFinished applies.
+    if (members.any(
+      (m) => m.status != AuditStatus.completed || m.scoreAchieved == null || m.scoreMax == null,
+    ))
       return null;
     final achieved = members.fold<double>(
       0,
@@ -1452,28 +1462,9 @@ class _BatchReportCard extends StatelessWidget {
                                     ],
                                   ),
                                 ),
-                                // The web's "Bundle" marker: this row stands
-                                // in for several locations' audits.
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 7,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    border: Border.all(
-                                      color: scheme.primary.withValues(alpha: 0.5),
-                                    ),
-                                    borderRadius: BorderRadius.circular(999),
-                                  ),
-                                  child: Text(
-                                    'Bundle',
-                                    style: TextStyle(
-                                      color: scheme.primary,
-                                      fontWeight: FontWeight.w700,
-                                      fontSize: 11,
-                                    ),
-                                  ),
-                                ),
+                                // No separate "Bundle" word chip — the "N locations" one
+                                // right above already says that; a second badge repeating
+                                // it read as confusing clutter, not new information.
                                 if (_RecurringBadge.sharedFrequency(members) != null)
                                   _RecurringBadge(
                                     frequency: _RecurringBadge.sharedFrequency(members),
@@ -1603,7 +1594,10 @@ class _BatchReportCard extends StatelessWidget {
                               ),
                             ),
                             const SizedBox(width: 6),
-                            _scoreBadge(context, m.scorePercentage),
+                            _scoreBadge(
+                              context,
+                              m.status == AuditStatus.completed ? m.scorePercentage : null,
+                            ),
                             const SizedBox(width: 2),
                             _PdfIconButton(
                               isDownloading: downloadingMemberId == m.id,
@@ -1802,7 +1796,10 @@ class _PerLocationReportCardState extends State<_PerLocationReportCard> {
                       Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          _scoreBadge(context, audit.scorePercentage),
+                          _scoreBadge(
+                            context,
+                            audit.status == AuditStatus.completed ? audit.scorePercentage : null,
+                          ),
                           const SizedBox(width: 4),
                           _PdfIconButton(
                             isDownloading: widget.isDownloading,

@@ -83,6 +83,20 @@ class NcModel {
   final String ncId;
   final String auditId;
   final String auditTitle;
+  // The audit's kind and dates — server: controllers/nc.controller.js
+  // populates `auditId` with these (title auditType scheduledDate
+  // scheduledEndDate), same fields the web app's NC popups show.
+  final String? auditType;
+  final DateTime? auditScheduledDate;
+  final DateTime? auditScheduledEndDate;
+  // Where the NC was raised — server: nc.controller.js#withPlaceNames (a
+  // frozen name if the place was since renamed/deleted, else the live one).
+  final String? locationName;
+  final String? departmentName;
+  // How many times the SAME checkpoint wording was raised at this SAME place
+  // before this one — server: nc.controller.js#withRepeatCounts. 0 = not a
+  // repeat.
+  final int repeatCount;
   final String title;
   final String description;
   final String status; // Raised | Response Submitted | Verification | Closed
@@ -108,6 +122,12 @@ class NcModel {
     required this.ncId,
     required this.auditId,
     required this.auditTitle,
+    this.auditType,
+    this.auditScheduledDate,
+    this.auditScheduledEndDate,
+    this.locationName,
+    this.departmentName,
+    this.repeatCount = 0,
     required this.title,
     required this.description,
     required this.status,
@@ -130,6 +150,12 @@ class NcModel {
       ncId: json['ncId']?.toString() ?? '',
       auditId: (auditRef is Map ? auditRef['_id'] : auditRef)?.toString() ?? '',
       auditTitle: auditRef is Map ? (auditRef['title']?.toString() ?? '') : '',
+      auditType: auditRef is Map ? auditRef['auditType']?.toString() : null,
+      auditScheduledDate: auditRef is Map ? DateTime.tryParse(auditRef['scheduledDate']?.toString() ?? '') : null,
+      auditScheduledEndDate: auditRef is Map ? DateTime.tryParse(auditRef['scheduledEndDate']?.toString() ?? '') : null,
+      locationName: json['locationName']?.toString(),
+      departmentName: json['departmentName']?.toString(),
+      repeatCount: (json['repeatCount'] as num?)?.toInt() ?? 0,
       title: json['title']?.toString() ?? '',
       description: json['description']?.toString() ?? '',
       status: json['status']?.toString() ?? 'Raised',

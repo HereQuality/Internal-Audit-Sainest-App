@@ -361,7 +361,15 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                   TextFormField(
                     controller: _remarkController,
                     maxLines: 3,
-                    decoration: const InputDecoration(labelText: 'Remark', alignLabelWithHint: true, prefixIcon: Icon(Icons.chat_bubble_outline)),
+                    decoration: const InputDecoration(
+                      labelText: 'Remark',
+                      // Carried over from the checkpoint's own remark box behind this
+                      // sheet (same field, see this file's own header doc) — said here
+                      // so it doesn't read as an unexplained prefill.
+                      helperText: 'This is the checkpoint\'s remark — edit it here if needed',
+                      alignLabelWithHint: true,
+                      prefixIcon: Icon(Icons.chat_bubble_outline),
+                    ),
                     validator: (v) => (v == null || v.trim().isEmpty) ? 'Add a remark' : null,
                   ),
                 ],

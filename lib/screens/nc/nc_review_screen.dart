@@ -9,6 +9,7 @@ import '../../models/nc_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/dashboard_provider.dart';
 import '../../providers/nc_provider.dart';
+import '../../widgets/nc_details_header.dart';
 import '../../widgets/photo_viewer.dart';
 
 /// The NC review thread — chat-style, same convention as the web app's NC
@@ -137,6 +138,7 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
               children: [
+                NcDetailsHeader(nc: nc),
                 _Bubble(
                   align: Alignment.centerLeft,
                   color: Theme.of(context).colorScheme.surfaceContainerHighest,
