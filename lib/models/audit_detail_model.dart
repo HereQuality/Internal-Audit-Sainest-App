@@ -219,6 +219,46 @@ class AuditScoreResult {
   }
 }
 
+/// A Lead + Support ("shared") audit is claimed by whichever assigned auditor
+/// FIRST starts it — server: utils/auditOwnership.js#ownershipFor, sent as
+/// `ownership` on every audit row (list AND detail). Mirrors the web app's
+/// own OwnershipPill.jsx reading of the same field.
+///   mode "single"   a normal audit (or Lead with no Support) — never claimed
+///   mode "shared"   Lead + Support; state "unclaimed" until someone starts it,
+///                   "claimed" once `ownerName` has it (an unclaimed one left
+///                   overdue defaults to the Lead — claimMode "overdue-default")
+class AuditOwnership {
+  final String mode; // "single" | "shared"
+  final String state; // "n/a" | "unclaimed" | "claimed"
+  final String? ownerName;
+  final String? claimMode; // "started" | "scored" | "overdue-default" | null
+  final bool canStart;
+  final String? startBlockedReason;
+
+  const AuditOwnership({
+    this.mode = 'single',
+    this.state = 'n/a',
+    this.ownerName,
+    this.claimMode,
+    this.canStart = false,
+    this.startBlockedReason,
+  });
+
+  bool get isSharedUnclaimed => mode == 'shared' && state == 'unclaimed';
+
+  factory AuditOwnership.fromJson(Map<String, dynamic>? json) {
+    if (json == null) return const AuditOwnership();
+    return AuditOwnership(
+      mode: json['mode']?.toString() ?? 'single',
+      state: json['state']?.toString() ?? 'n/a',
+      ownerName: json['ownerName']?.toString(),
+      claimMode: json['claimMode']?.toString(),
+      canStart: json['canStart'] as bool? ?? false,
+      startBlockedReason: json['startBlockedReason']?.toString(),
+    );
+  }
+}
+
 class AuditDetailModel {
   final String id;
   final String title;
@@ -295,6 +335,9 @@ class AuditDetailModel {
   // locationParameters/ncs above are already narrowed server-side when
   // this is "scoped", not filtered again on the client.
   final String accessLevel;
+  // First-to-start ownership, for a Lead + Support audit — see
+  // AuditOwnership's own doc above.
+  final AuditOwnership ownership;
 
   const AuditDetailModel({
     required this.id,
@@ -333,6 +376,7 @@ class AuditDetailModel {
     this.scoreResult = const AuditScoreResult(),
     this.ncs = const [],
     this.accessLevel = 'full',
+    this.ownership = const AuditOwnership(),
   });
 
   int get openNcCount => ncs.where((n) => n.status != 'Closed').length;
@@ -410,6 +454,7 @@ class AuditDetailModel {
       scoreResult: AuditScoreResult.fromJson(json['scoreResult'] as Map<String, dynamic>?),
       ncs: (json['ncs'] as List? ?? []).whereType<Map>().map((e) => NcModel.fromJson(Map<String, dynamic>.from(e))).toList(),
       accessLevel: json['accessLevel']?.toString() ?? 'full',
+      ownership: AuditOwnership.fromJson(json['ownership'] as Map<String, dynamic>?),
     );
   }
 }

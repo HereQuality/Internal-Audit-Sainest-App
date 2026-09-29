@@ -207,16 +207,30 @@ void main() {
       expect(calls, isEmpty);
     });
 
-    testWidgets('a remark typed with no finding is kept as a device draft, not flagged unsaved', (tester) async {
+    testWidgets('a remark typed with no finding saves on its own, the same way a photo does', (tester) async {
       await pump(tester);
       await tester.enterText(find.byType(TextField).first, 'only a remark');
       await tester.pump(const Duration(seconds: 2));
       await tester.pump();
-      expect(calls, isEmpty);
-      expect(states.where((s) => s != CheckpointSyncState.clean), isEmpty);
-      expect(find.textContaining('Draft saved on this device'), findsOneWidget);
+      expect(calls.single.findingType, isNull);
+      expect(calls.single.score, isNull);
+      expect(calls.single.remark, 'only a remark');
+      expect(find.text('Saved'), findsOneWidget);
+      // Sent to the server, so no local fallback copy is left behind.
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('draft:p1'), 'only a remark');
+      expect(prefs.getString('draft:p1'), isNull);
+    });
+
+    testWidgets('a remark-only save that fails keeps a local copy as a fallback', (tester) async {
+      await pump(tester);
+      nextError = 'Could not reach the server.';
+      await tester.enterText(find.byType(TextField).first, 'offline remark');
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump();
+      expect(calls.single.remark, 'offline remark');
+      expect(states.last, CheckpointSyncState.failed);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString('draft:p1'), 'offline remark');
     });
 
     testWidgets('a saved device draft comes back and rides along with the first save', (tester) async {

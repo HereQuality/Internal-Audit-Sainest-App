@@ -44,6 +44,10 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   bool _isFinalSubmitting = false;
   bool _isSubmitting = false;
   bool _settingRepresentative = false;
+  // A Lead + Support audit is claimed by whoever starts it first — asked once,
+  // on the very first load of this screen (see _load), never again on a
+  // pull-to-refresh (promptRepresentative: false) of the SAME visit.
+  bool _claimPromptShown = false;
   final Set<String> _removingCheckpointIds = {};
   // One GlobalKey per checkpoint, populated as the tree builds (see
   // _buildTree) — lets Final Submit jump straight to whichever checkpoint
@@ -211,6 +215,24 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     await provider.fetchAuditDetail(widget.auditId);
     if (!mounted) return;
     final audit = provider.activeAudit;
+    // Confirm BEFORE anything else: this is a shared (Lead + Support) audit
+    // nobody has started yet, and scoring it will claim it for this person —
+    // silently, server-side, on the very first checkpoint tap — and remove
+    // every other auditor's ability to do it instead. Asking up front means
+    // nobody claims one by accident just from opening it to look.
+    if (promptRepresentative &&
+        !_claimPromptShown &&
+        audit != null &&
+        audit.ownership.isSharedUnclaimed &&
+        audit.ownership.canStart) {
+      _claimPromptShown = true;
+      final proceed = await _confirmClaim(audit);
+      if (!mounted) return;
+      if (!proceed) {
+        Navigator.of(context).pop();
+        return;
+      }
+    }
     if (audit != null &&
         audit.structureMode == 'per-location' &&
         audit.locationParameters.isNotEmpty) {
@@ -644,6 +666,39 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     } finally {
       if (mounted) setState(() => _isSubmitting = false);
     }
+  }
+
+  // "Are you sure you want to perform this audit?" — the gate on a Lead +
+  // Support audit nobody has started yet (see _load). Yes claims it for this
+  // person the moment they score the first checkpoint (server: utils/
+  // auditClaim.js#claimForMember) and removes every other auditor's ability
+  // to do it instead — irreversible, so it is asked plainly before that
+  // happens, not discovered afterwards.
+  Future<bool> _confirmClaim(AuditDetailModel audit) async {
+    final others = audit.auditorNames.where((n) => n.trim().isNotEmpty).toList();
+    final proceed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Perform this audit?'),
+        content: Text(
+          others.length > 1
+              ? "This audit is shared between ${others.join(', ')}. Starting it now assigns it to you and removes it from the others — if it is later left overdue with nobody having started it, it falls to the Lead auditor instead."
+              : 'Starting this audit now assigns it to you. Are you sure you want to perform this audit?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Not now'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Yes, perform it'),
+          ),
+        ],
+      ),
+    );
+    return proceed ?? false;
   }
 
   Future<void> _handleFinalSubmit(AuditDetailModel audit) async {

@@ -534,6 +534,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
           // latest values, nothing more to do here.
           if (_disposed) return;
           if (error != null) {
+            // A remark-only save that failed (offline, most likely) keeps a
+            // local copy too — the automatic retry below will still resend
+            // it to the server; this is just a safety net against losing it
+            // if the app is killed before that succeeds.
+            if (p.findingType == null) _persistDraft(widget.draftKey, p.remark);
             _update(() {
               _saving = false;
               _error = error;
@@ -630,7 +635,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _debounce?.cancel();
     _retryTimer?.cancel();
     _photoRetryTimer?.cancel();
-    if (!_canSave && _dirty) await _writeDraft();
+    // Only the true "nothing picked yet" gap needs the on-device fallback — a
+    // finding that IS picked but still incomplete (e.g. OFI with no score
+    // typed) has nothing useful to persist here; _canSave would also be
+    // false for it, but writing a draft in that case serves no purpose.
+    if (_findingType == null && _dirty) await _writeDraft();
     _retryAttempt = 0;
     if (_photoUploadError != null && _newPhotos.isNotEmpty && !_uploadingPhotos) {
       _photoRetryAttempt = 0;
@@ -659,11 +668,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   void _onDebounceFired() {
     if (_disposed) return;
-    if (_findingType == null) {
-      _writeDraft();
-    } else {
-      _drain();
-    }
+    // A remark with no finding yet now saves to the server on its own (see
+    // _canSave's own doc) — _drain handles that case too, so it is always the
+    // right call here; the on-device draft (_writeDraft) is written only as
+    // an offline fallback, from _drain itself once a save actually fails.
+    _drain();
     _report();
   }
 
