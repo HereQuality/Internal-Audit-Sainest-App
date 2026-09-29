@@ -10,6 +10,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_status.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/report_stats.dart';
+import '../../core/utils/responsive.dart';
 import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
 import '../../models/audit_model.dart';
@@ -23,6 +24,7 @@ import '../../widgets/audit_agenda.dart' show AgendaEntry;
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
+import '../../widgets/max_width_scroll.dart';
 import '../../widgets/status_badge.dart';
 import '../../widgets/status_filter_chip_row.dart';
 import '../audits/audit_detail_screen.dart';
@@ -136,6 +138,11 @@ class _ReportsScreenState extends State<ReportsScreen> {
   late bool _byLocation;
   // Accordion: the key of the ONE bundle / series card that is open.
   String? _expandedKey;
+  // Location-wise view: every group starts COLLAPSED — just its header
+  // (place, report count, cumulative score), its own audits hidden until
+  // that header is tapped. More than one can be open at once, unlike
+  // _expandedKey above.
+  Set<String> _expandedLocationKeys = {};
   Timer? _statsDebounce;
 
   @override
@@ -146,6 +153,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
     _led = _saved.extra['led'] == true;
     _byLocation = _saved.extra['grouped'] == true;
     _expandedKey = _saved.extra['expanded'] as String?;
+    _expandedLocationKeys = {
+      ...?((_saved.extra['expandedLocations'] as List?)?.cast<String>()),
+    };
     _search = _saved.search;
     _searchController = TextEditingController(text: _saved.search);
     _scroll = ScrollController(initialScrollOffset: _saved.scroll)
@@ -204,7 +214,15 @@ class _ReportsScreenState extends State<ReportsScreen> {
       ..extra['status'] = _statusFilter
       ..extra['led'] = _led
       ..extra['grouped'] = _byLocation
-      ..extra['expanded'] = _expandedKey;
+      ..extra['expanded'] = _expandedKey
+      ..extra['expandedLocations'] = _expandedLocationKeys.toList();
+  }
+
+  void _toggleLocationGroup(String key) {
+    setState(() {
+      if (!_expandedLocationKeys.add(key)) _expandedLocationKeys.remove(key);
+    });
+    _remember();
   }
 
   void _setLed(bool led) {
@@ -380,7 +398,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
       appBar: AppBar(title: const Text('Final Report')),
       body: RefreshIndicator(
         onRefresh: _load,
-        child: ListView(
+        child: MaxWidthScroll(
+          child: ListView(
           controller: _scroll,
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.only(bottom: 24),
@@ -562,6 +581,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 ),
               ),
           ],
+          ),
         ),
       ),
     );
@@ -583,26 +603,37 @@ class _ReportsScreenState extends State<ReportsScreen> {
     return null;
   }
 
-  // The location-wise view: one header per location — its name, how many
-  // reports and its cumulative score (Σ achieved / Σ possible of its finished
-  // ones, never an average of percentages) — above its rows. A bundle spans
-  // several locations, so bundles sit together under their own header.
+  // The location-wise view: one header per REAL location — its name, how
+  // many reports and its cumulative score (Σ achieved / Σ possible of its
+  // finished ones, never an average of percentages) — above its rows. A
+  // multi-location bundle is exploded here into one synthetic single-zone
+  // item per member — each already carries its OWN real location (see
+  // AuditModel.location) — instead of being kept whole and dumped into one
+  // shared "Multi-location bundles" bucket regardless of which real places
+  // its zones were actually at, which used to mix totally unrelated
+  // bundles' scores into one meaningless combined %. Mirrors the identical
+  // fix on the web Final Report page (pages/CompletedAudits.jsx).
   List<Widget> _locationSections(List<_TopLevelItem> items) {
-    final groups = <String, List<_TopLevelItem>>{};
+    final exploded = <_TopLevelItem>[];
     for (final item in items) {
-      final key = item.batchId != null
-          ? 'Multi-location bundles'
-          : (item.members.first.location.isNotEmpty
-                ? item.members.first.location
-                : 'No location');
+      if (item.batchId != null) {
+        exploded.addAll(item.members.map((m) => _TopLevelItem(members: [m])));
+      } else {
+        exploded.add(item);
+      }
+    }
+    final groups = <String, List<_TopLevelItem>>{};
+    for (final item in exploded) {
+      final key = item.members.first.location.isNotEmpty
+          ? item.members.first.location
+          : 'No location';
       groups.putIfAbsent(key, () => []).add(item);
     }
     final keys = groups.keys.toList()
       ..sort((a, b) {
-        // Bundles last, the rest alphabetical.
-        final ab = a == 'Multi-location bundles';
-        final bb = b == 'Multi-location bundles';
-        if (ab != bb) return ab ? 1 : -1;
+        // A zone with no resolvable place sorts last, the rest alphabetical.
+        final an = a == 'No location', bn = b == 'No location';
+        if (an != bn) return an ? 1 : -1;
         return a.toLowerCase().compareTo(b.toLowerCase());
       });
     return [
@@ -613,11 +644,14 @@ class _ReportsScreenState extends State<ReportsScreen> {
           stats: ReportStats.fromAudits([
             for (final i in groups[key]!) ...i.members,
           ]),
+          isExpanded: _expandedLocationKeys.contains(key),
+          onToggle: () => _toggleLocationGroup(key),
         ),
-        for (final item in groups[key]!) ...[
-          _buildItem(item),
-          const SizedBox(height: 10),
-        ],
+        if (_expandedLocationKeys.contains(key))
+          for (final item in groups[key]!) ...[
+            _buildItem(item),
+            const SizedBox(height: 10),
+          ],
       ],
     ];
   }
@@ -733,8 +767,10 @@ List<_TopLevelItem> _groupTopLevel(List<AuditModel> audits) {
 
 /// The four Final Report tiles, for whatever is in view: cumulative Total
 /// Score (Σ achieved / Σ possible — never an average of each audit's %),
-/// Total Audits, On-Time Completed and Delayed Completed. A 2x2 grid whose
-/// tiles size to their text, so nothing clips at large text sizes.
+/// Total Audits, On-Time Completed and Delayed Completed. A 2-per-row grid
+/// on a phone (unchanged), more per row on a tablet-width screen — see
+/// responsiveColumnCount — whose tiles size to their text, so nothing clips
+/// at large text sizes.
 class _ReportStatTiles extends StatelessWidget {
   final ReportStats stats;
   final String? scopeLabel;
@@ -758,9 +794,13 @@ class _ReportStatTiles extends StatelessWidget {
       _StatTileData(
         icon: Icons.emoji_events_outlined,
         label: 'Total Score',
-        value: pct == null ? '—' : '$pct%',
+        // "*" once it includes a still-open audit's own progress so far, not
+        // a final grade yet — same convention a row's own partial score
+        // already carries (see stats.isPartial's own doc).
+        value: pct == null ? '—' : '$pct%${stats.isPartial ? '*' : ''}',
         sub: stats.maxPossible > 0
             ? '${_points(stats.achieved)} / ${_points(stats.maxPossible)} pts'
+                  '${stats.isPartial ? ' · includes in-progress' : ''}'
             : null,
         color: scoreColor,
       ),
@@ -804,17 +844,27 @@ class _ReportStatTiles extends StatelessWidget {
           ),
           const SizedBox(height: 6),
         ],
-        // Two per row; IntrinsicHeight keeps a pair the same height when one
-        // tile wraps its label at a large text size.
-        for (int r = 0; r < tiles.length; r += 2) ...[
-          if (r > 0) const SizedBox(height: 8),
+        // This screen doesn't use a GridView (it's one card inside the
+        // page's own outer ListView, not a scrollable of its own), so it
+        // can't hand a crossAxisCount to a SliverGridDelegate the way the
+        // two dashboards' grids do — it groups the tiles into its own
+        // N-per-row Rows instead, still driven by the SAME
+        // responsiveColumnCount helper (2 per row on a phone, unchanged).
+        // IntrinsicHeight keeps every tile in a row the same height when
+        // one wraps its label/sub text at a large text size.
+        for (final entry in _chunk(
+          tiles,
+          responsiveColumnCount(context),
+        ).indexed) ...[
+          if (entry.$1 > 0) const SizedBox(height: 8),
           IntrinsicHeight(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Expanded(child: _StatTile(data: tiles[r])),
-                const SizedBox(width: 8),
-                Expanded(child: _StatTile(data: tiles[r + 1])),
+                for (int i = 0; i < entry.$2.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 8),
+                  Expanded(child: _StatTile(data: entry.$2[i])),
+                ],
               ],
             ),
           ),
@@ -822,6 +872,23 @@ class _ReportStatTiles extends StatelessWidget {
       ],
     );
   }
+}
+
+// Splits [items] into consecutive groups of at most [size] — [size] itself
+// is never 0 (responsiveColumnCount's own `min` clamp already guarantees
+// at least 2), so this can't loop forever. The last group is simply
+// whatever is left over (never padded back up to [size]), which for this
+// screen's fixed 4 tiles only ever shows up as an uneven final row when the
+// column count doesn't evenly divide 4 (3 columns -> a row of 3 then a row
+// of 1) — an acceptable trade for reusing the one shared column-count rule
+// instead of a second, tile-count-aware one just for this screen.
+List<List<T>> _chunk<T>(List<T> items, int size) {
+  final result = <List<T>>[];
+  for (var i = 0; i < items.length; i += size) {
+    final end = i + size < items.length ? i + size : items.length;
+    result.add(items.sublist(i, end));
+  }
+  return result;
 }
 
 class _StatTileData {
@@ -903,43 +970,59 @@ class _LocationHeader extends StatelessWidget {
   final String label;
   final int count;
   final ReportStats stats;
+  final bool isExpanded;
+  final VoidCallback onToggle;
 
   const _LocationHeader({
     required this.label,
     required this.count,
     required this.stats,
+    required this.isExpanded,
+    required this.onToggle,
   });
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final pct = stats.percentage;
-    return Padding(
-      padding: const EdgeInsets.only(top: 6, bottom: 8),
-      child: Row(
-        children: [
-          Icon(Icons.place_outlined, size: 16, color: scheme.primary),
-          const SizedBox(width: 6),
-          Expanded(
-            child: Text(
-              label,
-              style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                fontWeight: FontWeight.w800,
+    // Tappable — collapsed by default, revealing this location's own
+    // audits only once tapped (see _expandedLocationKeys' own doc).
+    return InkWell(
+      onTap: onToggle,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Icon(
+              isExpanded ? Icons.expand_less : Icons.expand_more,
+              size: 18,
+              color: scheme.outline,
+            ),
+            const SizedBox(width: 2),
+            Icon(Icons.place_outlined, size: 16, color: scheme.primary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                label,
+                style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
               ),
             ),
-          ),
-          const SizedBox(width: 8),
-          Text(
-            [
-              '$count',
-              if (pct != null) '$pct%',
-            ].join(' · '),
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: scheme.outline,
-              fontWeight: FontWeight.w700,
+            const SizedBox(width: 8),
+            Text(
+              [
+                '$count',
+                if (pct != null) '$pct%${stats.isPartial ? '*' : ''}',
+              ].join(' · '),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: scheme.outline,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1052,6 +1135,7 @@ class _SeriesReportCard extends StatelessWidget {
                       _scoreBadge(
                         context,
                         stats.percentage?.toDouble(),
+                        isPartial: stats.isPartial,
                       ),
                       Icon(
                         isExpanded ? Icons.expand_less : Icons.expand_more,
@@ -1130,7 +1214,10 @@ Color _scoreColor(BuildContext context, double? score) {
   return Colors.red;
 }
 
-Widget _scoreBadge(BuildContext context, double? score) {
+// isPartial: a "*" for a score that includes a still-open audit's own
+// progress so far (see ReportStats.isPartial's own doc) — false everywhere
+// this badge shows a single, already-Completed audit's real final score.
+Widget _scoreBadge(BuildContext context, double? score, {bool isPartial = false}) {
   final color = _scoreColor(context, score);
   return Container(
     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
@@ -1139,7 +1226,7 @@ Widget _scoreBadge(BuildContext context, double? score) {
       borderRadius: BorderRadius.circular(999),
     ),
     child: Text(
-      score != null ? '${score.round()}%' : '—',
+      score != null ? '${score.round()}%${isPartial ? '*' : ''}' : '—',
       style: TextStyle(
         color: color,
         fontWeight: FontWeight.w700,
@@ -1361,21 +1448,25 @@ class _BatchReportCard extends StatelessWidget {
   // already uses on the web. Null (not 0%) if any member's own score
   // hasn't come back yet, same "nothing to show" convention as a single
   // report's own null percentage.
+  // Whether every zone is actually Completed — _combinedPercentage below is
+  // the bundle's real final score only then; otherwise it's the combined
+  // progress of whatever has been scored so far (marked with a "*" where
+  // this is shown — see reports_screen.dart's own _scoreBadge isPartial
+  // param), same rule the server's getCompletedAuditStats#isPartial and the
+  // web's pages/CompletedAudits.jsx now both apply.
+  bool get _combinedFinished => members.every((m) => m.status == AuditStatus.completed);
+
+  // Σ achieved / Σ possible across whichever zones have actually been scored
+  // (a Skipped one excluded, same rule getBatchReport's own combined score
+  // applies) — null only once nothing at all has a score yet.
   double? get _combinedPercentage {
-    // "Final Report" means a FINISHED score — a bundle still missing a zone
-    // is only scoring progress so far, not a final grade (its own status
-    // pill right beside this already says so), same rule the web's
-    // pages/CompletedAudits.jsx#groupFinished applies.
-    if (members.any(
-      (m) => m.status != AuditStatus.completed || m.scoreAchieved == null || m.scoreMax == null,
-    ))
-      return null;
-    final achieved = members.fold<double>(
-      0,
-      (sum, m) => sum + (m.scoreAchieved ?? 0),
+    final live = members.where(
+      (m) => m.status != AuditStatus.skipped && m.status != AuditStatus.draft,
     );
-    final max = members.fold<double>(0, (sum, m) => sum + (m.scoreMax ?? 0));
-    return max > 0 ? (achieved / max * 100) : null;
+    final max = live.fold<double>(0, (sum, m) => sum + (m.scoreMax ?? 0));
+    if (max <= 0) return null;
+    final achieved = live.fold<double>(0, (sum, m) => sum + (m.scoreAchieved ?? 0));
+    return achieved / max * 100;
   }
 
   // The batch's ONE status — the server's aggregate over every zone of the
@@ -1497,7 +1588,7 @@ class _BatchReportCard extends StatelessWidget {
                           Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              _scoreBadge(context, _combinedPercentage),
+                              _scoreBadge(context, _combinedPercentage, isPartial: !_combinedFinished),
                               const SizedBox(width: 4),
                               // Combined — spans every zone in this batch,
                               // not just one member (see onDownloadCombined).

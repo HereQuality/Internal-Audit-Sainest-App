@@ -210,6 +210,12 @@ Future<AuditFilterSelection?> showAuditFilterSheet(
     isScrollControlled: true,
     useSafeArea: true,
     backgroundColor: Colors.transparent,
+    // Capped on a tablet-width screen instead of stretching this sheet's
+    // rows (location chips, date fields...) edge to edge — the sheet
+    // route's own default Alignment.bottomCenter already centers a
+    // narrower-than-screen sheet horizontally, so no extra Center/Align is
+    // needed on top of this.
+    constraints: const BoxConstraints(maxWidth: 640),
     builder: (_) => _AuditFilterSheet(
       initial: initial,
       showStatus: showStatus,

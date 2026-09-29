@@ -12,6 +12,7 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/audit_filter_bar.dart';
+import '../../widgets/max_width_scroll.dart';
 import '../../widgets/status_badge.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
@@ -394,62 +395,69 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
           labels: _auditorStatusFilterLabels,
         ),
         Expanded(
-          child: showLoading
-              ? const AppLoading()
-              : showError
-              ? ErrorState(
-                  message: provider.raisedError!,
-                  onRetry: widget.onRefresh,
-                )
-              : showEmpty
-              ? (provider.hasActiveFilters
-                    ? _filteredEmpty(context)
-                    : const EmptyState(
-                        icon: Icons.fact_check_outlined,
-                        title: 'No NCs raised yet',
-                      ))
-              : RefreshIndicator(
-                  onRefresh: widget.onRefresh,
-                  child: filtered.isEmpty
-                      ? ListView(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          children: [
-                            SizedBox(
-                              height: MediaQuery.of(context).size.height * 0.5,
-                              child: EmptyState(
-                                icon: Icons.filter_alt_off_outlined,
-                                title: query.isNotEmpty
-                                    ? 'No NCs match "${_query.trim()}"'
-                                    : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
-                              ),
-                            ),
-                          ],
-                        )
-                      : ListView.separated(
-                          controller: _scroll,
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                          itemCount: filtered.length,
-                          separatorBuilder: (_, _) =>
-                              const SizedBox(height: 10),
-                          itemBuilder: (_, i) {
-                            final nc = filtered[i];
-                            return _NcCard(
-                              nc: nc,
-                              subtitle: 'Against ${nc.auditee.name}',
-                              actionLabel:
-                                  (nc.status == 'Response Submitted' ||
-                                      nc.status == 'Verification')
-                                  ? 'Review'
-                                  : (nc.status == 'Closed' ? 'View' : null),
-                              onTap: () => Navigator.of(context).push(
-                                MaterialPageRoute(
-                                  builder: (_) => NcReviewScreen(nc: nc),
+          // MaxWidthScroll wraps this whole branch (loading/error/empty
+          // states included, not just the ListView) — a thin wrap around
+          // "whatever this Expanded shows", the same one-line-per-screen
+          // approach as every other call site, rather than threading it
+          // into just the ListView/ListView.separated branch.
+          child: MaxWidthScroll(
+            child: showLoading
+                ? const AppLoading()
+                : showError
+                ? ErrorState(
+                    message: provider.raisedError!,
+                    onRetry: widget.onRefresh,
+                  )
+                : showEmpty
+                ? (provider.hasActiveFilters
+                      ? _filteredEmpty(context)
+                      : const EmptyState(
+                          icon: Icons.fact_check_outlined,
+                          title: 'No NCs raised yet',
+                        ))
+                : RefreshIndicator(
+                    onRefresh: widget.onRefresh,
+                    child: filtered.isEmpty
+                        ? ListView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            children: [
+                              SizedBox(
+                                height: MediaQuery.of(context).size.height * 0.5,
+                                child: EmptyState(
+                                  icon: Icons.filter_alt_off_outlined,
+                                  title: query.isNotEmpty
+                                      ? 'No NCs match "${_query.trim()}"'
+                                      : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
                                 ),
                               ),
-                            );
-                          },
-                        ),
-                ),
+                            ],
+                          )
+                        : ListView.separated(
+                            controller: _scroll,
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                            itemCount: filtered.length,
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(height: 10),
+                            itemBuilder: (_, i) {
+                              final nc = filtered[i];
+                              return _NcCard(
+                                nc: nc,
+                                subtitle: 'Against ${nc.auditee.name}',
+                                actionLabel:
+                                    (nc.status == 'Response Submitted' ||
+                                        nc.status == 'Verification')
+                                    ? 'Review'
+                                    : (nc.status == 'Closed' ? 'View' : null),
+                                onTap: () => Navigator.of(context).push(
+                                  MaterialPageRoute(
+                                    builder: (_) => NcReviewScreen(nc: nc),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+          ),
         ),
       ],
     );
@@ -541,67 +549,72 @@ class _AgainstMeListState extends State<_AgainstMeList> {
           labels: _auditeeStatusFilterLabels,
         ),
         Expanded(
-          child: showLoading
-              ? const AppLoading()
-              : showError
-              ? ErrorState(
-                  message: provider.mineError!,
-                  onRetry: widget.onRefresh,
-                )
-              : showEmpty
-              ? (provider.hasActiveFilters
-                    ? _filteredEmpty(context)
-                    : const EmptyState(
-                        icon: Icons.thumb_up_outlined,
-                        title: 'No NCs against you — great work!',
-                      ))
-              : RefreshIndicator(
-                  onRefresh: widget.onRefresh,
-                  child: filtered.isEmpty
-                      ? ListView(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          children: [
-                            SizedBox(
-                              height: MediaQuery.of(context).size.height * 0.5,
-                              child: EmptyState(
-                                icon: Icons.filter_alt_off_outlined,
-                                title: query.isNotEmpty
-                                    ? 'No NCs match "${_query.trim()}"'
-                                    : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
+          // See _RaisedByMeListState's identical wrap above: a thin
+          // MaxWidthScroll around whatever this Expanded shows, loading/
+          // error/empty states included.
+          child: MaxWidthScroll(
+            child: showLoading
+                ? const AppLoading()
+                : showError
+                ? ErrorState(
+                    message: provider.mineError!,
+                    onRetry: widget.onRefresh,
+                  )
+                : showEmpty
+                ? (provider.hasActiveFilters
+                      ? _filteredEmpty(context)
+                      : const EmptyState(
+                          icon: Icons.thumb_up_outlined,
+                          title: 'No NCs against you — great work!',
+                        ))
+                : RefreshIndicator(
+                    onRefresh: widget.onRefresh,
+                    child: filtered.isEmpty
+                        ? ListView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            children: [
+                              SizedBox(
+                                height: MediaQuery.of(context).size.height * 0.5,
+                                child: EmptyState(
+                                  icon: Icons.filter_alt_off_outlined,
+                                  title: query.isNotEmpty
+                                      ? 'No NCs match "${_query.trim()}"'
+                                      : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
+                                ),
                               ),
-                            ),
-                          ],
-                        )
-                      : ListView.separated(
-                          controller: _scroll,
-                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                          itemCount: filtered.length,
-                          separatorBuilder: (_, _) => const SizedBox(height: 10),
-                          itemBuilder: (_, i) {
-                            final nc = filtered[i];
-                            return _NcCard(
-                              nc: nc,
-                              subtitle: 'Raised by ${nc.raisedBy.name}',
-                              actionLabel: nc.status == 'Raised' ? 'Respond' : null,
-                              onTap: () {
-                                if (nc.status == 'Raised') {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) => NcResponseScreen(nc: nc),
-                                    ),
-                                  );
-                                } else {
-                                  Navigator.of(context).push(
-                                    MaterialPageRoute(
-                                      builder: (_) => NcReviewScreen(nc: nc),
-                                    ),
-                                  );
-                                }
-                              },
-                            );
-                          },
-                        ),
-                ),
+                            ],
+                          )
+                        : ListView.separated(
+                            controller: _scroll,
+                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                            itemCount: filtered.length,
+                            separatorBuilder: (_, _) => const SizedBox(height: 10),
+                            itemBuilder: (_, i) {
+                              final nc = filtered[i];
+                              return _NcCard(
+                                nc: nc,
+                                subtitle: 'Raised by ${nc.raisedBy.name}',
+                                actionLabel: nc.status == 'Raised' ? 'Respond' : null,
+                                onTap: () {
+                                  if (nc.status == 'Raised') {
+                                    Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => NcResponseScreen(nc: nc),
+                                      ),
+                                    );
+                                  } else {
+                                    Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => NcReviewScreen(nc: nc),
+                                      ),
+                                    );
+                                  }
+                                },
+                              );
+                            },
+                          ),
+                  ),
+          ),
         ),
       ],
     );

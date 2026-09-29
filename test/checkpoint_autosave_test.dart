@@ -110,12 +110,12 @@ void main() {
       expect(find.text('10 / 10'), findsOneWidget);
     });
 
-    testWidgets('picking Compliance prefills the max and saves; a typed score is debounced', (tester) async {
+    testWidgets('picking Compliance starts blank — nothing sent until a score is typed, then debounced', (tester) async {
       await pump(tester);
       await tester.tap(find.text('Compliance'));
       await tester.pump();
-      expect(calls.single.score, 10);
-      calls.clear();
+      expect(calls, isEmpty);
+      expect(states.last, CheckpointSyncState.incomplete);
 
       await tester.enterText(find.byType(TextField).first, '7');
       await tester.pump(const Duration(milliseconds: 300));

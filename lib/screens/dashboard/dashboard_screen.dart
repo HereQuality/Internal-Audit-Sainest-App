@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_status.dart';
+import '../../core/utils/responsive.dart';
 import '../../models/audit_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/audits_provider.dart';
@@ -13,6 +14,7 @@ import '../../widgets/expandable_section.dart';
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/filter_sheet.dart';
 import '../../widgets/auditor_scorecard.dart';
+import '../../widgets/max_width_scroll.dart';
 import '../../widgets/stat_card.dart';
 import '../../widgets/today_audits_section.dart';
 
@@ -71,7 +73,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
         context.read<DashboardProvider>().fetchStats(),
         context.read<AuditsProvider>().fetchMyAudits(),
       ]),
-      child: CustomScrollView(
+      // Wraps the WHOLE CustomScrollView (not each sliver individually) —
+      // see MaxWidthScroll's own doc for why that's the right level for a
+      // sliver tree: the cap only ever touches width, so it can't disturb
+      // this scroll view's (purely vertical) behavior.
+      child: MaxWidthScroll(
+        child: CustomScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
         slivers: [
           SliverPadding(
@@ -222,6 +229,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     ),
             ),
         ],
+        ),
       ),
     );
   }
@@ -328,7 +336,10 @@ class AuditStatsGrid extends StatelessWidget {
       // Pending" and "On-Time Completed" do not fit one line in a half-width
       // tile, and an ellipsized status name is no name at all.
       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
+        // responsiveColumnCount: 2 on a phone (unchanged), more on a
+        // tablet-width screen instead of the same 2 tiles just stretching
+        // wider and wider — see core/utils/responsive.dart.
+        crossAxisCount: responsiveColumnCount(context),
         mainAxisSpacing: 10,
         crossAxisSpacing: 10,
         mainAxisExtent: StatCard.compactTileExtent(context, labelLines: 2),

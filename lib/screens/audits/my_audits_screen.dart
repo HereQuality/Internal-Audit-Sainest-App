@@ -16,6 +16,7 @@ import '../../widgets/app_loading.dart';
 import '../../widgets/audit_agenda.dart';
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
+import '../../widgets/max_width_scroll.dart';
 
 /// screens/audits/my_audits_screen.dart
 /// ─────────────────────────────────────
@@ -453,14 +454,26 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
             // to reach true offset 0 before a second pull actually arms
             // it. `anywhere` accepts a drag starting from any position.
             triggerMode: RefreshIndicatorTriggerMode.anywhere,
-            child: showAgenda
-                ? _buildAgenda(agenda!)
-                : _buildPlaceholder(
-                    showLoading: showLoading,
-                    showError: showError,
-                    showEmptyState: showEmptyState,
-                    errorMessage: provider.errorMessage,
-                  ),
+            // MaxWidthScroll wraps the WHOLE Stack _buildAgenda returns
+            // (the sliver CustomScrollView plus the floating Today pill
+            // Positioned over it), not the CustomScrollView alone: the
+            // pill's `left: 0, right: 0` is relative to that Stack's own
+            // box, so capping just the scroll view underneath it would
+            // leave the pill centered on the OLD, uncapped width while the
+            // list beneath it narrowed. Wrapping the whole Stack keeps both
+            // inside the same capped, centred box — the cap only ever
+            // touches width, so the sliver `center` anchor's (purely
+            // vertical) behavior is unaffected either way.
+            child: MaxWidthScroll(
+              child: showAgenda
+                  ? _buildAgenda(agenda!)
+                  : _buildPlaceholder(
+                      showLoading: showLoading,
+                      showError: showError,
+                      showEmptyState: showEmptyState,
+                      errorMessage: provider.errorMessage,
+                    ),
+            ),
           ),
         ),
       ],

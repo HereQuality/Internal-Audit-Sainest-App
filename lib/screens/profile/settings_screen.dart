@@ -17,6 +17,7 @@ import '../../models/user_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/profile_provider.dart';
 import '../../providers/theme_provider.dart';
+import '../../widgets/max_width_scroll.dart';
 import 'edit_profile_screen.dart';
 
 /// iOS asks and reports through Firebase (the same source
@@ -568,7 +569,8 @@ class _SettingsScreenState extends State<SettingsScreen>
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
+      body: MaxWidthScroll(
+        child: ListView(
         padding: const EdgeInsets.all(16),
         children: [
           // The account's push switch — the SAME server-side preference as
@@ -696,6 +698,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             ),
           ),
         ],
+        ),
       ),
     );
   }

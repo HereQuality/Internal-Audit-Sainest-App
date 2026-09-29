@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -48,10 +49,9 @@ import 'nc_details_sheet.dart';
 ///    own too (findingType omitted — see _payload/_canSave), the same way a
 ///    photo already does independent of the finding; it is also kept as a
 ///    device draft (_writeDraft) purely as an offline fallback.
-/// `onSave`/`onUploadPhotos` return an error message on failure (null on
-/// success) — same shape as AuditsProvider#scoreCheckpoint/
-/// uploadCheckpointEvidence so this widget never needs to know about Dio/
-/// HTTP directly.
+/// `onSave` returns an error message on failure (null on success) — same
+/// shape as AuditsProvider#scoreCheckpoint so this widget never needs to
+/// know about Dio/HTTP directly.
 typedef SaveCheckpoint = Future<String?> Function({
   // Null = no finding picked yet — a remark-only save (see _canSave/_payload).
   String? findingType,
@@ -64,9 +64,11 @@ typedef SaveCheckpoint = Future<String?> Function({
 
 /// Uploads freshly-picked evidence photos right away — the server attaches
 /// them to this checkpoint's photoUrls the moment each upload finishes, no
-/// matter whether a finding/remark has been saved yet (see
-/// AuditsProvider.uploadCheckpointEvidence).
-typedef UploadCheckpointPhotos = Future<String?> Function({
+/// matter whether a finding/remark has been saved yet. Returns per-file,
+/// not all-or-nothing (see UploadPhotosResult/AuditsProvider
+/// .uploadCheckpointEvidence's own doc comments) — a batch can partially
+/// succeed.
+typedef UploadCheckpointPhotos = Future<UploadPhotosResult> Function({
   required List<File> photos,
   void Function(UploadPhase phase, double? fraction)? onProgress,
 });
@@ -244,7 +246,13 @@ class CheckpointCard extends StatefulWidget {
 }
 
 class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObserver {
-  static const _debounceDelay = Duration(milliseconds: 900);
+  // How long a pause in typing (remark or score) before it autosaves — long
+  // enough that a save fires once per pause, not once per keystroke/word,
+  // but still short enough that leaving right after typing (the "not saved
+  // yet" back-guard in audit_detail_screen.dart#_onBlockedPop always
+  // flushes immediately regardless of this delay) is the rare case rather
+  // than the norm.
+  static const _debounceDelay = Duration(milliseconds: 2500);
   static const _maxAutoRetries = 3;
 
   String? _findingType;
@@ -301,8 +309,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   // Photo upload — its own in-flight/error state (see _uploadPhotos), but it
   // shares the request queue above with the score save so the two can never
-  // hit the server for this checkpoint at the same time.
-  bool _uploadingPhotos = false;
+  // hit the server for this checkpoint at the same time. Per-PATH, not one
+  // flag for the whole card — a pick while an earlier one is still
+  // uploading queues behind it (still serialized through _exclusive/_tail
+  // below, never actually concurrent), but only that specific thumbnail
+  // shows busy, and the Add button is never disabled.
+  final Set<String> _uploadingPaths = {};
+  bool get _uploadingPhotos => _uploadingPaths.isNotEmpty;
   String? _photoUploadError;
   int _photoRetryAttempt = 0;
   Timer? _photoRetryTimer;
@@ -337,8 +350,22 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     if (!widget.readOnly) {
       WidgetsBinding.instance.addObserver(this);
       if (widget.node.findingType == null) _restoreDraft();
+      // A photo taken with the camera (not gallery multi-select) only
+      // finishes uploading after the auditor is back from that external
+      // Camera activity — and launching it a second time for another shot
+      // is exactly when Android is most likely to background or kill this
+      // app to free memory. _newPhotos is in-memory only, so that wipes
+      // out any photo whose upload hadn't confirmed yet. Recover it here
+      // the same way _restoreDraft recovers an unsaved remark.
+      _restorePendingPhotos();
     }
+    debugPrint('[photo-trace] $_logTag initState — existingPhotos=${_existingPhotos.length} readOnly=${widget.readOnly}');
   }
+
+  // Short, greppable id for correlating this card's own log lines — TEMPORARY
+  // instrumentation for tracking down the photo-disappears report; safe to
+  // strip once that's confirmed fixed on a device.
+  String get _logTag => 'node=${widget.node.id.substring(0, widget.node.id.length.clamp(0, 6))}';
 
   @override
   void didUpdateWidget(covariant CheckpointCard oldWidget) {
@@ -354,12 +381,18 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // _newPhotos (locally-picked, not-yet-uploaded files) is untouched
     // either way.
     if (widget.node.photoUrls != oldWidget.node.photoUrls) {
+      debugPrint('[photo-trace] $_logTag didUpdateWidget photoUrls ${oldWidget.node.photoUrls.length} -> ${widget.node.photoUrls.length}; newPhotos still pending=${_newPhotos.length}');
       setState(() => _existingPhotos = List.of(widget.node.photoUrls));
     }
   }
 
   @override
   void dispose() {
+    // If newPhotos/uploadingPaths is non-empty here, this card's State is
+    // being torn down (list rebuild, tab switch, navigation) while a photo
+    // was still pending — the persisted draft (_photoDraftKey) is what's
+    // supposed to carry it through to the next initState/_restorePendingPhotos.
+    debugPrint('[photo-trace] $_logTag dispose — newPhotos=${_newPhotos.length} uploadingPaths=${_uploadingPaths.length}');
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     _debounce?.cancel();
@@ -714,6 +747,75 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   Future<void> _writeDraft() => _persistDraft(widget.draftKey, _remarkController.text);
 
+  // ── On-device draft (photo picked but not yet confirmed uploaded) ────
+  // Same safety net as the remark draft above, for _newPhotos — see the
+  // initState comment for why this specifically matters for a camera shot.
+  String? get _photoDraftKey => widget.draftKey == null ? null : '${widget.draftKey}:photos';
+
+  Future<void> _persistPendingPhotos() async {
+    final key = _photoDraftKey;
+    if (key == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_newPhotos.isEmpty) {
+        await prefs.remove(key);
+      } else {
+        await prefs.setString(key, jsonEncode(_newPhotos.map((f) => f.path).toList()));
+      }
+    } catch (_) {
+      // Best effort — same as _persistDraft.
+    }
+  }
+
+  // Drops [gone]'s paths from the persisted draft — used once their upload
+  // is actually confirmed, so a later restore never re-sends something
+  // already attached server-side. Storage I/O only, safe to call after
+  // this card's own State is disposed.
+  Future<void> _removePersistedPhotos(List<File> gone) async {
+    final key = _photoDraftKey;
+    if (key == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(key);
+      if (saved == null || saved.isEmpty) return;
+      final gonePaths = gone.map((f) => f.path).toSet();
+      final remaining = (jsonDecode(saved) as List).cast<String>().where((p) => !gonePaths.contains(p)).toList();
+      debugPrint('[photo-trace] $_logTag _removePersistedPhotos dropping ${gonePaths.length} confirmed, ${remaining.length} still pending in draft');
+      if (remaining.isEmpty) {
+        await prefs.remove(key);
+      } else {
+        await prefs.setString(key, jsonEncode(remaining));
+      }
+    } catch (_) {
+      // Best effort.
+    }
+  }
+
+  Future<void> _restorePendingPhotos() async {
+    final key = _photoDraftKey;
+    if (key == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(key);
+      if (saved == null || saved.isEmpty || !mounted) return;
+      final paths = (jsonDecode(saved) as List).cast<String>();
+      // The file itself lives in the OS's own cache dir, not in Dart
+      // memory — it survives the process death that wiped _newPhotos, but
+      // a very old draft's file may have since been cleared by the OS.
+      final files = paths.map(File.new).where((f) => f.existsSync()).toList();
+      debugPrint('[photo-trace] $_logTag _restorePendingPhotos found ${paths.length} in draft, ${files.length} still exist on disk');
+      if (files.isEmpty) {
+        await prefs.remove(key);
+        return;
+      }
+      setState(() => _newPhotos.addAll(files));
+      _photoRetryAttempt = 0;
+      await _uploadPhotos(files);
+    } catch (_) {
+      // Malformed/unreadable draft — nothing to recover.
+    }
+  }
+
   Future<void> _persistDraft(String? key, String text) async {
     if (key == null) return;
     try {
@@ -797,9 +899,9 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   }
 
   // Score box defaults for a freshly picked finding: Strong/NC are fixed
-  // (shown, not typed), Compliance starts at full marks (the usual answer —
-  // one tap to save), OFI keeps a valid typed value or starts blank (there's
-  // no sensible default for a partial score).
+  // (shown, not typed); Compliance and OFI both keep a valid typed value if
+  // there is one, else start BLANK — the auditor enters the actual score
+  // themselves rather than the box silently pre-filling full marks for them.
   void _applyScoreDefaults(String ft) {
     final rule = scoreRuleFor(ft, widget.maxScore);
     final current = int.tryParse(_scoreController.text.trim());
@@ -809,7 +911,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     } else if (current != null && current >= rule.min && current <= rule.max) {
       next = _scoreController.text.trim();
     } else {
-      next = ft == 'Compliance' ? formatScore(rule.max) : '';
+      next = '';
     }
     _suppressEdits = true;
     _scoreController.text = next;
@@ -891,8 +993,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   Future<void> _pickPhotos() async {
     final picked = await pickEvidencePhotos(context);
+    debugPrint('[photo-trace] $_logTag _pickPhotos returned ${picked.length} file(s), mounted=$mounted');
     if (picked.isEmpty || !mounted) return;
     setState(() => _newPhotos.addAll(picked));
+    // On disk before the upload even starts — if the OS kills this app
+    // while it's still showing the camera for the NEXT shot, this photo
+    // survives to be picked back up by _restorePendingPhotos.
+    await _persistPendingPhotos();
     _photoRetryAttempt = 0;
     await _uploadPhotos(picked);
   }
@@ -902,18 +1009,25 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // comment), but queued behind any request already running for it.
   // `photos` is exactly the set this attempt is sending, so a Retry after a
   // failure can pass the same still-pending `_newPhotos` back in without
-  // resending anything that separately succeeded in the meantime.
+  // resending anything that separately succeeded in the meantime — and a
+  // batch that PARTIALLY fails (see UploadPhotosResult) only re-sends
+  // whichever of `photos` actually failed, never the ones already confirmed.
   Future<void> _uploadPhotos(List<File> photos) {
-    if (!mounted) return Future.value();
+    if (!mounted) {
+      debugPrint('[photo-trace] $_logTag _uploadPhotos called while UNMOUNTED for ${photos.length} file(s) — dropped, never even queued');
+      return Future.value();
+    }
+    debugPrint('[photo-trace] $_logTag _uploadPhotos queuing ${photos.length} file(s): ${photos.map((f) => f.path.split('/').last).join(', ')}');
     _photoRetryTimer?.cancel();
     setState(() {
-      _uploadingPhotos = true;
+      _uploadingPaths.addAll(photos.map((f) => f.path));
       _photoUploadError = null;
     });
     _report();
     final upload = widget.onUploadPhotos;
     return _exclusive(() async {
-      final error = await upload(
+      debugPrint('[photo-trace] $_logTag _uploadPhotos ACTUALLY SENDING ${photos.length} file(s) now (queue reached them)');
+      final result = await upload(
         photos: photos,
         onProgress: (phase, fraction) {
           if (!mounted) return;
@@ -923,27 +1037,38 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
           });
         },
       );
+      final failed = photos.where((f) => result.failedPaths.contains(f.path)).toList();
+      final succeeded = photos.where((f) => !result.failedPaths.contains(f.path)).toList();
+      debugPrint('[photo-trace] $_logTag _uploadPhotos result: ${succeeded.length} succeeded, ${failed.length} failed (error=${result.error}), disposed=$_disposed');
+      // Independent of _disposed below — the persisted draft is plain
+      // storage I/O, not widget state, and must drop each confirmed photo
+      // even if this card is gone by the time its upload finishes (e.g.
+      // the auditor already left this checkpoint), or the next restore
+      // would re-upload it as a duplicate.
+      if (succeeded.isNotEmpty) await _removePersistedPhotos(succeeded);
       if (_disposed) return;
       _update(() {
-        _uploadingPhotos = false;
+        _uploadingPaths.removeAll(photos.map((f) => f.path));
         _uploadPhase = null;
         _uploadFraction = null;
-        _photoUploadError = error;
+        _photoUploadError = result.error;
         // On success the server already attached these to photoUrls and
         // refetched the audit — didUpdateWidget's node.photoUrls resync
         // picks them up as _existingPhotos, so drop them here rather than
         // showing every photo twice. Left in _newPhotos on failure so
-        // Retry has exactly what to resend.
-        if (error == null) photos.forEach(_newPhotos.remove);
+        // Retry has exactly what to resend — but only the ones that
+        // actually failed; a partially-successful batch's confirmed photos
+        // drop out here too, not just the fully-successful case.
+        succeeded.forEach(_newPhotos.remove);
       });
       _report();
-      if (error != null && _photoRetryAttempt < 2) {
+      if (failed.isNotEmpty && _photoRetryAttempt < 2) {
         final delay = Duration(seconds: 4 << _photoRetryAttempt);
         _photoRetryAttempt++;
         _photoRetryTimer = Timer(delay, () {
-          if (!_disposed && _newPhotos.isNotEmpty && !_uploadingPhotos) _uploadPhotos(List.of(_newPhotos));
+          if (!_disposed && failed.every(_newPhotos.contains) && !_uploadingPhotos) _uploadPhotos(failed);
         });
-      } else if (error == null) {
+      } else if (failed.isEmpty) {
         _photoRetryAttempt = 0;
       }
     });
@@ -1305,9 +1430,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                   onRemove: () => _removeExistingPhoto(e.value),
                 )),
             // A picked photo uploads the moment it's picked (see
-            // _pickPhotos/_uploadPhotos) — busy (spinner, no remove) for
-            // as long as that upload is in flight, same convention as an
-            // already-uploaded photo's own delete-in-flight state above.
+            // _pickPhotos/_uploadPhotos) — busy (spinner, no remove) for as
+            // long as THAT SPECIFIC photo's own upload is in flight
+            // (_uploadingPaths, per-path — see its own doc comment), same
+            // convention as an already-uploaded photo's own delete-in-
+            // flight state above. Picking another photo while this one is
+            // still going is fine — queued behind it, never actually
+            // concurrent (see _uploadPhotos/_exclusive).
             ..._newPhotos.asMap().entries.map((e) => _removablePhoto(
                   child: GestureDetector(
                     onTap: () => openPhotoViewer(
@@ -1317,16 +1446,19 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                     ),
                     child: _thumb(Image.file(e.value, width: 56, height: 56, fit: BoxFit.cover)),
                   ),
-                  busy: _uploadingPhotos,
-                  onRemove: () => setState(() => _newPhotos.remove(e.value)),
+                  busy: _uploadingPaths.contains(e.value.path),
+                  onRemove: () {
+                    debugPrint('[photo-trace] $_logTag USER TAPPED X on ${e.value.path.split('/').last}');
+                    setState(() => _newPhotos.remove(e.value));
+                    _removePersistedPhotos([e.value]);
+                  },
                 )),
-            // Disabled while a batch is already uploading — _uploadingPhotos
-            // is one flag for the whole card (see its own doc comment), not
-            // per-file, so a second pick starting before the first batch's
-            // upload finishes would stomp it and leave the busy overlay on
-            // the in-flight batch's own thumbnails out of sync.
+            // Never disabled — an upload already in flight just means the
+            // next pick queues behind it (_exclusive), so the auditor can
+            // keep snapping photos back-to-back instead of waiting each one
+            // out before the button responds again.
             InkWell(
-              onTap: _uploadingPhotos ? null : _pickPhotos,
+              onTap: _pickPhotos,
               borderRadius: BorderRadius.circular(8),
               child: Container(
                 width: 56,
@@ -1335,7 +1467,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                   border: Border.all(color: scheme.outlineVariant, style: BorderStyle.solid),
                   borderRadius: BorderRadius.circular(8),
                 ),
-                child: Icon(Icons.camera_alt_outlined, color: _uploadingPhotos ? scheme.outline.withValues(alpha: 0.4) : scheme.outline),
+                child: Icon(Icons.camera_alt_outlined, color: scheme.outline),
               ),
             ),
           ],
@@ -1379,10 +1511,14 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   }
 
   Widget _photoUploadStatus(ColorScheme scheme) {
+    // More than one queued (another pick while an earlier one is still
+    // going) — say so, since only one is actually transmitting right now
+    // (_uploadPhase/_uploadFraction) while the rest wait their turn.
+    final queuedSuffix = _uploadingPaths.length > 1 ? ' (${_uploadingPaths.length} photos)' : '';
     final label = switch (_uploadPhase) {
-      UploadPhase.uploading => 'Uploading photo ${((_uploadFraction ?? 0) * 100).toStringAsFixed(0)}%…',
-      UploadPhase.processing => 'Processing photo…',
-      null => 'Uploading photo…',
+      UploadPhase.uploading => 'Uploading photo ${((_uploadFraction ?? 0) * 100).toStringAsFixed(0)}%…$queuedSuffix',
+      UploadPhase.processing => 'Processing photo…$queuedSuffix',
+      null => 'Uploading photo…$queuedSuffix',
     };
     return Row(children: [
       SizedBox(height: 13, width: 13, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.outline)),

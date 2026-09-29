@@ -170,6 +170,18 @@ class _AppShellState extends State<AppShell> {
 
     final safeIndex = _index < tabs.length ? _index : 0;
 
+    // 840px is Material's own "medium/expanded" breakpoint — a tablet in
+    // portrait sits right around it, landscape well past it. Below it this
+    // is a plain phone-shaped bottom bar; at/above it a side NavigationRail
+    // reads as the deliberately-tablet layout instead of a phone bar simply
+    // stretched edge to edge (see this file's own review notes, 2026-09-29).
+    // Built from the exact same `destinations` list the bottom bar uses
+    // below, so the two can never drift apart into different tab sets.
+    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final railDestinations = destinations
+        .map((d) => NavigationRailDestination(icon: d.icon, selectedIcon: d.selectedIcon, label: Text(d.label)))
+        .toList();
+
     return PopScope(
       // AppShell is always the (only) route in the stack while it's on
       // screen — see main.dart's _RootGate, which swaps it in/out of
@@ -223,28 +235,45 @@ class _AppShellState extends State<AppShell> {
             const SizedBox(width: 4),
           ],
         ),
-        // Swipeable, like WhatsApp's tab bar — the NavigationBar below
+        // Swipeable, like WhatsApp's tab bar — the bottom bar/rail below
         // still works by tap too (_goToTab animates this same controller
         // either way), this just also lets a left/right drag switch tabs.
-        body: PageView(
-          controller: _pageController,
-          onPageChanged: (i) {
-            // Every tab is a _KeepAlivePage, so a focused TextField on the
-            // tab being left (the Audits search box, a ticket reply field)
-            // is never disposed and keeps primary focus — a page swipe is
-            // not a route change, so nothing hands focus back on its own.
-            // The keyboard would otherwise follow the user to the next tab
-            // and sit over content they never asked to type into.
-            FocusManager.instance.primaryFocus?.unfocus();
-            setState(() => _index = i);
-          },
-          children: keepAliveTabs,
+        body: Row(
+          children: [
+            if (isWide)
+              NavigationRail(
+                selectedIndex: safeIndex,
+                onDestinationSelected: _goToTab,
+                labelType: NavigationRailLabelType.all,
+                destinations: railDestinations,
+              ),
+            if (isWide) const VerticalDivider(width: 1),
+            Expanded(
+              child: PageView(
+                controller: _pageController,
+                onPageChanged: (i) {
+                  // Every tab is a _KeepAlivePage, so a focused TextField on
+                  // the tab being left (the Audits search box, a ticket
+                  // reply field) is never disposed and keeps primary focus —
+                  // a page swipe is not a route change, so nothing hands
+                  // focus back on its own. The keyboard would otherwise
+                  // follow the user to the next tab and sit over content
+                  // they never asked to type into.
+                  FocusManager.instance.primaryFocus?.unfocus();
+                  setState(() => _index = i);
+                },
+                children: keepAliveTabs,
+              ),
+            ),
+          ],
         ),
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: safeIndex,
-          onDestinationSelected: _goToTab,
-          destinations: destinations,
-        ),
+        bottomNavigationBar: isWide
+            ? null
+            : NavigationBar(
+                selectedIndex: safeIndex,
+                onDestinationSelected: _goToTab,
+                destinations: destinations,
+              ),
       ),
     );
   }

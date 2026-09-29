@@ -842,17 +842,23 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// rather than only once scoreCheckpoint below is also called. This is
   /// what lets an auditor snap evidence now and fill in the finding/
   /// remark later without losing the photo if they navigate away first.
-  /// Returns the error message on failure, null on success, then
-  /// refreshes activeAudit so the tree reflects the newly-attached
-  /// photo(s) immediately.
-  Future<String?> uploadCheckpointEvidence({
+  /// Returns which of `photos` (by path) didn't get confirmed and, if any
+  /// didn't, a message about them — see UploadPhotosResult's own doc
+  /// comment for why this is per-file rather than all-or-nothing. Refreshes
+  /// activeAudit so the tree reflects whichever photos DID attach, even
+  /// when others in the same batch failed.
+  Future<UploadPhotosResult> uploadCheckpointEvidence({
     required String auditId,
     required String nodeId,
     required List<File> photos,
     String? locationId,
     void Function(UploadPhase phase, double? fraction)? onProgress,
   }) async {
-    if (photos.isEmpty) return null;
+    if (photos.isEmpty) return const UploadPhotosResult();
+    // fileName -> File, so a job's own result (identified by fileName, the
+    // one thing the server echoes back — see uploadParameterEvidence) maps
+    // back to exactly the local file it came from.
+    final byFileName = {for (final f in photos) f.path.split('/').last: f};
     try {
       // NOT FormData.fromMap({for (f in files) 'photos': ...}) — a Dart
       // map literal silently collapses duplicate keys to the last one,
@@ -889,22 +895,45 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           .map((e) => Map<String, dynamic>.from(e as Map))
           .toList();
       onProgress?.call(UploadPhase.processing, null);
-      await Future.wait(
-        jobs.map((j) => _waitForEvidenceJob(j['jobId'] as String)),
-      );
+      // Waited on PER JOB, not one Future.wait for the lot — a batch of
+      // several photos (picked together from the gallery) can genuinely
+      // partially succeed: a slower one timing out under server load must
+      // not drag the ones that already finished back into "failed", which
+      // used to mean the whole batch got resent on every retry, wasting
+      // bandwidth re-uploading photos that had already attached and never
+      // actually converging for a batch with one persistently slow file.
+      String? firstError;
+      final failedPaths = <String>{};
+      await Future.wait(jobs.map((j) async {
+        final fileName = j['fileName'] as String?;
+        final file = fileName != null ? byFileName[fileName] : null;
+        try {
+          await _waitForEvidenceJob(j['jobId'] as String);
+        } catch (e) {
+          if (file != null) failedPaths.add(file.path);
+          firstError ??= e is Exception && e is! DioException
+              ? e.toString().replaceFirst('Exception: ', '')
+              : null;
+        }
+      }));
+      // Refresh even on a partial failure — whichever photos DID attach
+      // must show up as confirmed right away, not wait for a fully clean
+      // batch that a single stubborn file may keep preventing.
       try {
         await fetchAuditDetail(auditId, quiet: true);
       } catch (_) {}
-      return null;
+      if (failedPaths.isEmpty) return const UploadPhotosResult();
+      return UploadPhotosResult(
+        failedPaths: failedPaths,
+        error: (firstError?.isNotEmpty ?? false) ? firstError : 'Could not upload this photo.',
+      );
     } catch (e) {
-      // Not just DioException: _waitForEvidenceJob rejects with a plain
-      // Exception ("Upload failed" / "taking longer than expected") that
-      // used to escape uncaught and leave the card stuck on "Uploading…".
-      if (e is Exception && e is! DioException) {
-        final text = e.toString().replaceFirst('Exception: ', '');
-        return text.isEmpty ? 'Could not upload this photo.' : text;
-      }
-      return _saveErrorMessage(e, 'Could not upload this photo.');
+      // The upload request itself failed (not a specific job) — every
+      // photo in this attempt is unconfirmed.
+      return UploadPhotosResult(
+        failedPaths: photos.map((f) => f.path).toSet(),
+        error: _saveErrorMessage(e, 'Could not upload this photo.'),
+      );
     }
   }
 

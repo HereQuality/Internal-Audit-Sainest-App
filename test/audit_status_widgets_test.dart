@@ -10,6 +10,7 @@ import 'package:provider/provider.dart';
 import 'package:internal_audit_app/core/constants/api_constants.dart';
 import 'package:internal_audit_app/core/network/dio_client.dart';
 import 'package:internal_audit_app/core/theme/app_theme.dart';
+import 'package:internal_audit_app/core/utils/responsive.dart';
 import 'package:internal_audit_app/models/audit_model.dart';
 import 'package:internal_audit_app/providers/audits_provider.dart';
 import 'package:internal_audit_app/providers/auth_provider.dart';
@@ -21,6 +22,7 @@ import 'package:internal_audit_app/screens/audits/my_audits_screen.dart';
 import 'package:internal_audit_app/screens/dashboard/dashboard_screen.dart';
 import 'package:internal_audit_app/screens/profile/reports_screen.dart';
 import 'package:internal_audit_app/widgets/audit_agenda.dart';
+import 'package:internal_audit_app/widgets/max_width_scroll.dart';
 import 'package:internal_audit_app/widgets/status_badge.dart';
 import 'package:internal_audit_app/widgets/status_filter_chip_row.dart';
 import 'package:internal_audit_app/widgets/today_audits_section.dart';
@@ -312,6 +314,93 @@ void main() {
         expect(tester.takeException(), isNull, reason: 'scale $scale');
         expect(find.text('NC Verification Pending'), findsOneWidget);
       }
+    });
+  });
+
+  // Sets the ACTUAL test surface size (not just a MediaQuery override), so
+  // both what MediaQuery.sizeOf reports AND what the widget tree is really
+  // laid out at agree — a GridView's real column width (and so whether it
+  // visibly overflows) depends on the real render constraints, not just the
+  // MediaQueryData a test hands it. Same pattern as this file's own
+  // usePhone() and notification_topics_test.dart's openSettings().
+  Future<void> pumpAtWidth(WidgetTester tester, Widget child, double width, {double height = 1200}) async {
+    tester.view.physicalSize = Size(width, height);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(MaterialApp(theme: AppTheme.light(), home: Scaffold(body: child)));
+  }
+
+  group('responsiveColumnCount', () {
+    Future<int> columnsAt(WidgetTester tester, double width) async {
+      late int columns;
+      await pumpAtWidth(
+        tester,
+        Builder(builder: (context) {
+          columns = responsiveColumnCount(context);
+          return const SizedBox();
+        }),
+        width,
+      );
+      return columns;
+    }
+
+    testWidgets('a phone width (~390) stays at 2 columns — the layout every grid ships today', (tester) async {
+      expect(await columnsAt(tester, 390), 2);
+    });
+
+    testWidgets('a small tablet (~700) gets more than the phone\'s 2 columns', (tester) async {
+      expect(await columnsAt(tester, 700), 3);
+    });
+
+    testWidgets('a large tablet (~1100) is clamped at max, not one column per 180px forever', (tester) async {
+      expect(await columnsAt(tester, 1100), 5);
+    });
+
+    testWidgets('the min clamp — not the arithmetic — is what keeps a narrower-than-phone width at 2', (tester) async {
+      // 300 / 180 floors to 1; only the clamp(min: 2) brings this back to
+      // the phone layout.
+      expect(await columnsAt(tester, 300), 2);
+    });
+  });
+
+  group('stat grids scale their column count with width', () {
+    Future<int> auditStatsGridColumnsAt(WidgetTester tester, double width) async {
+      await pumpAtWidth(tester, const AuditStatsGrid(stats: AuditorStats()), width);
+      final gridView = tester.widget<GridView>(find.byType(GridView));
+      final delegate = gridView.gridDelegate as SliverGridDelegateWithFixedCrossAxisCount;
+      return delegate.crossAxisCount;
+    }
+
+    testWidgets('exactly 2 columns at a phone width', (tester) async {
+      expect(await auditStatsGridColumnsAt(tester, 390), 2);
+    });
+
+    testWidgets('more than 2 columns at a wide tablet width', (tester) async {
+      expect(await auditStatsGridColumnsAt(tester, 1100), greaterThan(2));
+    });
+  });
+
+  group('MaxWidthScroll', () {
+    const childKey = Key('max-width-scroll-child');
+
+    Future<Size> childSizeAt(WidgetTester tester, double width) async {
+      await pumpAtWidth(tester, MaxWidthScroll(child: Container(key: childKey)), width);
+      return tester.getSize(find.byKey(childKey));
+    }
+
+    testWidgets('passes the child through unchanged below the breakpoint', (tester) async {
+      final size = await childSizeAt(tester, 390);
+      expect(size.width, 390);
+    });
+
+    testWidgets('caps the child at maxWidth on a wide screen', (tester) async {
+      final size = await childSizeAt(tester, 1200);
+      expect(size.width, 720);
+    });
+
+    testWidgets('right at the breakpoint is still a pass-through (< breakpoint, not <=)', (tester) async {
+      final size = await childSizeAt(tester, 700);
+      expect(size.width, 700);
     });
   });
 

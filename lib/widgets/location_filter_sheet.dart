@@ -39,6 +39,9 @@ Future<WhereSelection?> showLocationFilterSheet(
     isScrollControlled: true,
     useSafeArea: true,
     backgroundColor: Colors.transparent,
+    // Capped on a tablet-width screen — see filter_sheet.dart's identical
+    // constraints for why no extra centering is needed on top of it.
+    constraints: const BoxConstraints(maxWidth: 640),
     builder: (_) => _LocationSheet(
       locations: locations,
       departments: showDepartments ? departments : const [],

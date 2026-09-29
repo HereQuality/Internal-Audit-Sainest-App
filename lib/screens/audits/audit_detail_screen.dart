@@ -12,6 +12,7 @@ import '../../providers/auth_provider.dart';
 import '../../providers/dashboard_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
+import '../../widgets/max_width_scroll.dart';
 import 'audit_header_card.dart';
 import 'checkpoint_card.dart';
 import 'select_representative_sheet.dart';
@@ -111,6 +112,11 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // itself in dispose(); its state stays in _syncStates until that ends.)
   Future<bool> _flushAll() async {
     final states = _checkpointKeys.values.map((k) => k.currentState).whereType<CheckpointCardState>().toList();
+    // TEMPORARY — tracking down the photo-disappears report: how many of
+    // this screen's checkpoint keys actually resolved to a live State right
+    // now vs. going missing (currentState == null, e.g. scrolled out of a
+    // lazy list and disposed) at the exact moment a flush was requested.
+    debugPrint('[photo-trace] _flushAll: ${_checkpointKeys.length} keys total, ${states.length} resolved to a live card');
     final results = await Future.wait(states.map((c) => c.flush()));
     // Give a detached (already unmounted) card's last save a moment to land.
     for (var i = 0; i < 20 && _syncStates.values.any((s) => s == CheckpointSyncState.saving); i++) {
@@ -922,7 +928,12 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
 
     return RefreshIndicator(
       onRefresh: () => _load(promptRepresentative: false),
-      child: ListView(
+      // MaxWidthScroll wraps just this checkpoint-tree ListView — the
+      // screen's other ListViews (the location-tab strip at ~1109, a
+      // picker sheet's own list at ~1725) are short, single-purpose
+      // scrollers, not "the main content", so they're left as is.
+      child: MaxWidthScroll(
+        child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
         children: [
           AuditHeaderCard(audit: audit),
@@ -1159,6 +1170,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
               serialPrefix: '',
             ),
         ],
+        ),
       ),
     );
   }
