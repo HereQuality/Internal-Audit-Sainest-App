@@ -63,6 +63,8 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     // The Final Report is open: its list and tiles follow the filters too.
     if (reportsInUse) fetchReportAudits(),
     if (reportsInUse) fetchReportStats(),
+    // The leader's "My locations" list is showing: same filters, same reload.
+    if (ledAuditsInUse) fetchLedAudits(),
   ]);
 
   bool isLoading = false;
@@ -119,6 +121,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     ledLocationIds = const [];
     ledDepartmentIds = const [];
     ledPlaceNames = const [];
+    ledAudits = [];
+    ledAuditsInUse = false;
+    ledAuditsError = null;
+    isLoadingLedAudits = false;
     reportsInUse = false;
     reportsLed = false;
     reportsStatus = null;
@@ -160,6 +166,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         _refreshTimer?.cancel();
         _refreshTimer = Timer(const Duration(milliseconds: 500), () {
           fetchMyAudits();
+          // A reassignment (by this leader elsewhere, a scheduler, ...) changes
+          // who is on the audits at their places.
+          if (ledAuditsInUse) fetchLedAudits(quiet: true);
           if (activeAudit != null) {
             fetchAuditDetail(activeAudit!.id, quiet: true);
           }
@@ -595,6 +604,129 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
+  // ── Leader: "My locations" on the Audits tab — the audits still to be done
+  // at the places I lead, whoever they are assigned to, each with the
+  // server's own canReassign verdict. Not the Final Report's list above (that
+  // one is finished audits, for reading).
+  List<AuditModel> ledAudits = [];
+  bool isLoadingLedAudits = false;
+  String? ledAuditsError;
+
+  /// True while the Audits tab is showing "My locations", so a live
+  /// notification refreshes it too.
+  bool ledAuditsInUse = false;
+  int _ledAuditsSeq = 0;
+
+  /// The audits at the places I lead that can still change hands: not started,
+  /// in progress or overdue (the web view's own default).
+  Future<void> fetchLedAudits({bool quiet = false}) async {
+    final epoch = _epoch;
+    final seq = ++_ledAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _ledAuditsSeq;
+    if (!quiet) {
+      isLoadingLedAudits = true;
+      ledAuditsError = null;
+      notifyListeners();
+    }
+    try {
+      final list = await _fetchLedAudits(status: 'Not Started,In Progress,Overdue');
+      if (stale()) return;
+      // Soonest first: what needs a stand-in next is at the top.
+      list.sort((a, b) {
+        final ad = a.scheduledDate, bd = b.scheduledDate;
+        if (ad == null && bd == null) return 0;
+        if (ad == null) return 1;
+        if (bd == null) return -1;
+        return ad.compareTo(bd);
+      });
+      ledAudits = list;
+      ledAuditsError = null;
+    } on DioException catch (e) {
+      if (!stale()) {
+        ledAuditsError = extractErrorMessage(e, fallback: 'Could not load the audits at your locations.');
+      }
+    } finally {
+      if (!stale()) {
+        isLoadingLedAudits = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Who could take [audit] over from one of its auditors: active members of
+  /// the audited place, not already on the audit, and qualified for its audit
+  /// type — the same pool the web dialog offers. A Cross Functional Team audit
+  /// (or one with no place) has no member list to offer here: the server
+  /// refuses a leader on a CFT audit anyway. Returns null on a failed lookup.
+  Future<List<EmployeeOption>?> fetchReassignCandidates(AuditModel audit) async {
+    if (audit.isCFT || (audit.locationIdList.isEmpty && audit.departmentIdList.isEmpty)) {
+      return const [];
+    }
+    final epoch = _epoch;
+    try {
+      final responses = await Future.wait([
+        _dio.get(ApiConstants.employeesByLocation(audit.locationIdList, departmentIds: audit.departmentIdList)),
+        _dio.get(ApiConstants.auditTypes),
+      ]);
+      if (epoch != _epoch) return null;
+      final people = (responses[0].data['data'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => EmployeeOption.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+      String? typeId;
+      for (final t in (responses[1].data['data'] as List? ?? []).whereType<Map>()) {
+        if (t['name']?.toString() == audit.auditType) typeId = t['_id']?.toString();
+      }
+      final onAudit = {for (final a in audit.auditors) a.id};
+      final seen = <String>{};
+      final out = [
+        for (final p in people)
+          if (p.isActive &&
+              !onAudit.contains(p.id) &&
+              (typeId == null || p.auditTypeIds.isEmpty || p.auditTypeIds.contains(typeId)) &&
+              seen.add(p.id))
+            p,
+      ]..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      return out;
+    } on DioException {
+      return null;
+    }
+  }
+
+  /// PATCH /audits/:id/reassign-auditor. The server decides whether it is
+  /// allowed and says why not in plain words, which come back as [message].
+  /// Either way the lists are refetched afterwards on a success or a 409 (the
+  /// audit changed under the open dialog), so what is on screen is current.
+  Future<({bool ok, String message})> reassignAuditor(
+    String auditId, {
+    required String toAuditorId,
+    required String fromAuditorId,
+    String? reason,
+    bool alsoUpcoming = false,
+  }) async {
+    try {
+      final res = await _dio.patch(
+        ApiConstants.reassignAuditor(auditId),
+        data: {
+          'toAuditorId': toAuditorId,
+          'fromAuditorId': fromAuditorId,
+          'applyTo': alsoUpcoming ? 'thisAndUpcoming' : 'this',
+          if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+        },
+      );
+      unawaited(fetchLedAudits(quiet: true));
+      unawaited(fetchMyAudits());
+      final message = res.data is Map ? res.data['message']?.toString() : null;
+      return (ok: true, message: message ?? 'Auditor changed.');
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 409) unawaited(fetchLedAudits(quiet: true));
+      return (
+        ok: false,
+        message: extractErrorMessage(e, fallback: 'Could not change the auditor. Please try again.'),
+      );
+    }
+  }
+
   static int _byRecency(AuditModel a, AuditModel b) {
     final ad = a.completedDate ?? a.scheduledDate;
     final bd = b.completedDate ?? b.scheduledDate;
@@ -663,14 +795,17 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
 
   // Every audit at a place I lead, paged 100 at a time (the endpoint's
   // maximum) — the Final Report list is one scroll, not a paginated table.
-  Future<List<AuditModel>> _fetchLedAudits() async {
+  Future<List<AuditModel>> _fetchLedAudits({
+    String status = 'Not Started,In Progress,Overdue,Completed',
+  }) async {
     final params = Map<String, dynamic>.from(filterParams ?? const {})
       // The led list ignores employeeIds by design (a "just me" default would
       // empty a list whose point is other people's audits).
       ..remove('employeeIds')
-      // Without a status the server defaults to the still-open ones; a Final
-      // Report wants every started audit, so name them.
-      ..['status'] = 'Not Started,In Progress,Overdue,Completed'
+      // Without a status the server defaults to the still-open ones; the Final
+      // Report wants every started audit (the default here), the reassign
+      // list only the ones still to be done — so name them.
+      ..['status'] = status
       ..['limit'] = 100;
     final all = <AuditModel>[];
     var page = 1;

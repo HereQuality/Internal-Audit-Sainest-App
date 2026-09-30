@@ -49,6 +49,13 @@ String _locationLabel(dynamic json) {
 DateTime? _localDate(dynamic v) =>
     DateTime.tryParse(v?.toString() ?? '')?.toLocal();
 
+// Ids of a populated (or bare) ref list, blanks dropped.
+List<String> _refIds(dynamic list) => [
+  if (list is List)
+    for (final e in list)
+      if ((e is Map ? e['_id'] : e)?.toString().isNotEmpty ?? false) (e is Map ? e['_id'] : e).toString(),
+];
+
 // null for an absent field AND for a present-but-empty string, so
 // callers can treat "no audit type" / "not part of a series" as one
 // falsy case instead of also having to check for ''.
@@ -178,6 +185,25 @@ class AuditModel {
   final int? occurrenceCount;
   bool get isRecurring => seriesId != null && seriesId!.isNotEmpty;
 
+  // ── What a place leader needs to swap an auditor (rows of GET
+  // /audits/at-places-i-lead only; empty / false everywhere else) ──
+  /// The auditors on the audit, id + name in the same order, so "who is not
+  /// coming?" can name one of them. [auditorNames] above is the names alone.
+  final List<({String id, String name, bool inactive})> auditors;
+  /// The audited place ids (locations, then departments) — who may replace an
+  /// auditor is that place's own members.
+  final List<String> locationIdList;
+  final List<String> departmentIdList;
+  /// Cross Functional Team audit: its place's members may NOT be its auditor.
+  final bool isCFT;
+  /// The server's verdict for THIS person right now (utils/reassign.js) and,
+  /// when false, the reason it gives — shown under the disabled button.
+  final bool canReassign;
+  final String? reassignBlockedReason;
+  /// How many checkpoints are already scored — the swap keeps them, and the
+  /// dialog says so.
+  final int scoredCount;
+
   /// What a badge/tile/filter/PDF prints for this audit: the server's
   /// unified [displayStatus], else the raw [status] (older server, cached
   /// data). Every label the user reads goes through this; every behavioural
@@ -217,6 +243,13 @@ class AuditModel {
     this.frequency,
     this.occurrenceIndex,
     this.occurrenceCount,
+    this.auditors = const [],
+    this.locationIdList = const [],
+    this.departmentIdList = const [],
+    this.isCFT = false,
+    this.canReassign = false,
+    this.reassignBlockedReason,
+    this.scoredCount = 0,
   });
 
   factory AuditModel.fromJson(Map<String, dynamic> json) {
@@ -261,6 +294,21 @@ class AuditModel {
       frequency: _nonEmpty(recurrence is Map ? recurrence['frequency'] : null),
       occurrenceIndex: recurrence is Map ? (recurrence['occurrenceIndex'] as num?)?.toInt() : null,
       occurrenceCount: recurrence is Map ? (recurrence['occurrenceCount'] as num?)?.toInt() : null,
+      auditors: [
+        for (final e in (json['auditorIds'] as List? ?? []).whereType<Map>())
+          if ((e['_id'] ?? '').toString().isNotEmpty)
+            (
+              id: e['_id'].toString(),
+              name: e['employeeName']?.toString() ?? 'Unknown employee',
+              inactive: e['isActive'] == false,
+            ),
+      ],
+      locationIdList: _refIds(json['locationIds']),
+      departmentIdList: _refIds(json['departmentIds']),
+      isCFT: json['isCFT'] == true,
+      canReassign: json['canReassign'] == true,
+      reassignBlockedReason: _nonEmpty(json['reassignBlockedReason']),
+      scoredCount: scoreResult is Map ? (scoreResult['scoredCount'] as num?)?.toInt() ?? 0 : 0,
     );
   }
 }

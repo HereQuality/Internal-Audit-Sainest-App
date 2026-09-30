@@ -38,10 +38,19 @@ final GlobalKey<NavigatorState> notificationNavigatorKey =
 // the real server types. Ticket notifications are the opposite: they only
 // ever come from the server (ticket_created/ticket_reply/ticket_status/
 // ticket_forwarded), there is no local-poll counterpart.
+//
+// An FCM push also carries WHOSE notification it is (`recipientId`, an optional
+// third part) so a tap can be refused when this phone is signed in as somebody
+// else — a token left bound to an earlier account otherwise opens that
+// account's audit under the current one ("someone else's audit"). Local
+// banners never need it: they are only ever drawn for the signed-in person.
 String encodeNotificationPayload({
   required String type,
   required String? referenceId,
-}) => '$type|${referenceId ?? ''}';
+  String? recipientId,
+}) => recipientId == null || recipientId.isEmpty
+    ? '$type|${referenceId ?? ''}'
+    : '$type|${referenceId ?? ''}|$recipientId';
 
 ({String type, String? referenceId})? decodeNotificationPayload(
   String? payload,
@@ -49,11 +58,22 @@ String encodeNotificationPayload({
   if (payload == null || payload.isEmpty) return null;
   final i = payload.indexOf('|');
   if (i == -1) return null;
-  final refId = payload.substring(i + 1);
+  final rest = payload.substring(i + 1);
+  final j = rest.indexOf('|');
+  final refId = j == -1 ? rest : rest.substring(0, j);
   return (
     type: payload.substring(0, i),
     referenceId: refId.isEmpty ? null : refId,
   );
+}
+
+/// The account an FCM payload was addressed to, or null when it names none
+/// (a local banner, an older server).
+String? notificationPayloadRecipient(String? payload) {
+  if (payload == null) return null;
+  final parts = payload.split('|');
+  if (parts.length < 3 || parts[2].isEmpty) return null;
+  return parts[2];
 }
 
 // Where a tap on a notification actually goes — audit_* types carry an
@@ -208,6 +228,17 @@ void handleLocalNotificationTap(String? payload) {
   final context = notificationNavigatorKey.currentContext;
   if (context == null || !_tapsAllowedNow(context)) {
     holdNotificationTap(payload);
+    return;
+  }
+  // Addressed to a different account than the one signed in now: a push that
+  // reached this phone through a token an earlier account left behind. Opening
+  // its record would show the current person somebody else's audit / NC.
+  final recipient = notificationPayloadRecipient(payload);
+  final me = context.read<AuthProvider>().user?.id;
+  if (recipient != null && me != null && recipient != me) {
+    ScaffoldMessenger.maybeOf(context)
+      ?..hideCurrentSnackBar()
+      ..showSnackBar(const SnackBar(content: Text('That notification was for a different account.')));
     return;
   }
   openNotificationTarget(

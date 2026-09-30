@@ -83,6 +83,17 @@ Future<void> renderDataPush(RemoteMessage message) async {
   final token = await NotificationPrefs.readToken();
   if (token == null || token.isEmpty) return;
   final data = message.data;
+  // Addressed to a DIFFERENT account than the one signed in (the phone still
+  // holds a token an earlier account left registered): never draw it — it
+  // would show that account's audit titles and open its record under this one.
+  final recipient = data['recipientId'] as String?;
+  if (recipient != null && recipient.isNotEmpty) {
+    final me = await NotificationPrefs.readUserId();
+    if (me != null && me.isNotEmpty && me != recipient) {
+      debugPrint('FcmService: dropped a push addressed to another account (${_describe(message)})');
+      return;
+    }
+  }
   final referenceId = data['referenceId'] as String?;
   final notificationId = data['notificationId'] as String?;
   await LocalNotifications.showServerBanner(
@@ -480,6 +491,7 @@ class FcmService {
     return encodeNotificationPayload(
       type: data['type'] as String? ?? 'general',
       referenceId: (referenceId == null || referenceId.isEmpty) ? null : referenceId,
+      recipientId: data['recipientId'] as String?,
     );
   }
 
@@ -605,11 +617,14 @@ class FcmService {
   static Future<void> _onTokenRefresh(String token) async {
     if (_signedOut || await NotificationPrefs.readToken() == null) return;
     final session = _session;
+    // The token this phone had registered until now: the server is told to drop
+    // it, otherwise the row lingers and keeps receiving this account's pushes.
+    final replaced = _registeredToken;
     // The server holds the OLD token until this POST lands — not "registered",
     // and not something the polls may count on either.
     _tokenRegistered = false;
     await _setPushReady(false);
-    if (await _postToken(token, session) == _Post.retry && session == _session && !_signedOut) {
+    if (await _postToken(token, session, replaces: replaced) == _Post.retry && session == _session && !_signedOut) {
       _scheduleRetry();
     }
   }
@@ -628,7 +643,7 @@ class FcmService {
   // this device and every push, and it usually fires right at login/launch
   // when the connection can still be waking up. Anything longer is the
   // caller's backoff ([_scheduleRetry]), so login isn't held up by it.
-  static Future<_Post> _postToken(String token, int session) async {
+  static Future<_Post> _postToken(String token, int session, {String? replaces}) async {
     const attempts = 2;
     for (var attempt = 1; attempt <= attempts; attempt++) {
       // Signed out since this started: registering now would bind the phone
@@ -641,6 +656,7 @@ class FcmService {
             'token': token,
             'platform': defaultTargetPlatform == TargetPlatform.iOS ? 'ios' : 'android',
             'firebaseProjectId': _firebaseProjectId(),
+            if (replaces != null && replaces.isNotEmpty && replaces != token) 'replaces': replaces,
           },
         );
         // The server holds it now, whichever session asked — remembered so a

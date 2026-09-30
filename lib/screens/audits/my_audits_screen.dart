@@ -17,6 +17,7 @@ import '../../widgets/audit_agenda.dart';
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/max_width_scroll.dart';
+import 'led_audits_view.dart';
 
 /// screens/audits/my_audits_screen.dart
 /// ─────────────────────────────────────
@@ -187,6 +188,8 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
         }
       }
       context.read<AuditsProvider>().fetchMyAudits();
+      // Who leads what decides whether "My locations" is offered at all.
+      context.read<AuditsProvider>().fetchLedPlaces();
     });
   }
 
@@ -324,8 +327,54 @@ class _MyAuditsScreenState extends State<MyAuditsScreen> {
 
   Future<void> _refresh() => context.read<AuditsProvider>().fetchMyAudits();
 
+  // false = "My audits" (this screen's own agenda), true = "My locations"
+  // (LedAuditsView — every open audit at the places I lead, with Reassign
+  // auditor). Only a leader is ever offered the second; remembered with the
+  // rest of the screen's state.
+  bool get _showLed => _saved.extra['led'] == true;
+
+  void _setShowLed(bool led) {
+    if (_showLed == led) return;
+    setState(() => _saved.extra['led'] = led);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final leader = context.select<AuditsProvider, bool>((p) => p.isPlaceLeader);
+    // A remembered "My locations" for someone who no longer leads anything
+    // falls back to their own audits.
+    final showLed = leader && _showLed;
+    if (!leader) return _buildMine(context);
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          child: SegmentedButton<bool>(
+            showSelectedIcon: false,
+            segments: const [
+              ButtonSegment(
+                value: false,
+                icon: Icon(Icons.person_outline, size: 16),
+                label: Text('My audits'),
+              ),
+              ButtonSegment(
+                value: true,
+                icon: Icon(Icons.location_city_outlined, size: 16),
+                label: Text('My locations'),
+              ),
+            ],
+            selected: {showLed},
+            onSelectionChanged: (s) => _setShowLed(s.first),
+          ),
+        ),
+        Expanded(
+          child: showLed ? const LedAuditsView() : _buildMine(context),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMine(BuildContext context) {
     final provider = context.watch<AuditsProvider>();
 
     final bool showEmptyState =

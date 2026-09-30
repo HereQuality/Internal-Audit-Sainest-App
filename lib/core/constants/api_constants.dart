@@ -45,6 +45,9 @@ class ApiConstants {
   // getAuditsAtPlacesILead).
   static const ledPlaces = '/audits/led-places';
   static const auditsAtPlacesILead = '/audits/at-places-i-lead';
+  // A leader (or the planner / a scheduler) hands one auditor's place on an
+  // audit to someone else (audit.controller.js#reassignAuditor).
+  static String reassignAuditor(String id) => '/audits/$id/reassign-auditor';
   // The Final Report tiles (audit.controller.js#getCompletedAuditStats).
   static const completedStats = '/audits/stats/completed';
   static const auditorStats = '/audits/stats/auditor';

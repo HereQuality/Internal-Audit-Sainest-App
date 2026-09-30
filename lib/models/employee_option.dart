@@ -30,6 +30,10 @@ class EmployeeOption {
   // false for a deactivated person: their audits stay on record, so the
   // filter still offers them, marked "(inactive)" and listed last.
   final bool isActive;
+  // Audit types the person is qualified for (ids; empty = no restriction
+  // recorded) — the reassign picker offers only people qualified for the
+  // audit's type, like the web's.
+  final List<String> auditTypeIds;
 
   const EmployeeOption({
     required this.id,
@@ -37,6 +41,7 @@ class EmployeeOption {
     this.locationIds = const [],
     this.teams = const [],
     this.isActive = true,
+    this.auditTypeIds = const [],
   });
 
   factory EmployeeOption.fromJson(Map<String, dynamic> json) {
@@ -58,6 +63,10 @@ class EmployeeOption {
           .where((t) => t.id.isNotEmpty && t.name.isNotEmpty)
           .toList(),
       isActive: json['isActive'] != false,
+      auditTypeIds: (json['auditTypeIds'] as List? ?? [])
+          .map((e) => (e is Map ? e['_id'] : e)?.toString() ?? '')
+          .where((id) => id.isNotEmpty)
+          .toList(),
     );
   }
 }

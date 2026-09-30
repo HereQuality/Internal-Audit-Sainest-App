@@ -105,6 +105,27 @@ under the master push switch. The retired phone-local switches — the
 "Notifications" master switch (`notif_bg_polling_enabled`) and the six
 per-type reminder toggles — are gone.
 
+## A push that belongs to another account, and rows left behind
+
+A token row the server still holds for an account that has left this phone keeps
+delivering that account's pushes (iOS draws them itself, no Dart runs). Three
+guards, all needed:
+
+- **Rows are cleaned up.** `POST /device-tokens/register` takes an optional
+  `replaces` (the token FCM just rotated away from; `FcmService._onTokenRefresh`
+  sends it) and deletes that row for the same account, and keeps at most 5 rows
+  per account and platform (oldest dropped) — a reinstall or a rotation that
+  never said goodbye no longer leaves a row that outlives the logout.
+- **Every FCM push names its owner.** `fcmPush.service.js#buildFcmMessage` adds
+  `recipientId` to `data`. `renderDataPush` drops (draws nothing) a push whose
+  `recipientId` is not the signed-in person, and a tap on a push addressed to
+  someone else (`handleLocalNotificationTap`, carried as a third part of the
+  tap payload, see `notificationPayloadRecipient`) opens nothing and says so —
+  never "someone else's audit" under the current login.
+- **The auditee is told as the auditee.** `audit_created` to the auditee no
+  longer says "you've been assigned to audit" (it read as an auditor task and
+  opened an audit that, in the auditor view, is not theirs).
+
 ## What each platform receives
 
 `fcmPush.service.js` builds a different message per token `platform`:
