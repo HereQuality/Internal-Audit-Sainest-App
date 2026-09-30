@@ -5,6 +5,7 @@ import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/nc_timeliness.dart';
 import '../../models/nc_model.dart';
+import '../../models/nc_report_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
@@ -13,6 +14,7 @@ import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/max_width_scroll.dart';
+import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
@@ -72,6 +74,27 @@ const _auditeeStatusFilterLabels = {
   'All': 'Total NC',
   'On Time': 'On Time Completion',
 };
+
+// The six tiles NC Monitoring shows (GET /ncs/raised/stats) speak in the
+// server's bucket keys; the list's own filter speaks in the labels above. A
+// tile tap sets the same _statusFilter a dashboard jump does, so the two are
+// one mechanism — these two helpers just translate.
+const _bucketFilterLabels = {
+  NcBucket.inProgress: 'In Progress',
+  NcBucket.overdue: 'Overdue',
+  NcBucket.pendingApproval: 'Pending Approval',
+  NcBucket.delayed: 'Delayed',
+  NcBucket.onTime: 'On Time',
+};
+
+/// The bucket a filter value stands for, null for All / Open / Closed / a raw
+/// status (those have no tile of their own).
+String? _bucketOfFilter(String filter) {
+  for (final e in _bucketFilterLabels.entries) {
+    if (e.value == filter) return e.key;
+  }
+  return null;
+}
 
 // Same bucket rules as server/controllers/nc.controller.js#computeNcBuckets
 // — kept in sync by hand since there's no shared-across-platforms source
@@ -160,7 +183,10 @@ class _NcListScreenState extends State<NcListScreen>
       // below silently ran unscoped instead.
       final selfId = context.read<AuthProvider>().user?.id;
       if (selfId != null) provider.setSelfEmployeeId(selfId);
-      if (_showRaised) provider.fetchRaisedByMe();
+      if (_showRaised) {
+        provider.fetchRaisedByMe();
+        provider.fetchRaisedStats();
+      }
       if (_showAgainst) provider.fetchAgainstMe();
     });
   }
@@ -173,9 +199,14 @@ class _NcListScreenState extends State<NcListScreen>
 
   @override
   Widget build(BuildContext context) {
+    // The list and its tiles are two requests under the same filters.
+    Future<void> refreshRaised() {
+      final p = context.read<NcProvider>();
+      return Future.wait([p.fetchRaisedByMe(), p.fetchRaisedStats()]);
+    }
     if (widget.mode == NcListMode.auditorOnly) {
       return _RaisedByMeList(
-        onRefresh: () => context.read<NcProvider>().fetchRaisedByMe(),
+        onRefresh: refreshRaised,
         initialStatusFilter: widget.initialStatusFilter,
       );
     }
@@ -199,7 +230,7 @@ class _NcListScreenState extends State<NcListScreen>
             controller: _tabController,
             children: [
               _RaisedByMeList(
-                onRefresh: () => context.read<NcProvider>().fetchRaisedByMe(),
+                onRefresh: refreshRaised,
                 initialStatusFilter: widget.initialStatusFilter,
               ),
               _AgainstMeList(
@@ -374,10 +405,21 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
         provider.raisedError != null && provider.raisedByMe.isEmpty;
     final showEmpty = !showLoading && !showError && provider.raisedByMe.isEmpty;
     final query = _query.trim().toLowerCase();
+    // A tile's own filter narrows by the NC ids the server counted under it, so
+    // the list under a tile always has exactly the tile's number of rows; with
+    // no tiles loaded (or a filter that is no tile — All / Open / Closed) the
+    // long-standing _matchesFilter rules apply.
+    final stats = provider.raisedStats;
+    final bucket = _bucketOfFilter(_statusFilter);
+    final bucketIds = bucket != null && stats != null && stats.hasBuckets
+        ? stats.idsFor(bucket).toSet()
+        : null;
     final filtered = provider.raisedByMe
         .where(
           (n) =>
-              _matchesFilter(n, _statusFilter) &&
+              (bucketIds != null
+                  ? bucketIds.contains(n.id)
+                  : _matchesFilter(n, _statusFilter)) &&
               (query.isEmpty || _ncMatchesSearch(n, query)),
         )
         .toList();
@@ -394,6 +436,24 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
           filters: _auditorStatusFilters,
           labels: _auditorStatusFilterLabels,
         ),
+        // The same six tiles as the Final Report's NCs tab and the Auditee
+        // dashboard — Total NC, In Progress, Overdue, Pending Approval,
+        // Delayed, On Time Completion — under the same filters as the list.
+        // Each is a tap-filter; Total NC clears it.
+        if (stats != null && stats.hasBuckets)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: ReportTileGrid(
+              tiles: ncBucketTiles(
+                stats,
+                selected: {?bucket},
+                onToggle: (b) => _onStatus(
+                  bucket == b ? 'All' : _bucketFilterLabels[b]!,
+                ),
+                onClear: () => _onStatus('All'),
+              ),
+            ),
+          ),
         Expanded(
           // MaxWidthScroll wraps this whole branch (loading/error/empty
           // states included, not just the ListView) — a thin wrap around

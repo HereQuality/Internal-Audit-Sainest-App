@@ -14,6 +14,9 @@
 library;
 
 const _msPerDay = 24 * 60 * 60 * 1000;
+// IST = UTC+05:30, a fixed offset (India has no daylight saving). Mirrors
+// COMPANY_UTC_OFFSET_MS in server/utils/dueDate.js.
+const _companyUtcOffsetMs = (5 * 60 + 30) * 60 * 1000;
 
 // A "bare" calendar date (midnight, no real time-of-day) vs. one that
 // deliberately carries an hour/minute — e.g. a due date set to "5pm today".
@@ -29,13 +32,14 @@ DateTime _startOfDayUtc(DateTime d) {
 
 /// effectiveDeadline — the actual instant a due date expires.
 ///
-/// A bare calendar date means "by end of that day": push to one
-/// millisecond before the next UTC midnight, so anything finished later
-/// that same day still reads as on time. A due date that DOES carry a real
-/// time (e.g. "5pm today") means exactly that instant — nothing is pushed.
+/// A bare calendar date (exactly midnight UTC) means "by end of that day IN
+/// INDIA STANDARD TIME": one millisecond before the next IST midnight, i.e.
+/// 18:29:59.999 UTC of that same date (server: d + 1 day - 1ms - 5h30m).
+/// A due date that DOES carry a real time (e.g. "5pm today") means exactly
+/// that instant — nothing is pushed.
 DateTime effectiveDeadline(DateTime targetDate) {
   if (_hasTimeComponent(targetDate)) return targetDate;
-  return _startOfDayUtc(targetDate).add(const Duration(milliseconds: _msPerDay - 1));
+  return targetDate.toUtc().add(const Duration(milliseconds: _msPerDay - 1 - _companyUtcOffsetMs));
 }
 
 /// computeTurnaroundRatio — the "planned ÷ actual" duration score, 0-100,
@@ -76,7 +80,7 @@ enum NcTimelinessVerdict {
 
 class NcTimeliness {
   final NcTimelinessVerdict verdict;
-  final int? ats; // null while inProgress/unscored — nothing to score yet.
+  final int? ats; // null unless closed (onTime/delayed) — an open NC (incl. overdue) has no turnaround to score.
 
   const NcTimeliness({required this.verdict, this.ats});
 }
@@ -98,7 +102,7 @@ NcTimeliness computeNcTimeliness({
 
   if (completionDate == null) {
     return clock.isAfter(deadline)
-        ? const NcTimeliness(verdict: NcTimelinessVerdict.overdue, ats: 0)
+        ? const NcTimeliness(verdict: NcTimelinessVerdict.overdue)
         : const NcTimeliness(verdict: NcTimelinessVerdict.inProgress);
   }
 

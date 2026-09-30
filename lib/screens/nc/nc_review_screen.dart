@@ -27,10 +27,18 @@ import '../../widgets/photo_viewer.dart';
 /// nc.raisedByEmployeeId — so the action bar only renders for them; an
 /// auditee viewing their own pending response sees the same thread
 /// read-only instead of buttons that would just error.
+///
+/// [readOnly] is the Final Report's way in (Reports tab -> an NC): anyone the
+/// report hands an NC to may read its thread, and most of them are neither its
+/// raiser nor its auditee — so the "waiting for the auditor to review YOUR
+/// response" footer, which only makes sense to the auditee, is left out. The
+/// Approve / Reject bar needs no such switch: it already only ever appears for
+/// the NC's own raiser.
 class NcReviewScreen extends StatefulWidget {
   final NcModel nc;
+  final bool readOnly;
 
-  const NcReviewScreen({super.key, required this.nc});
+  const NcReviewScreen({super.key, required this.nc, this.readOnly = false});
 
   @override
   State<NcReviewScreen> createState() => _NcReviewScreenState();
@@ -238,7 +246,7 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
           ),
           if (_awaitingReview(nc) && _isRaiser(context, nc))
             _buildActionBar(context, nc)
-          else if (_awaitingReview(nc))
+          else if (_awaitingReview(nc) && !widget.readOnly)
             Container(
               width: double.infinity,
               // + home-indicator inset, same as the action bar above.

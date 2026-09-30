@@ -117,12 +117,19 @@ class AuditModel {
   // "completed on time / late" filter + dashboard tile.
   final String? timeliness;
   final AuditNcSummary? ncSummary;
-  // Same vocabulary as [displayStatus], aggregated over EVERY sibling of
-  // this audit's scheduleBatchId (the one status a multi-zone batch's parent
-  // row shows); null for a non-batch audit. [batchTimeliness] is set only
-  // once the whole batch is completed (Delayed if any zone was late).
+  // Same vocabulary as [displayStatus], aggregated over the zones of this
+  // audit's scheduleBatchId that the response holds (the one status a
+  // multi-zone batch's parent row shows); null for a non-batch audit. On
+  // GET /audits/report that is only the zones the filters matched — see
+  // [batchZoneCount]. [batchTimeliness] is set only once those zones are
+  // completed (Delayed if any was late).
   final String? batchDisplayStatus;
   final String? batchTimeliness;
+  // How many zones the bundle has IN TOTAL (GET /audits/report sends it on every
+  // row of a bundle). A list that carries fewer of them than this — "Me" lists
+  // only the zones you are on — is a partial view of the bundle, and says so
+  // ("2 of 5 locations"). Null for a non-batch audit / an older server.
+  final int? batchZoneCount;
   final DateTime? scheduledDate;
   final DateTime? scheduledEndDate;
   final DateTime? completedDate;
@@ -226,6 +233,7 @@ class AuditModel {
     this.ncSummary,
     this.batchDisplayStatus,
     this.batchTimeliness,
+    this.batchZoneCount,
     this.scheduledDate,
     this.scheduledEndDate,
     this.completedDate,
@@ -267,6 +275,7 @@ class AuditModel {
       ncSummary: AuditNcSummary.tryParse(json['ncSummary']),
       batchDisplayStatus: _nonEmpty(json['batchDisplayStatus']),
       batchTimeliness: _nonEmpty(json['batchTimeliness']),
+      batchZoneCount: (json['batchZoneCount'] as num?)?.toInt(),
       scheduledDate: _localDate(json['scheduledDate']),
       scheduledEndDate: _localDate(json['scheduledEndDate']),
       completedDate: _localDate(json['completedDate']),

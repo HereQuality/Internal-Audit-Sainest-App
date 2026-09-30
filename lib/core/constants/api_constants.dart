@@ -48,8 +48,13 @@ class ApiConstants {
   // A leader (or the planner / a scheduler) hands one auditor's place on an
   // audit to someone else (audit.controller.js#reassignAuditor).
   static String reassignAuditor(String id) => '/audits/$id/reassign-auditor';
-  // The Final Report tiles (audit.controller.js#getCompletedAuditStats).
-  static const completedStats = '/audits/stats/completed';
+  // The Final Report (phone: the Reports tab), open to every logged-in user —
+  // reached by who you ARE, not by a menu grant (audit.controller.js#
+  // listReportAudits / getReportAuditStats). The list is paged over GROUPS (a
+  // bundle or a series is one); the stats carry the six tiles, their id lists
+  // and the per-place `byLocation` breakdown.
+  static const auditsReport = '/audits/report';
+  static const auditsReportStats = '/audits/report/stats';
   static const auditorStats = '/audits/stats/auditor';
   static const ncs = '/ncs';
   static String auditById(String id) => '/audits/$id';
@@ -123,6 +128,16 @@ class ApiConstants {
   static const ncsMine = '/ncs/mine'; // auditee: NCs raised against me
   static const ncsAtsSummary =
       '/ncs/ats-summary'; // auditee: dashboard tallies (nc.controller.js#getAtsSummary)
+  // NC Monitoring's six tiles + the ids behind each (nc.controller.js#
+  // getRaisedNCStats) — same filters as /ncs/raised.
+  static const ncsRaisedStats = '/ncs/raised/stats';
+  // The Final Report's NCs tab: every NC the caller may see (by who they ARE,
+  // not by a menu), its six tiles and per-place tallies, and the Repeated NCs
+  // tab's groups (same wording at the same place) with the NCs behind one.
+  static const ncsReport = '/ncs/report';
+  static const ncsReportStats = '/ncs/report/stats';
+  static const ncsRepeats = '/ncs/repeats';
+  static const ncsRepeatRows = '/ncs/repeats/rows';
   // One NC's full detail by id — used to resolve a notification's
   // referenceId into a full NcModel before navigating to it (see
   // notifications_screen.dart), since a nc_* notification only carries

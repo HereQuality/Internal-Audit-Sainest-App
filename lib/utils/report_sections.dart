@@ -79,21 +79,26 @@ class AchievedMax {
 // achieve the same "round once" property with simply by calling it ONCE
 // over a combined leaf list rather than once per group.
 AchievedMax rawAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
+  // Mirrors server/utils/scoring.js#sumTree exactly: only SCORED leaves
+  // (findingType != null) count, and every one of them contributes the
+  // per-leaf `score` the server STORED at scoring time
+  // (audit.controller.js#scoreParameter: Strong Compliance = max,
+  // Compliance a typed 0..max, OFI a typed 0..max-1, NC = 0) — never a
+  // value re-derived here from the finding type.
   double achieved = 0, max = 0;
   for (final l in leaves) {
+    if (l.findingType == null) continue;
     final m = leafMax(l, auditMaxScore);
-    final raw = l.findingType == 'NC'
-        ? 0.0
-        : (l.findingType == 'Strong Compliance' || l.findingType == 'Compliance')
-            ? m
-            : (l.score ?? 0);
+    final rawAchieved = l.score ?? 0;
     if (scoringSystem == 'weightage') {
-      final capped = raw.clamp(0, m).toDouble();
+      // Ratio against the leaf's OWN max first, then weighted by its
+      // independent Weightage: achieved/max are in weightage-units.
+      final ratio = m > 0 ? (rawAchieved / m).clamp(0.0, 1.0) : 0.0;
       final wt = leafWeightage(l, auditMaxScore);
-      achieved += capped * wt;
-      max += m * wt;
+      achieved += ratio * wt;
+      max += wt;
     } else {
-      achieved += raw;
+      achieved += rawAchieved;
       max += m;
     }
   }

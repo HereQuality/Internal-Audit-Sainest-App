@@ -104,6 +104,15 @@ void main() {
           case ApiConstants.myAudits:
           case ApiConstants.auditsAtMyLocation:
             return json(200, {'data': [{'_id': 'a1', 'title': 'Old account audit'}]});
+          case ApiConstants.auditsReport:
+            return json(200, {
+              'data': {
+                'audits': [{'_id': 'a1', 'title': 'Old account audit'}],
+                'total': 1,
+                'page': 1,
+                'limit': 100,
+              },
+            });
           case ApiConstants.ncsRaised:
           case ApiConstants.ncsMine:
             return json(200, {'data': [{'_id': 'nc1', 'title': 'Old account NC'}]});

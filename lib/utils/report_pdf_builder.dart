@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io' show Platform;
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -13,6 +15,7 @@ import '../core/network/dio_client.dart';
 import '../models/audit_detail_model.dart';
 import '../models/nc_model.dart';
 import 'report_pdf_fonts.dart';
+import 'report_photo_utils.dart';
 import 'report_sections.dart';
 
 /// utils/report_pdf_builder.dart
@@ -215,6 +218,13 @@ class _ReportSpec {
   final String? finalAuditorRemark;
   final List<(String, String)>? zoneRemarks;
 
+  /// The server's own stored/rolled-up overall % (audit.scoreResult.percentage,
+  /// or the sum-then-divide of every zone's achieved/maxPossible for a
+  /// combined report). Wins over the locally recomputed % for the header ring
+  /// and stat tiles so the PDF can never disagree with the number every list
+  /// and the web show. Null (older server / nothing scored) = recompute.
+  final int? serverPercentage;
+
   const _ReportSpec({
     required this.reportTitle,
     required this.headerFields,
@@ -224,6 +234,7 @@ class _ReportSpec {
     required this.isFinalReport,
     this.finalAuditorRemark,
     this.zoneRemarks,
+    this.serverPercentage,
   });
 
   bool get isWeightage => scoringSystem == 'weightage';
@@ -336,6 +347,23 @@ bool _looksLikeWebp(Uint8List bytes) =>
     bytes[11] == 0x50;
 
 Future<pw.MemoryImage?> _decodeIfSupported(Uint8List bytes) async {
+  // JPEG/PNG — what an evidence photo effectively always is (the photo URLs
+  // are asked for as JPEG, see report_photo_utils.dart) — are recognised by
+  // their magic bytes alone. A full package:image decode of every photo, only
+  // to throw the pixels away and hand pw.MemoryImage the original bytes
+  // anyway, was a large slice of the time spent on a report with hundreds of
+  // them. pw.MemoryImage's own constructor still parses the header (size,
+  // orientation) and throws on a malformed one, which the catch below turns
+  // into the slower, fully-validating path.
+  if (looksLikeJpeg(bytes) || looksLikePng(bytes)) {
+    try {
+      return pw.MemoryImage(bytes);
+    } catch (_) {
+      // fall through to the full-decode check below
+    }
+  }
+  // Unknown format (GIF/BMP/…) or a JPEG/PNG whose header the pdf package
+  // rejected: keep the original decode-and-validate.
   if (!_looksLikeWebp(bytes)) {
     try {
       if (img.decodeImage(bytes) != null) return pw.MemoryImage(bytes);
@@ -378,27 +406,108 @@ Future<pw.MemoryImage?> _fetchCompanyLogoImage(String? url) async {
   }
 }
 
-Future<Map<String, pw.MemoryImage?>> _fetchImages(Set<String> urls) async {
-  final entries = await Future.wait(
-    urls.map((url) async {
-      try {
-        final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 20));
-        if (res.statusCode != 200) return MapEntry<String, pw.MemoryImage?>(url, null);
-        return MapEntry<String, pw.MemoryImage?>(url, await _decodeIfSupported(res.bodyBytes));
-      } catch (_) {
-        // Bad URL, network blip, or an image format the pdf package can't
-        // decode — degrade to a placeholder box rather than failing the
-        // whole report.
-        return MapEntry<String, pw.MemoryImage?>(url, null);
+/// What a report build reports back about its evidence photos, so the caller
+/// can tell the user when some of them are placeholders in the PDF. Pass one to
+/// [buildReportPdf] / [buildCombinedReportPdf]; it is filled in before they
+/// return.
+class ReportPdfStats {
+  /// Distinct photo URLs the report needed (a photo shown twice counts once).
+  int photosTotal = 0;
+
+  /// How many of those could not be fetched or decoded even after a retry —
+  /// each one is drawn as the grey "photo" placeholder box.
+  int photosFailed = 0;
+
+  /// The line to show the user, or null when every photo made it.
+  String? get photoWarning {
+    if (photosFailed <= 0) return null;
+    return photosFailed == 1
+        ? '1 photo could not be loaded and appears as a blank box in the PDF.'
+        : '$photosFailed photos could not be loaded and appear as blank boxes in the PDF.';
+  }
+}
+
+// Photo download tuning. Six requests at a time: enough to keep a phone's
+// connection busy, few enough that each one still finishes inside its
+// timeout on a slow network (the previous unbounded Future.wait started every
+// photo at once, so with hundreds of photos most of them timed out and quietly
+// became grey boxes).
+const _photoConcurrency = 6;
+const _photoTimeout = Duration(seconds: 30);
+const _photoRetryDelay = Duration(milliseconds: 500);
+
+// After this many photos in a row fail at the TRANSPORT level (no HTTP answer
+// at all: offline, DNS, timeout) the network is treated as gone and the rest
+// are skipped as failed instead of each burning two 30s timeouts — with a
+// bounded pool that would otherwise be hours for a few hundred photos. Any
+// HTTP response (even a 404 for a deleted photo) proves the network is up and
+// resets the count.
+const _photoNetworkDownAfter = 12;
+
+class _PhotoFetchState {
+  int consecutiveNetworkFailures = 0;
+  bool get networkDown => consecutiveNetworkFailures >= _photoNetworkDownAfter;
+}
+
+/// One photo: the shrunken URL first (see optimizedReportPhotoUrl), then —
+/// after a short pause — the ORIGINAL url as the single retry. That second
+/// attempt covers both a transient blip and an account that refuses
+/// on-the-fly Cloudinary transformations (strict mode answers those with
+/// 401/403, while the original URL is fine). Null when both attempts fail; the
+/// caller draws the placeholder.
+Future<pw.MemoryImage?> _fetchPhoto(http.Client client, String url, _PhotoFetchState state) async {
+  final optimized = optimizedReportPhotoUrl(url);
+  for (var attempt = 0; attempt < 2; attempt++) {
+    if (state.networkDown) return null;
+    final target = attempt == 0 ? optimized : url;
+    try {
+      final res = await client.get(Uri.parse(target)).timeout(_photoTimeout);
+      state.consecutiveNetworkFailures = 0;
+      if (res.statusCode == 200) {
+        final image = await _decodeIfSupported(res.bodyBytes);
+        if (image != null) return image;
+        // The ORIGINAL bytes themselves are undecodable — downloading them
+        // again can't change that.
+        if (target == url) return null;
       }
-    }),
-  );
-  return Map.fromEntries(entries);
+    } catch (_) {
+      // Bad URL, timeout, dropped connection.
+      state.consecutiveNetworkFailures++;
+    }
+    if (attempt == 0) await Future<void>.delayed(_photoRetryDelay);
+  }
+  return null;
+}
+
+Future<Map<String, pw.MemoryImage?>> _fetchImages(Set<String> urls, {ReportPdfStats? stats}) async {
+  final list = urls.toList();
+  if (list.isEmpty) return const {};
+  final client = http.Client();
+  final state = _PhotoFetchState();
+  try {
+    final fetched = await mapWithConcurrency<String, pw.MemoryImage>(
+      list,
+      _photoConcurrency,
+      (url) => _fetchPhoto(client, url, state),
+    );
+    final images = <String, pw.MemoryImage?>{};
+    var failed = 0;
+    for (var i = 0; i < list.length; i++) {
+      images[list[i]] = fetched[i];
+      if (fetched[i] == null) failed++;
+    }
+    stats?.photosTotal += list.length;
+    stats?.photosFailed += failed;
+    return images;
+  } finally {
+    client.close();
+  }
 }
 
 /// One completed audit — the mobile counterpart of the web Final Report
-/// page's own "Download PDF".
-Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
+/// page's own "Download PDF". [stats], when given, is filled with how many
+/// evidence photos could not be loaded (see [ReportPdfStats]).
+Future<Uint8List> buildReportPdf(AuditDetailModel audit, {ReportPdfStats? stats}) async {
   final sections = buildReportSections(
     audit,
   ).map((s) => _SectionSpec(label: s.label, tree: s.tree, maxScore: audit.maxScore)).toList();
@@ -429,7 +538,9 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
       scoringSystem: audit.scoringSystem,
       isFinalReport: audit.status == 'Completed',
       finalAuditorRemark: (audit.finalAuditorRemark ?? '').isNotEmpty ? audit.finalAuditorRemark : null,
+      serverPercentage: audit.scoreResult.percentage?.round(),
     ),
+    stats: stats,
   );
 }
 
@@ -457,6 +568,7 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit) async {
 Future<Uint8List> buildCombinedReportPdf(
   List<AuditDetailModel> zones, {
   String? batchStatus,
+  ReportPdfStats? stats,
 }) async {
   if (zones.isEmpty) {
     return pw.Document(theme: await loadReportPdfTheme()).save();
@@ -521,17 +633,113 @@ Future<Uint8List> buildCombinedReportPdf(
       scoringSystem: first.scoringSystem,
       isFinalReport: zones.every((z) => z.status == 'Completed'),
       zoneRemarks: zoneRemarks.isNotEmpty ? zoneRemarks : null,
+      serverPercentage: _combinedServerPercentage(zones),
     ),
+    stats: stats,
   );
+}
+
+/// Server's aggregateRollup (utils/scoring.js) over every zone's stored
+/// scoreResult: achieved/maxPossible summed first, THEN divided. Null when any
+/// zone that has scored leaves carries no server percentage (older server) —
+/// a partial rollup would be wrong, so the caller recomputes instead.
+int? _combinedServerPercentage(List<AuditDetailModel> zones) {
+  double achieved = 0, max = 0;
+  for (final z in zones) {
+    final r = z.scoreResult;
+    if (r.percentage == null) {
+      if (collectScoredLeaves(buildReportSections(z).expand((s) => s.tree).toList()).isNotEmpty) return null;
+      continue;
+    }
+    achieved += r.achieved;
+    max += r.maxPossible;
+  }
+  return max > 0 ? (achieved.roundToDouble() / max.roundToDouble() * 100).round() : null;
 }
 
 // ── Renderer — the block order below is exportAuditReportToPdf.js's own
 // top-level body, one for one. ─────────────────────────────────────────
-Future<Uint8List> _render(_ReportSpec spec) async {
-  final doc = pw.Document(theme: await loadReportPdfTheme());
-  final images = await _fetchImages(_collectPhotoUrls(spec.sections));
+//
+// Split in two on purpose. Everything that needs the app's own isolate —
+// the font download, the company lookup (Dio), the photo downloads, the
+// WebP-via-Skia decode (dart:ui) — happens here, in [_render]. What is left
+// ([_buildPdfBytes]) is pure Dart on plain data, and is where a 300-page
+// report spends tens of seconds (pw.MultiPage lays every page out inside
+// doc.addPage, then paints them all inside doc.save()) — so it runs on a
+// BACKGROUND isolate instead of freezing the UI thread for that whole time
+// (the spinner stopped animating and touches went unanswered).
+Future<Uint8List> _render(_ReportSpec spec, {ReportPdfStats? stats}) async {
+  final fontData = await loadReportPdfFontData();
+  final images = await _fetchImages(_collectPhotoUrls(spec.sections), stats: stats);
   final (companyName, companyLogoUrl) = await _fetchCompanyInfo();
   final companyLogo = await _fetchCompanyLogoImage(companyLogoUrl);
+
+  final bytes = await _buildPdfOffThread(
+    _RenderJob(
+      spec: spec,
+      fontData: fontData,
+      images: images,
+      companyName: companyName,
+      companyLogo: companyLogo,
+    ),
+  );
+  if (bytes.isEmpty) throw Exception('The report came out empty.');
+  return bytes;
+}
+
+/// Everything [_buildPdfBytes] needs, as one plain-data bundle that can be
+/// copied to a background isolate: the report spec (strings, numbers, the
+/// audit's parameter tree), the font faces' raw bytes, the already-downloaded
+/// evidence images (pw.MemoryImage only wraps bytes — it has not touched a
+/// document yet) and the company name/logo.
+class _RenderJob {
+  final _ReportSpec spec;
+  final List<ByteData?> fontData;
+  final Map<String, pw.MemoryImage?> images;
+  final String? companyName;
+  final pw.MemoryImage? companyLogo;
+
+  const _RenderJob({
+    required this.spec,
+    required this.fontData,
+    required this.images,
+    required this.companyName,
+    required this.companyLogo,
+  });
+}
+
+/// Runs [_buildPdfBytes] on a background isolate. Falls back to running it
+/// right here — the pre-isolate behaviour, slower to feel but identical in
+/// output — when an isolate can't be used: flutter test (the same guard the
+/// pdf package's own save() uses, FakeAsync can't await an isolate), a
+/// platform without isolates (web), or the job not being sendable to one.
+/// Only those setup failures fall back; a genuine layout error thrown while
+/// building propagates to the caller exactly as it did before.
+Future<Uint8List> _buildPdfOffThread(_RenderJob job) async {
+  if (Platform.environment.containsKey('FLUTTER_TEST')) return _buildPdfBytes(job);
+  try {
+    return await Isolate.run(() => _buildPdfBytes(job), debugName: 'report_pdf');
+  } on ArgumentError {
+    // "Illegal argument in isolate message" — something in the job isn't
+    // sendable. (A RangeError from inside the build is an ArgumentError too;
+    // it simply re-throws from the inline attempt below.)
+    return _buildPdfBytes(job);
+  } on UnsupportedError {
+    return _buildPdfBytes(job);
+  } on IsolateSpawnException {
+    return _buildPdfBytes(job);
+  }
+}
+
+/// The pure-Dart half of the render: lays the whole report out and serialises
+/// it. Top-level and free of anything that needs the UI isolate, so
+/// [_buildPdfOffThread] can run it in a background one.
+Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
+  final spec = job.spec;
+  final images = job.images;
+  final companyName = job.companyName;
+  final companyLogo = job.companyLogo;
+  final doc = pw.Document(theme: reportPdfThemeFrom(job.fontData));
 
   // RAW (unrounded) per-leaf contributions summed across every section
   // FIRST, rounded exactly once at the very end — mirrors the web's own
@@ -564,7 +772,7 @@ Future<Uint8List> _render(_ReportSpec spec) async {
   }
   final achieved = rawAchieved.round();
   final max = rawMax.round();
-  final overallPct = max > 0 ? (achieved / max * 100).round() : null;
+  final overallPct = spec.serverPercentage ?? (max > 0 ? (achieved / max * 100).round() : null);
   final scoreColor = _scoreColor(overallPct);
 
   final hasRemark = spec.finalAuditorRemark != null || (spec.zoneRemarks?.isNotEmpty ?? false);
@@ -930,7 +1138,8 @@ const _horizontalBarThreshold = 10;
 
 double? _leafRatio(ParameterNode leaf, double? auditMaxScore) {
   if (leaf.findingType == null) return null;
-  if (leaf.findingType == 'Strong Compliance' || leaf.findingType == 'Compliance') return 1;
+  // The stored per-leaf score for EVERY finding type (Compliance is a typed
+  // 0..max on the server, not always full marks) — see rawAchievedMax.
   final max = leafMax(leaf, auditMaxScore);
   return ((leaf.score ?? 0) / max).clamp(0.0, 1.0);
 }

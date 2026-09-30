@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import '../core/theme/app_colors.dart';
 import '../core/utils/audit_status.dart';
+import '../core/utils/place_cascade.dart';
 import '../models/employee_option.dart';
 import '../models/nc_model.dart' show kNcFlags;
 import '../providers/audit_filter_scope.dart';
@@ -54,6 +55,13 @@ class AuditFilterSelection {
   final List<String> teams;
   final List<String> teamMembers;
 
+  /// Team / Members picks a picked place has SET ASIDE (people who don't belong
+  /// to it): not applied — [teams] / [employees] / [teamMembers] hold only what
+  /// the requests use — but kept here so clearing the place brings them back
+  /// (see AuditFilterScope.heldTeamFilter).
+  final List<String> heldTeams;
+  final List<String> heldEmployees;
+
   /// Location ids and department ids — one "where" facet (empty both = All).
   final List<String> locations;
   final List<String> departments;
@@ -85,6 +93,8 @@ class AuditFilterSelection {
     this.employees = const [],
     this.teams = const [],
     this.teamMembers = const [],
+    this.heldTeams = const [],
+    this.heldEmployees = const [],
     this.locations = const [],
     this.departments = const [],
     this.auditTypes = const [],
@@ -109,6 +119,8 @@ class AuditFilterSelection {
       employees: scope.employeeFilter,
       teams: scope.teamFilter,
       teamMembers: scope.teamMemberIds,
+      heldTeams: scope.heldTeamFilter,
+      heldEmployees: scope.heldEmployeeFilter,
       locations: scope.locationFilter,
       departments: scope.departmentFilter,
       auditTypes: scope.auditTypeFilter,
@@ -126,6 +138,8 @@ class AuditFilterSelection {
     List<String>? employees,
     List<String>? teams,
     List<String>? teamMembers,
+    List<String>? heldTeams,
+    List<String>? heldEmployees,
     List<String>? locations,
     List<String>? departments,
     List<String>? auditTypes,
@@ -140,6 +154,8 @@ class AuditFilterSelection {
       employees: employees ?? this.employees,
       teams: teams ?? this.teams,
       teamMembers: teamMembers ?? this.teamMembers,
+      heldTeams: heldTeams ?? this.heldTeams,
+      heldEmployees: heldEmployees ?? this.heldEmployees,
       locations: locations ?? this.locations,
       departments: departments ?? this.departments,
       auditTypes: auditTypes ?? this.auditTypes,
@@ -177,6 +193,8 @@ Future<void> applyAuditFilterSelection(
         employees: selection.employees,
         teams: selection.teams,
         teamMembers: selection.teamMembers,
+        heldTeams: selection.heldTeams,
+        heldEmployees: selection.heldEmployees,
         locations: selection.locations,
         departments: selection.departments,
         auditTypes: selection.auditTypes,
@@ -246,8 +264,14 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   // The whole selection is local until Apply — the sheet is a draft of a
   // filter, not a live control.
   late bool _isTeam = widget.initial.isTeam;
-  late List<String> _teams = [...widget.initial.teams];
-  late List<String> _members = [...widget.initial.employees];
+  // Team / Members hold EVERYTHING picked, the ones a picked place has set aside
+  // included: the place narrows what is offered and applied (see [_who]) but
+  // never rewrites these, so clearing the place brings its picks back.
+  late List<String> _teams = _union(widget.initial.teams, widget.initial.heldTeams);
+  late List<String> _members = _union(
+    widget.initial.employees,
+    widget.initial.heldEmployees,
+  );
   late List<String> _locations = [...widget.initial.locations];
   late List<String> _departments = [...widget.initial.departments];
   late List<String> _auditTypes = [...widget.initial.auditTypes];
@@ -278,6 +302,31 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     });
   }
 
+  static List<String> _union(List<String> a, List<String> b) => [
+    ...a,
+    for (final x in b)
+      if (!a.contains(x)) x,
+  ];
+
+  /// What Team / Members really mean under the picked place (people who don't
+  /// belong to it are set aside; the Location list narrows to the picked
+  /// people's places) — see core/utils/place_cascade.dart. Waits for the
+  /// directory: until it has loaded nothing is narrowed or set aside.
+  WhoCascade _who(
+    FilterOptionsProvider options, {
+    List<String>? locations,
+    List<String>? departments,
+  }) => WhoCascade.resolve(
+    directory: options.employees,
+    locations: options.locations,
+    teams: _teams,
+    members: _members,
+    locationIds: locations ?? _locations,
+    departmentIds: departments ?? _departments,
+    // Me is the untouched default: it must not narrow the Location list.
+    untouchedMembers: !_isTeam && _selfId != null ? [_selfId!] : const [],
+  );
+
   static DateTime? _normaliseMonth(DateTime? value) =>
       value == null ? null : DateTime(value.year, value.month, 1);
 
@@ -302,9 +351,10 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     });
   }
 
-  int get _draftCount =>
-      (_teams.isNotEmpty ? 1 : 0) +
-      (_members.isNotEmpty || (_teams.isEmpty && _isTeam) ? 1 : 0) +
+  // Counts what is really applied: a pick the place set aside is not one.
+  int _draftCountFor(WhoCascade who) =>
+      (who.teams.isNotEmpty ? 1 : 0) +
+      (who.members.isNotEmpty || (who.teams.isEmpty && _isTeam) ? 1 : 0) +
       (_locations.isNotEmpty || _departments.isNotEmpty ? 1 : 0) +
       (_auditTypes.isNotEmpty ? 1 : 0) +
       (widget.showDateRange && (_from != null || _to != null) ? 1 : 0) +
@@ -325,15 +375,20 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   }
 
   Future<void> _pickTeams(FilterOptionsProvider options) async {
+    final who = _who(options);
     final picked = await showMultiPickerSheet<String>(
       context,
       title: 'Team',
-      subtitle: 'Everyone in the picked teams.',
+      subtitle: who.placeApplies
+          ? 'Teams of the people at the picked place.'
+          : 'Everyone in the picked teams.',
       searchHint: 'Search teams',
-      selected: _teams,
+      selected: who.teams,
       confirmLabel: 'Apply teams',
       items: [
-        for (final t in options.teams)
+        // Only the teams of the people the picked place leaves in play, counted
+        // over those people.
+        for (final t in options.teamsOf(who.pool))
           PickerItem(
             value: t.id,
             label: t.name,
@@ -343,18 +398,24 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     );
     if (picked == null || !mounted) return;
     setState(() {
-      _teams = picked;
+      // A team the place set aside is not on offer to untick: it stays saved.
+      _teams = _union(picked, who.heldTeams);
       // Members cascades from Team: keep only people still inside the teams;
       // if none remain the new team simply means "all of it".
-      if (picked.isNotEmpty && _members.isNotEmpty) {
-        final inTeams = options.membersOfTeams(picked).map((e) => e.id).toSet();
+      if (_teams.isNotEmpty && _members.isNotEmpty) {
+        final inTeams = options.membersOfTeams(_teams).map((e) => e.id).toSet();
         _members = _members.where(inTeams.contains).toList();
       }
     });
   }
 
-  List<EmployeeOption> _memberPool(FilterOptionsProvider options) {
-    final pool = [...options.membersOfTeams(_teams)];
+  List<EmployeeOption> _memberPool(WhoCascade who) {
+    // The people the picked place leaves in play, inside the picked team(s).
+    final teamSet = who.teams.toSet();
+    final pool = [
+      for (final e in who.pool)
+        if (teamSet.isEmpty || e.teams.any((t) => teamSet.contains(t.id))) e,
+    ];
     // 'Me' first, then active people by name, then the deactivated ones.
     pool.sort((a, b) {
       if (a.id == _selfId) return -1;
@@ -366,12 +427,18 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   }
 
   Future<void> _pickMembers(FilterOptionsProvider options) async {
-    final pool = _memberPool(options);
+    final who = _who(options);
+    final pool = _memberPool(who);
     final picked = await showMultiPickerSheet<String>(
       context,
       title: 'Members',
+      subtitle: who.placeApplies ? 'People at the picked place.' : null,
       searchHint: 'Search members',
-      selected: _members,
+      // "All Members" row: opens with everything ticked while no one is picked
+      // under All Members, and ticking everyone by hand is the same thing.
+      allLabel: pool.length > 1 ? 'All Members' : null,
+      initiallyAll: _isTeam && who.members.isEmpty,
+      selected: who.members,
       confirmLabel: 'Apply members',
       items: [
         for (final e in pool)
@@ -387,7 +454,15 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
       ],
     );
     if (picked == null || !mounted) return;
-    setState(() => _members = picked);
+    // Everyone ticked = All Members (no explicit list, and the scope reads All).
+    if (pool.length > 1 && picked.length == pool.length) {
+      setState(() {
+        _isTeam = true;
+        _members = [];
+      });
+      return;
+    }
+    setState(() => _members = _union(picked, who.heldMembers));
   }
 
   Future<void> _pickWhere(FilterOptionsProvider options) async {
@@ -401,6 +476,11 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
       loading: options.isLoading,
       failed: options.locationsFailed,
       fullAccess: options.fullAccess,
+      // Picked people / teams narrow the places on offer to the ones they belong
+      // to. Asked again for the sheet's LIVE ticks: ticking a place can set a
+      // pick aside, which changes which people count.
+      restrictTo: (locs, depts) =>
+          _who(options, locations: locs, departments: depts).placeRestriction,
     );
     if (result == null || !mounted) return;
     setState(() {
@@ -466,20 +546,36 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
 
   void _apply() {
     final options = context.read<FilterOptionsProvider>();
+    // What Team / Members mean under the picked place: the people the place set
+    // aside are neither applied nor forgotten (held), so the scope sent to the
+    // server is exactly what the sheet shows.
+    final who = _who(options);
+    // Without a directory nothing was narrowed or set aside on screen; keep
+    // what was held before so an unrelated Apply never turns it back on.
+    final ready = options.employees.isNotEmpty;
+    final heldT = widget.initial.heldTeams;
+    final heldM = widget.initial.heldEmployees;
+    final teams = ready ? who.teams : _teams.where((t) => !heldT.contains(t)).toList();
+    final members = ready
+        ? who.members
+        : _members.where((m) => !heldM.contains(m)).toList();
     // Team → people, resolved here from the directory the sheet already
-    // holds; a team the directory can't resolve (not loaded) keeps the
-    // previous resolution so an unrelated Apply never wipes it.
-    final teamMembers = _teams.isEmpty
+    // holds (within the picked place, as the Members list is); a team the
+    // directory can't resolve (not loaded) keeps the previous resolution so an
+    // unrelated Apply never wipes it.
+    final teamMembers = teams.isEmpty
         ? const <String>[]
-        : (options.employees.isEmpty
-              ? widget.initial.teamMembers
-              : options.membersOfTeams(_teams).map((e) => e.id).toList());
+        : (ready ? who.teamMembers : widget.initial.teamMembers);
     Navigator.of(context).pop(
       AuditFilterSelection(
         isTeam: _isTeam,
-        employees: _members,
-        teams: _teams,
+        employees: members,
+        teams: teams,
         teamMembers: teamMembers,
+        heldTeams: ready ? who.heldTeams : _teams.where(heldT.contains).toList(),
+        heldEmployees: ready
+            ? who.heldMembers
+            : _members.where(heldM.contains).toList(),
         locations: _locations,
         departments: _departments,
         auditTypes: _auditTypes,
@@ -503,6 +599,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     final scheme = Theme.of(context).colorScheme;
     final options = context.watch<FilterOptionsProvider>();
     final media = MediaQuery.of(context);
+    final who = _who(options);
 
     // Height-bounded and internally scrollable, so the Apply button is
     // pinned and can never end up below the fold. Never taller than what's
@@ -540,7 +637,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
                   ),
                 ),
               ),
-              _buildHeader(context),
+              _buildHeader(context, who),
               Flexible(
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
@@ -554,7 +651,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
                         _RetryBanner(
                           onRetry: () => options.load(force: true),
                         ),
-                      _buildPeopleSection(context, options),
+                      _buildPeopleSection(context, options, who),
                       const _SectionGap(),
                       _buildWhereSection(context, options),
                       const _SectionGap(),
@@ -579,7 +676,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
                   ),
                 ),
               ),
-              _buildFooter(context),
+              _buildFooter(context, who),
             ],
           ),
         ),
@@ -587,7 +684,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     );
   }
 
-  Widget _buildHeader(BuildContext context) {
+  Widget _buildHeader(BuildContext context, WhoCascade who) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 12, 8, 4),
@@ -599,13 +696,13 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
               context,
             ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
           ),
-          if (_draftCount > 0) ...[
+          if (_draftCountFor(who) > 0) ...[
             const SizedBox(width: 8),
-            _CountPill(count: _draftCount),
+            _CountPill(count: _draftCountFor(who)),
           ],
           const Spacer(),
           TextButton(
-            onPressed: _draftCount == 0 && !_showMonth ? null : _reset,
+            onPressed: _draftCountFor(who) == 0 && !_showMonth ? null : _reset,
             style: TextButton.styleFrom(foregroundColor: scheme.primary),
             child: const Text('Clear all'),
           ),
@@ -618,35 +715,50 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   Widget _buildPeopleSection(
     BuildContext context,
     FilterOptionsProvider options,
+    WhoCascade who,
   ) {
     final scheme = Theme.of(context).colorScheme;
-    final specific = _members.isNotEmpty || _teams.isNotEmpty;
+    // What is really applied: a pick the picked place set aside does not count.
+    final specific = who.members.isNotEmpty || who.teams.isNotEmpty;
     final loading = options.isLoading && options.employees.isEmpty;
+    final poolTeams = options.teamsOf(who.pool);
+    final memberPool = _memberPool(who);
+    final held = who.heldTeams.length + who.heldMembers.length;
 
     String teamSummary() {
-      if (_teams.isEmpty) return 'All teams';
-      if (_teams.length == 1) {
+      if (who.teams.isEmpty) return 'All teams';
+      if (who.teams.length == 1) {
         for (final t in options.teams) {
-          if (t.id == _teams.first) return t.name;
+          if (t.id == who.teams.first) return t.name;
         }
         return '1 team';
       }
-      return '${_teams.length} teams';
+      return '${who.teams.length} teams';
     }
 
     String memberSummary() {
-      if (_members.isEmpty) {
-        return _teams.isEmpty ? 'Choose specific people' : 'Everyone in the team';
+      if (who.members.isEmpty) {
+        return who.teams.isEmpty
+            ? 'Choose specific people'
+            : 'Everyone in the team';
       }
-      if (_members.length == 1) {
-        if (_members.first == _selfId) return 'Only me';
+      if (who.members.length == 1) {
+        if (who.members.first == _selfId) return 'Only me';
         for (final e in options.employees) {
-          if (e.id == _members.first) return e.name;
+          if (e.id == who.members.first) return e.name;
         }
         return '1 member';
       }
-      return '${_members.length} members';
+      return '${who.members.length} members';
     }
+
+    // Directory empty = not loaded / failed: tap retries. Directory loaded but
+    // the picked place has no people (or no teams) = a plain, untappable note.
+    final noDirectory = options.employees.isEmpty;
+    final teamsOnPlace =
+        !loading && !noDirectory && who.placeApplies && poolTeams.isEmpty;
+    final peopleOnPlace =
+        !loading && !noDirectory && who.placeApplies && memberPool.isEmpty;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -682,16 +794,32 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
             ).textTheme.bodySmall?.copyWith(color: scheme.outline),
           ),
         ],
+        if (who.placeApplies) ...[
+          const SizedBox(height: 6),
+          Text(
+            held > 0
+                ? 'Team and Members list only the people at the picked location / department. '
+                      '$held pick${held == 1 ? '' : 's'} outside it ${held == 1 ? 'is' : 'are'} set aside — clear the location to bring ${held == 1 ? 'it' : 'them'} back.'
+                : 'Team and Members list only the people at the picked location / department.',
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.outline),
+          ),
+        ],
         const SizedBox(height: 10),
         _PickTile(
           icon: Icons.diversity_3_outlined,
           title: 'Team',
           summary: loading ? 'Loading…' : teamSummary(),
-          active: _teams.isNotEmpty,
-          onTap: loading || options.teams.isEmpty
-              ? (loading ? null : () => options.load(force: true))
+          active: who.teams.isNotEmpty,
+          onTap: loading || teamsOnPlace
+              ? null
+              : (noDirectory || options.teams.isEmpty)
+              ? () => options.load(force: true)
               : () => _pickTeams(options),
-          disabledHint: !loading && options.teams.isEmpty
+          disabledHint: teamsOnPlace
+              ? 'No teams at the picked location'
+              : !loading && options.teams.isEmpty
               ? 'No teams available — tap to retry'
               : null,
         ),
@@ -700,11 +828,17 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
           icon: Icons.person_search_outlined,
           title: 'Members',
           summary: loading ? 'Loading…' : memberSummary(),
-          active: _members.isNotEmpty,
-          onTap: loading || options.employees.isEmpty
-              ? (loading ? null : () => options.load(force: true))
+          active: who.members.isNotEmpty,
+          onTap: loading || peopleOnPlace
+              ? null
+              : noDirectory
+              ? () => options.load(force: true)
               : () => _pickMembers(options),
-          disabledHint: !loading && options.employees.isEmpty
+          disabledHint: peopleOnPlace
+              ? (who.teams.isEmpty
+                    ? 'No people at the picked location'
+                    : 'No people of the picked team at the location')
+              : !loading && options.employees.isEmpty
               ? 'No people available — tap to retry'
               : null,
         ),
@@ -990,7 +1124,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   }
 
   // ── Footer ────────────────────────────────────────────────────────────
-  Widget _buildFooter(BuildContext context) {
+  Widget _buildFooter(BuildContext context, WhoCascade who) {
     final scheme = Theme.of(context).colorScheme;
     // Outside the scroll view entirely — the one thing in this sheet that
     // must never need a scroll to reach.
@@ -1006,7 +1140,11 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
           child: FilledButton(
             onPressed: _apply,
-            child: Text(_draftCount == 0 ? 'Apply' : 'Apply ($_draftCount)'),
+            child: Text(
+              _draftCountFor(who) == 0
+                  ? 'Apply'
+                  : 'Apply (${_draftCountFor(who)})',
+            ),
           ),
         ),
       ),

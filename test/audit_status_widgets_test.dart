@@ -731,6 +731,7 @@ void main() {
       await tester.pumpWidget(MultiProvider(
         providers: [
           ChangeNotifierProvider(create: (_) => AuditsProvider()),
+          ChangeNotifierProvider(create: (_) => NcProvider()),
           ChangeNotifierProvider(create: (_) => FilterOptionsProvider()),
           ChangeNotifierProvider(create: (_) => ListViewMemory()),
         ],
@@ -757,7 +758,7 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('defaults to every audit whose RAW status is Completed, badged by NC stage', (tester) async {
+    testWidgets('defaults to every started audit (the rows the tiles count), badged by NC stage', (tester) async {
       adapter.audits = [
         row('closed', 'Completed', 'Total Closed', timeliness: 'On-Time Completed'),
         row('waiting', 'Completed', 'NC Response Pending', timeliness: 'Delayed Completed'),
@@ -765,11 +766,11 @@ void main() {
       ];
       await pumpScreen(tester);
 
-      // The default view keeps showing finished audits — whatever their NC
-      // stage — and only those.
+      // 'All' is the default chip: the list is the same population the tiles
+      // (Total Audits, In Progress, Completed...) describe.
       expect(find.text('Report closed'), findsOneWidget);
       expect(find.text('Report waiting'), findsOneWidget);
-      expect(find.text('Report open'), findsNothing);
+      expect(find.text('Report open'), findsOneWidget);
       expect(onCard('Total Closed'), findsOneWidget);
       expect(onCard('NC Response Pending'), findsOneWidget);
       // The raw word never reaches a badge (it is only the chip's own label).
@@ -777,6 +778,11 @@ void main() {
       // On-Time / Delayed pills sit with the finished audits.
       expect(find.text('On-Time'), findsOneWidget);
       expect(find.text('Delayed'), findsOneWidget);
+
+      // The 'Completed' chip is the old default view: finished audits only.
+      await pick(tester, 'Completed');
+      expect(find.text('Report closed'), findsOneWidget);
+      expect(find.text('Report open'), findsNothing);
     });
 
     testWidgets('the status chips narrow the list by display status / timeliness', (tester) async {
@@ -870,8 +876,9 @@ void main() {
 
 void _ignore(String _) {}
 
-/// GET /audits/mine answers with [audits]; everything else with an empty
-/// list. Records whether the app ever sent a `status` query parameter.
+/// GET /audits/mine answers with [audits], GET /audits/report with the same rows
+/// in the report's paged shape; everything else with an empty list. Records
+/// whether the app ever sent a `status` query parameter.
 class _AuditsAdapter implements HttpClientAdapter {
   List<Map<String, dynamic>> audits = [];
   bool sawStatusParam = false;
@@ -883,7 +890,11 @@ class _AuditsAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     if (options.queryParameters.containsKey('status')) sawStatusParam = true;
-    final data = options.path == ApiConstants.myAudits ? audits : <dynamic>[];
+    final Object data = options.path == ApiConstants.myAudits
+        ? audits
+        : options.path == ApiConstants.auditsReport
+        ? {'audits': audits, 'total': audits.length, 'page': 1, 'limit': 100}
+        : <dynamic>[];
     return ResponseBody.fromString(
       jsonEncode({'isOk': true, 'data': data}),
       200,

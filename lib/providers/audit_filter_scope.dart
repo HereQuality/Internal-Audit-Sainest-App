@@ -49,7 +49,17 @@ mixin AuditFilterScope on ChangeNotifier {
   List<String> teamFilter = const [];
 
   /// Everyone in [teamFilter]'s teams, resolved by the sheet when it applied.
+  /// (Within the picked place when there is one — see [heldTeamFilter].)
   List<String> teamMemberIds = const [];
+
+  /// Team / Members picks a picked Location or Department has SET ASIDE: the
+  /// people in them do not belong to that place, so they are not offered and
+  /// not applied (they are absent from [teamFilter] / [employeeFilter], which
+  /// are exactly what the requests and the pills use) — but they are not
+  /// forgotten either: the sheet feeds them back in, so clearing the place
+  /// brings them back (core/utils/place_cascade.dart#WhoCascade).
+  List<String> heldTeamFilter = const [];
+  List<String> heldEmployeeFilter = const [];
 
   /// Location ids to narrow to (Area / Zone / Sub Zone). Empty means every
   /// location this user can see (no param sent at all).
@@ -210,12 +220,16 @@ mixin AuditFilterScope on ChangeNotifier {
     List<String>? statuses,
     bool? includeSkipped,
     List<String>? flags,
+    List<String>? heldTeams,
+    List<String>? heldEmployees,
   }) {
     setFilterState(
       isTeam: isTeam,
       employees: employees,
       teams: teams,
       teamMembers: teamMembers,
+      heldTeams: heldTeams,
+      heldEmployees: heldEmployees,
       locations: locations,
       departments: departments,
       auditTypes: auditTypes,
@@ -249,8 +263,12 @@ mixin AuditFilterScope on ChangeNotifier {
     List<String>? statuses,
     bool? includeSkipped,
     List<String>? flags,
+    List<String>? heldTeams,
+    List<String>? heldEmployees,
   }) {
     if (isTeam != null) isTeamScope = isTeam;
+    if (heldTeams != null) heldTeamFilter = List.unmodifiable(heldTeams);
+    if (heldEmployees != null) heldEmployeeFilter = List.unmodifiable(heldEmployees);
     if (employees != null) employeeFilter = List.unmodifiable(employees);
     if (teams != null) teamFilter = List.unmodifiable(teams);
     if (teamMembers != null) teamMemberIds = List.unmodifiable(teamMembers);
@@ -272,6 +290,8 @@ mixin AuditFilterScope on ChangeNotifier {
     employees: const [],
     teams: const [],
     teamMembers: const [],
+    heldTeams: const [],
+    heldEmployees: const [],
     locations: const [],
     departments: const [],
     auditTypes: const [],
@@ -305,6 +325,8 @@ mixin AuditFilterScope on ChangeNotifier {
       employees: const [],
       teams: const [],
       teamMembers: const [],
+      heldTeams: const [],
+      heldEmployees: const [],
       locations: const [],
       departments: const [],
       auditTypes: const [],

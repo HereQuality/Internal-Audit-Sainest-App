@@ -7,7 +7,6 @@ import '../../providers/auth_provider.dart';
 import '../../widgets/avatar_circle.dart';
 import '../support/tickets_list_screen.dart';
 import 'edit_profile_screen.dart';
-import 'reports_screen.dart';
 import 'settings_screen.dart';
 
 class ProfileScreen extends StatelessWidget {
@@ -143,15 +142,6 @@ class ProfileScreen extends StatelessWidget {
                   trailing: const Icon(Icons.chevron_right),
                   onTap: () => Navigator.of(context).push(
                     MaterialPageRoute(builder: (_) => const SettingsScreen()),
-                  ),
-                ),
-                const Divider(height: 1),
-                ListTile(
-                  leading: const Icon(Icons.description_outlined),
-                  title: const Text('Reports'),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: () => Navigator.of(context).push(
-                    MaterialPageRoute(builder: (_) => const ReportsScreen()),
                   ),
                 ),
                 const Divider(height: 1),

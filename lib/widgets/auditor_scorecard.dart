@@ -8,9 +8,9 @@ import '../models/audit_model.dart';
 /// /audits/auditor-stats response). It replaces the ATS/OTC ScoreRow there —
 /// ATS/OTC now belong to the auditee's NCs only.
 ///
-/// Two blocks per row so it reads on a phone: Total Planned / Active, Overall /
-/// Last Audit Score, On-Time / Delayed Completed (with their share of the
-/// finished audits), then the two plan-vs-actual bars.
+/// Blocks stacked so it reads on a phone: Total Planned / Active, On-Time /
+/// Delayed Completed (with their share of the finished audits), the two
+/// plan-vs-actual bars, then the Cumulative Score.
 class AuditorScorecard extends StatelessWidget {
   final AuditorStats stats;
 
@@ -23,9 +23,11 @@ class AuditorScorecard extends StatelessWidget {
       ? '—'
       : '${v == v.roundToDouble() ? v.toInt() : v.toStringAsFixed(1)}%';
 
-  static Color _tier(double? v) => v == null
+  // [good]: where green starts — 75 for an audit score (as on every other
+  // screen and the web), 80 for the other percentages here.
+  static Color _tier(double? v, {double good = 80}) => v == null
       ? Colors.grey
-      : v >= 80
+      : v >= good
       ? AppColors.green
       : v >= 50
       ? AppColors.amber
@@ -147,14 +149,9 @@ class AuditorScorecard extends StatelessWidget {
               _Line(
                 label: 'Cumulative Score',
                 value: _pct(stats.overallScore),
-                color: _tier(stats.overallScore),
+                color: _tier(stats.overallScore, good: 75),
                 strong: true,
                 note: 'All audits you performed, combined',
-              ),
-              _Line(
-                label: 'Last Audit Score',
-                value: _pct(stats.lastAuditScore),
-                color: _tier(stats.lastAuditScore),
               ),
               _Line(
                 label: 'Active Audits',

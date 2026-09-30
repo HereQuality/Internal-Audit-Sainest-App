@@ -27,6 +27,12 @@ class AuditStatus {
   static const draft = 'Draft';
   static const skipped = 'Skipped';
 
+  // A repeat whose window closed without it ever being done — a `displayStatus`
+  // the server sends but that is not one of the eight pipeline chips. Never a
+  // real audit to grade: the Final Report's Total Audits leaves it out and its
+  // score is "—" (owner, 2026-09-30).
+  static const notAttempted = 'Not Attempted';
+
   // The stored status of an audit its auditor has finished, whatever its NC
   // stage — the raw `status`, kept as a filter value for the Final Report
   // list's default view (which must keep showing every finished audit).

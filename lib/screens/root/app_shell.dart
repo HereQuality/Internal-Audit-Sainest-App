@@ -15,11 +15,16 @@ import '../dashboard/dashboard_screen.dart';
 import '../nc/nc_list_screen.dart';
 import '../notifications/notifications_screen.dart';
 import '../profile/profile_screen.dart';
+import '../profile/reports_screen.dart';
 
 /// Restricted tab set per AppMode — Profile is deliberately NOT one of
 /// these tabs (it's shared/identical for both modes), it's reached via
 /// the app-bar avatar instead. See AppModeProvider for why the mode
 /// itself is a local UI choice, not a real permission.
+///
+/// Reports (the Final Report: Audits | NCs | Repeated NCs) is the LAST tab of
+/// BOTH modes, so every index the dashboards' stat tiles jump to (_goToTab)
+/// stays what it was.
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
 
@@ -111,8 +116,13 @@ class _AppShellState extends State<AppShell> {
     final isAuditor = mode == AppMode.auditor;
 
     final titles = isAuditor
-        ? const ['Auditor Dashboard', 'Audits', 'NC Monitoring']
-        : const ['Dashboard', 'NCs'];
+        ? const ['Auditor Dashboard', 'Audits', 'NC Monitoring', 'Final Report']
+        : const ['Dashboard', 'NCs', 'Final Report'];
+    // Last in both modes (see the class doc). The page stays mounted while
+    // another tab shows, so it is told whether it is the one on screen: only
+    // then do filter changes refetch its three lists.
+    final reportsIndex = isAuditor ? 3 : 2;
+    final reports = ReportsScreen(embedded: true, isActive: _index == reportsIndex);
     final tabs = isAuditor
         ? [
             // Passed to each dashboard so its stat tiles can jump straight
@@ -124,6 +134,7 @@ class _AppShellState extends State<AppShell> {
             DashboardScreen(onNavigateToTab: _goToTab),
             MyAuditsScreen(key: ValueKey('audits-$_auditsFilterToken'), initialStatusFilter: _auditsFilter),
             NcListScreen(key: ValueKey('nc-$_ncFilterToken'), mode: NcListMode.auditorOnly, initialStatusFilter: _ncFilter),
+            reports,
           ]
         // Auditee mode gets its own NC-tallies dashboard, not the auditor
         // one's assigned/in-progress AUDIT stats — those mean nothing to
@@ -131,6 +142,7 @@ class _AppShellState extends State<AppShell> {
         : [
             AuditeeDashboardScreen(onNavigateToTab: _goToTab),
             NcListScreen(key: ValueKey('nc-$_ncFilterToken'), mode: NcListMode.auditeeOnly, initialStatusFilter: _ncFilter),
+            reports,
           ];
     // Each tab wrapped to stay alive off-screen (scroll position, filter
     // chips, etc. survive a swipe away and back) — PageView, unlike the
@@ -154,6 +166,11 @@ class _AppShellState extends State<AppShell> {
               selectedIcon: Icon(Icons.fact_check),
               label: 'NC Monitoring',
             ),
+            NavigationDestination(
+              icon: Icon(Icons.assessment_outlined),
+              selectedIcon: Icon(Icons.assessment),
+              label: 'Reports',
+            ),
           ]
         : const [
             NavigationDestination(
@@ -165,6 +182,11 @@ class _AppShellState extends State<AppShell> {
               icon: Icon(Icons.report_gmailerrorred_outlined),
               selectedIcon: Icon(Icons.report_gmailerrorred),
               label: 'NCs',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.assessment_outlined),
+              selectedIcon: Icon(Icons.assessment),
+              label: 'Reports',
             ),
           ];
 

@@ -85,6 +85,13 @@ class ScoreRow extends StatelessWidget {
   }
 }
 
+/// 1dp like the web's fmtPct / the PDFs (77.8), with a trailing ".0"
+/// dropped so a whole number reads "78" not "78.0".
+String formatScorePct(double v) {
+  final s = v.toStringAsFixed(1);
+  return s.endsWith('.0') ? s.substring(0, s.length - 2) : s;
+}
+
 class _ScoreGaugeBlock extends StatelessWidget {
   final String label;
   final double? value;
@@ -116,7 +123,7 @@ class _ScoreGaugeBlock extends StatelessWidget {
               ),
               child: Center(
                 child: Text(
-                  value != null ? value!.toStringAsFixed(0) : '—',
+                  value != null ? formatScorePct(value!) : '—',
                   style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800, color: tierColor),
                 ),
               ),

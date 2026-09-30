@@ -99,6 +99,12 @@ Future<PickerChoice<T>?> showSinglePickerChoice<T>(
 /// order of [items] (so a result is stable), or null when dismissed.
 /// [minSelected] = 1 keeps Confirm disabled ("Select at least one") until
 /// something is ticked — used for a required pick such as the representative.
+///
+/// [allLabel] ("All Members") adds a first row that ticks / unticks EVERY row.
+/// With [initiallyAll] the sheet opens with everything ticked (the caller's
+/// "no pick = all" state), and ticking every row by hand is the same as the All
+/// row. The result is then every value (the caller reads "all of them" as
+/// "All"), and Confirm needs at least one tick.
 Future<List<T>?> showMultiPickerSheet<T>(
   BuildContext context, {
   required String title,
@@ -108,6 +114,8 @@ Future<List<T>?> showMultiPickerSheet<T>(
   String searchHint = 'Search',
   int minSelected = 0,
   String confirmLabel = 'Confirm',
+  String? allLabel,
+  bool initiallyAll = false,
 }) {
   return showModalBottomSheet<List<T>>(
     context: context,
@@ -126,6 +134,8 @@ Future<List<T>?> showMultiPickerSheet<T>(
       searchHint: searchHint,
       minSelected: minSelected,
       confirmLabel: confirmLabel,
+      allLabel: allLabel,
+      initiallyAll: initiallyAll,
     ),
   );
 }
@@ -149,6 +159,8 @@ class _PickerBody<T> extends StatefulWidget {
   final int minSelected;
   final String confirmLabel;
   final String? clearLabel;
+  final String? allLabel;
+  final bool initiallyAll;
 
   const _PickerBody({
     required this.title,
@@ -160,6 +172,8 @@ class _PickerBody<T> extends StatefulWidget {
     this.minSelected = 0,
     this.confirmLabel = 'Confirm',
     this.clearLabel,
+    this.allLabel,
+    this.initiallyAll = false,
   });
 
   @override
@@ -167,7 +181,28 @@ class _PickerBody<T> extends StatefulWidget {
 }
 
 class _PickerBodyState<T> extends State<_PickerBody<T>> {
-  late final Set<T> _selected = {...widget.initiallySelected};
+  late final Set<T> _selected = {
+    // "No pick = all" callers open with every row ticked.
+    if (widget.allLabel != null && widget.initiallyAll && widget.initiallySelected.isEmpty)
+      for (final i in widget.items) i.value
+    else
+      ...widget.initiallySelected,
+  };
+
+  // With an All row, "nothing ticked" is not an answer (an empty list would read as All).
+  int get _minRequired => widget.allLabel != null && widget.minSelected < 1 ? 1 : widget.minSelected;
+
+  bool get _hasAll => widget.allLabel != null && widget.multi && widget.items.isNotEmpty;
+  bool get _allSelected =>
+      _hasAll && widget.items.every((i) => _selected.contains(i.value));
+
+  void _toggleAll() => setState(() {
+    if (_allSelected) {
+      _selected.clear();
+    } else {
+      _selected.addAll(widget.items.map((i) => i.value));
+    }
+  });
   final TextEditingController _search = TextEditingController();
   String _query = '';
 
@@ -338,6 +373,14 @@ class _PickerBodyState<T> extends State<_PickerBody<T>> {
                                 context,
                               ).pop(PickerChoice<T>(null, cleared: true)),
                             ),
+                          if (_hasAll && _query.isEmpty)
+                            _PickerRow(
+                              label: widget.allLabel!,
+                              sublabel: '${widget.items.length} in total',
+                              selected: _allSelected,
+                              multi: true,
+                              onTap: _toggleAll,
+                            ),
                           for (final item in visible)
                             _PickerRow(
                               label: item.label,
@@ -363,14 +406,16 @@ class _PickerBodyState<T> extends State<_PickerBody<T>> {
                     child: Padding(
                       padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
                       child: FilledButton(
-                        onPressed: _selected.length < widget.minSelected
+                        onPressed: _selected.length < _minRequired
                             ? null
                             : _confirm,
                         child: Text(
-                          _selected.length < widget.minSelected
-                              ? 'Select at least ${widget.minSelected}'
+                          _selected.length < _minRequired
+                              ? 'Select at least $_minRequired'
                               : _selected.isEmpty
                               ? widget.confirmLabel
+                              : _allSelected
+                              ? '${widget.confirmLabel} (All)'
                               : '${widget.confirmLabel} (${_selected.length})',
                         ),
                       ),

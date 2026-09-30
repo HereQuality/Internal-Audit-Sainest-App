@@ -710,35 +710,35 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('lists only my audits by default, tiles from the completed-stats endpoint, series as one row', (tester) async {
+    // GET /audits/report answers in the paged shape; the stats beside it.
+    Object reportPage(List<Map<String, dynamic>> audits) => {
+      'isOk': true,
+      'data': {'audits': audits, 'total': audits.length, 'page': 1, 'limit': 100},
+    };
+
+    testWidgets('lists the report rows, tiles from the report-stats endpoint, series as one row', (tester) async {
       adapter.handler = (o) async {
         switch (o.path) {
-          case '/audits/mine':
-            return json(200, {
-              'isOk': true,
-              'data': [
-                row('1', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
-                row('2', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
-                row('3', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
-                row('4', title: 'One-off', location: 'Plant B'),
-              ],
-            });
-          case '/audits/stats/completed':
+          case '/audits/report':
+            return json(200, reportPage([
+              row('1', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
+              row('2', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
+              row('3', title: 'Weekly hygiene', seriesId: 's1', location: 'Plant A'),
+              row('4', title: 'One-off', location: 'Plant B'),
+            ]));
+          case '/audits/report/stats':
             return json(200, {
               'isOk': true,
               'data': {
                 'percentage': 80,
                 'achieved': 32,
                 'maxPossible': 40,
-                'totalAudits': 2,
-                'onTimeCompleted': 2,
+                'totalAudits': 4,
+                'completed': 4,
+                'inProgress': 0,
+                'onTimeCompleted': 4,
                 'delayedCompleted': 0,
               },
-            });
-          case '/audits/led-places':
-            return json(200, {
-              'isOk': true,
-              'data': {'locations': [], 'departments': []},
             });
         }
         return json(200, {'isOk': true, 'data': []});
@@ -752,16 +752,20 @@ void main() {
       expect(find.text('80%'), findsWidgets);
       expect(find.text('32 / 40 pts'), findsOneWidget);
       expect(find.text('Total Audits'), findsOneWidget);
+      expect(find.text('In Progress'), findsWidgets);
+      expect(find.text('Completed'), findsWidgets);
       expect(find.text('On-Time Completed'), findsWidgets);
       expect(find.text('Delayed Completed'), findsWidgets);
       // The series is ONE row with its badge and label, the one-off is a card.
       expect(find.text('Weekly series · 3 occurrences'), findsOneWidget);
       expect(find.text('Weekly'), findsOneWidget);
       expect(find.text('One-off'), findsOneWidget);
-      // The request carried the shared filters' default (Me), plus what makes
-      // the tiles match the list.
-      final stats = adapter.requests.firstWhere((r) => r.path == '/audits/stats/completed');
-      expect(stats.queryParameters['hideUnstarted'], 'true');
+      // The list and the tiles come from the Final Report's own endpoints — not
+      // /audits/mine, not the old completed-stats one — under the shared filters.
+      expect(adapter.requests.where((r) => r.path == '/audits/report'), isNotEmpty);
+      expect(adapter.requests.where((r) => r.path == '/audits/report/stats'), isNotEmpty);
+      expect(adapter.requests.where((r) => r.path == '/audits/mine'), isEmpty);
+      expect(adapter.requests.where((r) => r.path == '/audits/stats/completed'), isEmpty);
 
       // Expanding the series shows its occurrences; opening a series is an
       // accordion so only one is ever open.
@@ -770,21 +774,14 @@ void main() {
       expect(find.text('Weekly hygiene'), findsNWidgets(4)); // header + 3 occurrences
     });
 
-    testWidgets('a leader gets a My locations view that lists other auditors\' audits there', (tester) async {
+    testWidgets('a leader needs no My locations switch: the places they lead come with the report itself', (tester) async {
       adapter.handler = (o) async {
         switch (o.path) {
-          case '/audits/mine':
-            return json(200, {'isOk': true, 'data': [row('mine', title: 'Mine')]});
-          case '/audits/at-places-i-lead':
-            return json(200, {
-              'isOk': true,
-              'data': {
-                'audits': [row('theirs', title: 'Colleague audit', location: 'Zone 9')],
-                'total': 1,
-                'page': 1,
-                'limit': 100,
-              },
-            });
+          case '/audits/report':
+            return json(200, reportPage([
+              row('mine', title: 'Mine'),
+              row('theirs', title: 'Colleague audit', location: 'Zone 9'),
+            ]));
           case '/audits/led-places':
             return json(200, {
               'isOk': true,
@@ -799,33 +796,22 @@ void main() {
         return json(200, {'isOk': true, 'data': []});
       };
       await pump(tester);
-      expect(find.text('My locations'), findsOneWidget);
+      expect(find.text('My locations'), findsNothing);
+      expect(find.text('My audits'), findsNothing);
+      // A colleague's audit at a place I lead is simply in the list.
       expect(find.text('Mine'), findsOneWidget);
-      expect(find.text('Colleague audit'), findsNothing);
-
-      await tester.tap(find.text('My locations'));
-      await tester.pumpAndSettle();
       expect(find.text('Colleague audit'), findsOneWidget);
-      expect(find.text('Mine'), findsNothing);
-      // employeeIds is never sent to the led list (the server ignores it, and
-      // "just me" would empty it), and the tiles ask as All Members over the
-      // places I lead.
-      final led = adapter.requests.lastWhere((r) => r.path == '/audits/at-places-i-lead');
-      expect(led.queryParameters.containsKey('employeeIds'), isFalse);
-      final stats = adapter.requests.lastWhere((r) => r.path == '/audits/stats/completed');
-      expect(stats.queryParameters.containsKey('employeeIds'), isFalse);
-      expect(stats.queryParameters['locationIds'], 'z9');
+      // The old second list and its leader lookup are never asked for here.
+      expect(adapter.requests.where((r) => r.path == '/audits/at-places-i-lead'), isEmpty);
+      expect(adapter.requests.where((r) => r.path == '/audits/led-places'), isEmpty);
     });
 
-    testWidgets('no stats endpoint for this role: the tiles are worked out from the rows', (tester) async {
+    testWidgets('no stats answer for this role: the tiles are worked out from the rows', (tester) async {
       adapter.handler = (o) async {
-        if (o.path == '/audits/mine') {
-          return json(200, {
-            'isOk': true,
-            'data': [row('a', got: 10, of: 10), row('b', got: 0, of: 90)],
-          });
+        if (o.path == '/audits/report') {
+          return json(200, reportPage([row('a', got: 10, of: 10), row('b', got: 0, of: 90)]));
         }
-        if (o.path == '/audits/stats/completed') return json(403, {'isOk': false});
+        if (o.path == '/audits/report/stats') return json(403, {'isOk': false});
         return json(200, {'isOk': true, 'data': []});
       };
       await pump(tester);

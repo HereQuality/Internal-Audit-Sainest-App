@@ -14,6 +14,12 @@ const kNcFlags = ['Major', 'Minor'];
 /// merely reading it.
 String flagOf(String? severity) => severity == 'Major' ? 'Major' : 'Minor';
 
+// The id of a populated ({_id}) or bare ref, null when absent/blank.
+String? _refId(dynamic v) {
+  final id = (v is Map ? v['_id'] : v)?.toString() ?? '';
+  return id.isEmpty ? null : id;
+}
+
 /// Mirrors server/models/NonConformance.js — one NC's full lifecycle,
 /// including responseHistory (one entry per submit-then-verify cycle),
 /// which is what lets the mobile review screen show the same "NC1, NC2, ..."
@@ -89,6 +95,15 @@ class NcModel {
   final String? auditType;
   final DateTime? auditScheduledDate;
   final DateTime? auditScheduledEndDate;
+  // The audit's scheduleBatchId, when it is one zone-document of a multi-zone
+  // bundle — the Final Report's NC groups mark such an audit "Bundle". Null for
+  // a stand-alone audit.
+  final String? auditBatchId;
+  // The audit's id as the NC stores it (GET /ncs/report sends it on every row): it
+  // outlives the audit being deleted — `auditId` then comes back null (no title,
+  // no bundle marker) but this is still there, so the NCs of one deleted audit
+  // still group together.
+  final String? auditKey;
   // Where the NC was raised — server: nc.controller.js#withPlaceNames (a
   // frozen name if the place was since renamed/deleted, else the live one).
   final String? locationName;
@@ -116,6 +131,15 @@ class NcModel {
   final int reopenCount;
   final String? verificationNote;
   final List<NcResponseEntry> responseHistory;
+  // Only the Final Report's NC list (GET /ncs/report) sends these two, both
+  // worked out by the SERVER so a row can never be labelled differently from
+  // the tile a tap on it came from — the device renders them, never derives
+  // them: the bucket the NC is counted under (nc_report_model.dart's
+  // NcBucket: inProgress | overdue | pendingApproval | delayed | onTime) and
+  // where it belongs (its own place, else its audit's places, else "No
+  // location"). Null on every other list.
+  final String? bucket;
+  final String? placeLabel;
 
   const NcModel({
     required this.id,
@@ -125,6 +149,8 @@ class NcModel {
     this.auditType,
     this.auditScheduledDate,
     this.auditScheduledEndDate,
+    this.auditBatchId,
+    this.auditKey,
     this.locationName,
     this.departmentName,
     this.repeatCount = 0,
@@ -141,7 +167,12 @@ class NcModel {
     this.reopenCount = 0,
     this.verificationNote,
     this.responseHistory = const [],
+    this.bucket,
+    this.placeLabel,
   });
+
+  /// The audit this NC was raised in no longer exists (the populated ref is null).
+  bool get auditDeleted => auditId.isEmpty;
 
   factory NcModel.fromJson(Map<String, dynamic> json) {
     final auditRef = json['auditId'];
@@ -153,6 +184,8 @@ class NcModel {
       auditType: auditRef is Map ? auditRef['auditType']?.toString() : null,
       auditScheduledDate: auditRef is Map ? DateTime.tryParse(auditRef['scheduledDate']?.toString() ?? '') : null,
       auditScheduledEndDate: auditRef is Map ? DateTime.tryParse(auditRef['scheduledEndDate']?.toString() ?? '') : null,
+      auditBatchId: auditRef is Map ? _refId(auditRef['scheduleBatchId']) : null,
+      auditKey: _refId(json['auditKey']),
       locationName: json['locationName']?.toString(),
       departmentName: json['departmentName']?.toString(),
       repeatCount: (json['repeatCount'] as num?)?.toInt() ?? 0,
@@ -172,6 +205,8 @@ class NcModel {
           .whereType<Map>()
           .map((e) => NcResponseEntry.fromJson(Map<String, dynamic>.from(e)))
           .toList(),
+      bucket: json['bucket']?.toString(),
+      placeLabel: json['placeLabel']?.toString(),
     );
   }
 }

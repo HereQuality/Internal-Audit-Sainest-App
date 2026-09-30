@@ -57,15 +57,23 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// location/audit-type filter that skipped the second one would visibly
   /// only half-apply on the calendar.
   @override
-  Future<void> refetchForFilters() => Future.wait([
-    fetchMyAudits(),
-    fetchAuditsAtMyLocation(),
-    // The Final Report is open: its list and tiles follow the filters too.
-    if (reportsInUse) fetchReportAudits(),
-    if (reportsInUse) fetchReportStats(),
-    // The leader's "My locations" list is showing: same filters, same reload.
-    if (ledAuditsInUse) fetchLedAudits(),
-  ]);
+  Future<void> refetchForFilters() {
+    // The Reports tab is not on screen (another tab is, the tab stays mounted
+    // in the shell): it is not refetched behind the user's back — it notes that
+    // it is out of date and reloads when it is opened again.
+    if (!reportsInUse) reportsStale = true;
+    return Future.wait([
+      fetchMyAudits(),
+      fetchAuditsAtMyLocation(),
+      // The Reports tab is showing: its list and tiles follow the filters too.
+      if (reportsInUse) fetchReportAudits(),
+      if (reportsInUse) fetchReportStats(),
+      // The leader's "My locations" list is showing: same filters, same reload.
+      if (ledAuditsInUse) fetchLedAudits(),
+      // The Calendar is open: its own list follows the filters too.
+      if (calendarInUse) fetchCalendarAudits(),
+    ]);
+  }
 
   bool isLoading = false;
   String? errorMessage;
@@ -100,6 +108,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   int _reportAuditsSeq = 0;
   int _reportStatsSeq = 0;
   int _atMyLocationSeq = 0;
+  int _calendarAuditsSeq = 0;
 
   /// Empties every list and the open audit, and puts the filters back to
   /// their defaults — call on logout, without refetching. Every list here is
@@ -116,19 +125,22 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     _selfEmployeeId = null;
     audits = [];
     auditsAtMyLocation = [];
+    calendarAudits = [];
+    calendarInUse = false;
+    isLoadingCalendarAudits = false;
     reportAudits = [];
-    ledReportAudits = [];
     ledLocationIds = const [];
     ledDepartmentIds = const [];
-    ledPlaceNames = const [];
     ledAudits = [];
     ledAuditsInUse = false;
     ledAuditsError = null;
     isLoadingLedAudits = false;
     reportsInUse = false;
-    reportsLed = false;
+    reportsStale = false;
     reportsStatus = null;
     reportsSearch = '';
+    reportsTileKeys = const {};
+    reportsByLocation = false;
     reportStats = null;
     isLoadingReportStats = false;
     activeAudit = null;
@@ -166,6 +178,15 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         _refreshTimer?.cancel();
         _refreshTimer = Timer(const Duration(milliseconds: 500), () {
           fetchMyAudits();
+          // An audit finishing / changing hands moves the Final Report too (the
+          // web page refreshes on the same signal); a tab that is not showing
+          // just notes it is out of date.
+          if (reportsInUse) {
+            fetchReportAudits();
+            fetchReportStats();
+          } else {
+            reportsStale = true;
+          }
           // A reassignment (by this leader elsewhere, a scheduler, ...) changes
           // who is on the audits at their places.
           if (ledAuditsInUse) fetchLedAudits(quiet: true);
@@ -471,6 +492,42 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
+  // ── Calendar's own "my audits" list ─────────────────────────────────────
+  // The Calendar offers no Status / Include skipped filter (web's neither), so
+  // it must not read [audits] — that list is fetched with the Audits tab's
+  // Include skipped switch and would silently narrow (or widen) the calendar
+  // with a pick it can neither show nor clear. Same shared filters otherwise
+  // ([filterParams], not [listFilterParams]).
+  bool calendarInUse = false;
+  bool isLoadingCalendarAudits = false;
+  List<AuditModel> calendarAudits = [];
+
+  Future<void> fetchCalendarAudits() async {
+    final epoch = _epoch;
+    final seq = ++_calendarAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _calendarAuditsSeq;
+    isLoadingCalendarAudits = true;
+    notifyListeners();
+    try {
+      final res = await _dio.get(
+        ApiConstants.myAudits,
+        queryParameters: filterParams,
+      );
+      if (stale()) return;
+      calendarAudits = (res.data['data'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+    } on DioException {
+      // Fail quiet like the other calendar layers: keep what was showing.
+    } finally {
+      if (!stale()) {
+        isLoadingCalendarAudits = false;
+        notifyListeners();
+      }
+    }
+  }
+
   // ── Audit detail / scoring workspace ──────────────────────────────────
   // Same GET /audits/:id the web app's AuditReportDetail.jsx reads —
   // full parameter tree, assignments, ncs. Access is enforced server-side
@@ -533,51 +590,61 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     isLoadingDetail = true;
   }
 
-  // ── Reports (Profile → Reports, titled "Final Report") ────────────────
-  // Two views, like the web's My audits / Audits at places I lead switch:
-  //  * "My audits" — GET /audits/mine under the SHARED filters (Team,
-  //    Members, Location + Department, Audit Type, Date range). The default
-  //    scope is Me, so a plain visit lists only this auditor's own audits;
-  //    All Members widens it, and Me + a Location is only my audits there
-  //    while All Members + a Location is every audit at that location (for
-  //    places I belong to or lead) — all decided server-side
-  //    (audit.controller.js#whereWithScope), so this just sends the params.
-  //  * "My locations" (only for a leader — [ledPlaceIds] non-empty) — GET
-  //    /audits/at-places-i-lead: every audit at a place I lead, whoever the
-  //    auditor is. That endpoint deliberately ignores employeeIds.
-  // ReportsScreen narrows either list client-side via status chips + search,
-  // the same "fetch once, filter locally" pattern MyAuditsScreen uses.
+  // ── Reports (the bottom bar's Reports tab, titled "Final Report") ───────
+  // GET /audits/report — the web Final Report's own list, open to every
+  // logged-in user and already cut down by the server's people + places rule
+  // (audit.controller.js#reportWhereWithScope), so this just sends the SHARED
+  // filters (Team, Members, Location + Department, Audit Type, Date range):
+  //  * the default scope is Me (employeeIds = self) and it is a REAL narrowing:
+  //    only the audits (and, of a bundle, only the zones) where I am an auditor
+  //    or auditee — nothing widens it, not my places, not having scheduled it;
+  //  * All Members sends no employeeIds at all, and that is what adds the places
+  //    I belong to or lead (a Zone includes its Sub Zones): a location member
+  //    then sees a CFT audit at their place even when they are neither its
+  //    auditor nor its auditee. Only All Members opens a place;
+  //  * a picked Team / specific Members is a deliberate narrowing too, and a
+  //    Location + a specific Member is only that member's audits at that place.
+  // A bundle is listed by just the zones the filters matched, each row carrying
+  // `batchZoneCount` (the bundle's total) so a card can say "2 of 5 locations".
+  // That replaces the old "My audits / My locations" switch: with All Members
+  // the leader's places are in.
+  // ReportsScreen narrows the loaded list client-side via status chips, search
+  // and tile picks, the same "fetch once, filter locally" pattern
+  // MyAuditsScreen uses.
   bool isLoadingReports = false;
   String? reportsError;
   List<AuditModel> reportAudits = [];
 
-  /// Audits at the places this employee leads (empty for a non-leader).
-  List<AuditModel> ledReportAudits = [];
-
-  /// What this employee leads, from GET /audits/led-places: location ids,
-  /// department ids and display names. Empty = not a leader, which is how the
-  /// Final Report decides whether to offer its "My locations" view at all.
+  /// What this employee leads, from GET /audits/led-places: location ids and
+  /// department ids. Empty = not a leader, which is how the Audits tab decides
+  /// whether to offer its "My locations" (reassign) view at all.
   List<String> ledLocationIds = const [];
   List<String> ledDepartmentIds = const [];
-  List<String> ledPlaceNames = const [];
   bool get isPlaceLeader =>
       ledLocationIds.isNotEmpty || ledDepartmentIds.isNotEmpty;
 
-  /// The four Final Report tiles for what is in view — the server's, or null
-  /// until loaded / when the endpoint isn't open to this role (the screen then
+  /// The Final Report tiles (and per-place numbers) for what is in view — the
+  /// server's, or null until loaded / when the endpoint failed (the screen then
   /// works them out from the rows on screen, see ReportStats.fromAudits).
   ReportStats? reportStats;
   bool isLoadingReportStats = false;
 
-  /// What the Final Report screen currently asks for, kept here so a FILTER
-  /// change (which reaches this provider through refetchForFilters) reloads
-  /// the report lists and tiles too: the screen registers itself while it is
-  /// open ([reportsInUse]), and says which view / status chip / search text
-  /// the rows and the tiles are for.
+  /// What the Reports tab currently asks for, kept here so a FILTER change
+  /// (which reaches this provider through refetchForFilters) reloads the report
+  /// list and tiles too: the tab registers itself while it is the one showing
+  /// ([reportsInUse]), and says which status chip / search text the tiles are
+  /// for. [reportsStale] says a filter moved while it was not showing.
   bool reportsInUse = false;
-  bool reportsLed = false;
+  bool reportsStale = false;
   String? reportsStatus;
   String reportsSearch = '';
+
+  /// The tile picks (ReportStats.idsFor keys) and whether the location-wise view
+  /// is on: with both, the place headers are asked for over just the picked
+  /// tiles' audits (the server's `onlyIds`), so a header never counts reports the
+  /// list under it is not showing. The tiles themselves keep the whole set.
+  Set<String> reportsTileKeys = const {};
+  bool reportsByLocation = false;
 
   Future<void> fetchLedPlaces() async {
     final epoch = _epoch;
@@ -593,14 +660,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       ledDepartmentIds = [
         for (final d in departments.whereType<Map>()) d['_id'].toString(),
       ];
-      ledPlaceNames = [
-        for (final l in locations.whereType<Map>()) (l['name'] ?? '').toString(),
-        for (final d in departments.whereType<Map>())
-          (d['departmentName'] ?? '').toString(),
-      ].where((n) => n.isNotEmpty).toList();
       notifyListeners();
     } on DioException {
-      // Fail quiet: without it the Final Report simply has no second view.
+      // Fail quiet: without it the Audits tab simply has no "My locations" view.
     }
   }
 
@@ -736,11 +798,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     return bd.compareTo(ad);
   }
 
-  /// Loads the list for the Final Report view chosen in [reportsLed] ("My
-  /// locations" or "My audits") under the current shared filters. The stat
-  /// tiles are a separate request, [fetchReportStats].
+  /// Loads the Reports tab's list — every audit GET /audits/report returns under
+  /// the current shared filters. The stat tiles are a separate request,
+  /// [fetchReportStats].
   Future<void> fetchReportAudits() async {
-    final led = reportsLed;
     final epoch = _epoch;
     final seq = ++_reportAuditsSeq;
     bool stale() => epoch != _epoch || seq != _reportAuditsSeq;
@@ -748,43 +809,19 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     reportsError = null;
     notifyListeners();
     try {
-      final List<AuditModel> list;
-      if (led) {
-        list = await _fetchLedAudits();
-      } else {
-        final res = await _dio.get(
-          ApiConstants.myAudits,
-          // The SHARED filters, Me by default (employeeIds = self). NOT
-          // listFilterParams: Include skipped is an Audits-tab switch.
-          queryParameters: {
-            ...?filterParams,
-            // Same population rule as the tiles (fetchReportStats). The search
-            // box narrows these rows on the device (the screen filters the
-            // loaded list), so it is not sent.
-            'hideUnstarted': 'true',
-          },
-        );
-        list = (res.data['data'] as List? ?? [])
-            .whereType<Map>()
-            .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
-            .toList();
-      }
+      final list = await _fetchReportPages(stale);
       if (stale()) return;
       list.sort(_byRecency);
-      if (led) {
-        ledReportAudits = list;
-      } else {
-        reportAudits = list;
-      }
+      reportAudits = list;
+      reportsStale = false;
     } on DioException catch (e) {
       if (!stale()) {
-        reportsError = extractErrorMessage(
-          e,
-          fallback: led
-              ? 'Could not load the audits at your locations.'
-              : 'Could not load your audits.',
-        );
+        reportsError = extractErrorMessage(e, fallback: 'Could not load the reports.');
       }
+    } catch (e, st) {
+      // An answer the model cannot read ends the loading state and says so.
+      debugPrint('AuditsProvider.fetchReportAudits: unreadable answer: $e\n$st');
+      if (!stale()) reportsError = 'Could not load the reports.';
     } finally {
       if (!stale()) {
         isLoadingReports = false;
@@ -793,18 +830,95 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
-  // Every audit at a place I lead, paged 100 at a time (the endpoint's
-  // maximum) — the Final Report list is one scroll, not a paginated table.
-  Future<List<AuditModel>> _fetchLedAudits({
-    String status = 'Not Started,In Progress,Overdue,Completed',
-  }) async {
+  // Every page of GET /audits/report, 100 groups at a time (the endpoint's
+  // maximum) — the Reports list is one scroll, not a paginated table. The
+  // server pages over GROUPS (a bundle, or a recurring series, is one group
+  // whose rows all come back with it), so `total` counts groups and a page can
+  // hold more than `limit` rows: the last page is worked out from `total`, never
+  // from how many rows have arrived. [isStale] lets a superseded load stop
+  // paging.
+  Future<List<AuditModel>> _fetchReportPages(bool Function() isStale) async {
+    const limit = 100;
+    final params = <String, dynamic>{...?filterParams, 'limit': limit};
+    final seen = <String>{};
+    final all = <AuditModel>[];
+    var page = 1;
+    while (page <= 20) {
+      final res = await _dio.get(
+        ApiConstants.auditsReport,
+        queryParameters: {...params, 'page': page},
+      );
+      if (isStale()) return all;
+      final data = res.data['data'];
+      final rows = data is Map ? (data['audits'] as List? ?? []) : const [];
+      for (final e in rows.whereType<Map>()) {
+        final audit = AuditModel.fromJson(Map<String, dynamic>.from(e));
+        if (seen.add(audit.id)) all.add(audit);
+      }
+      final total = data is Map ? (data['total'] as num?)?.toInt() ?? 0 : 0;
+      if (rows.isEmpty || page * limit >= total) break;
+      page++;
+    }
+    return all;
+  }
+
+  /// The Reports tiles from GET /audits/report/stats under the same filters as
+  /// the list, so the numbers equal the web's. The status chip and the search
+  /// text narrow them too ([reportsStatus] / [reportsSearch]), so they describe
+  /// the rows on screen. If the request fails [reportStats] stays null and the
+  /// screen works the tiles out from the loaded list.
+  Future<void> fetchReportStats() async {
+    final epoch = _epoch;
+    final seq = ++_reportStatsSeq;
+    isLoadingReportStats = true;
+    notifyListeners();
+    ReportStats? stats;
+    try {
+      final params = <String, dynamic>{...?filterParams};
+      if (reportsStatus != null) params['status'] = reportsStatus;
+      if (reportsSearch.trim().isNotEmpty) params['search'] = reportsSearch.trim();
+      final res = await _dio.get(
+        ApiConstants.auditsReportStats,
+        queryParameters: params,
+      );
+      stats = ReportStats.tryParse(res.data['data']);
+      // Location-wise AND a tile picked: the place headers must describe the
+      // tile's audits, so ask again for just them. Best effort — without it the
+      // headers keep the whole set's numbers.
+      if (stats != null && reportsByLocation && reportsTileKeys.isNotEmpty) {
+        final ids = {for (final k in reportsTileKeys) ...stats.idsFor(k)};
+        try {
+          final narrowed = await _dio.get(
+            ApiConstants.auditsReportStats,
+            queryParameters: {...params, 'onlyIds': ids.join(',')},
+          );
+          final rows = ReportStats.tryParse(narrowed.data['data'])?.byLocation;
+          if (rows != null) stats = stats.withByLocation(rows);
+        } on DioException {
+          // keep the whole set's headers
+        }
+      }
+    } on DioException {
+      stats = null;
+    } catch (e, st) {
+      debugPrint('AuditsProvider.fetchReportStats: unreadable answer: $e\n$st');
+      stats = null;
+    }
+    if (epoch != _epoch || seq != _reportStatsSeq) return;
+    reportStats = stats;
+    isLoadingReportStats = false;
+    notifyListeners();
+  }
+
+  // Every audit at a place I lead that is in one of [status]'s stages, paged 100
+  // at a time (the endpoint's maximum) — the reassign list is one scroll, not a
+  // paginated table. Named by its one caller (fetchLedAudits): without a status
+  // the server defaults to the still-open ones.
+  Future<List<AuditModel>> _fetchLedAudits({required String status}) async {
     final params = Map<String, dynamic>.from(filterParams ?? const {})
       // The led list ignores employeeIds by design (a "just me" default would
       // empty a list whose point is other people's audits).
       ..remove('employeeIds')
-      // Without a status the server defaults to the still-open ones; the Final
-      // Report wants every started audit (the default here), the reassign
-      // list only the ones still to be done — so name them.
       ..['status'] = status
       ..['limit'] = 100;
     final all = <AuditModel>[];
@@ -826,53 +940,6 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       page++;
     }
     return all;
-  }
-
-  /// The Final Report tiles from GET /audits/stats/completed under the same
-  /// filters as the list, so the numbers equal the web's. "My locations" asks
-  /// as All Members over the places I lead (or the picked ones among them),
-  /// which the server reads as every audit there. If the endpoint isn't open
-  /// to this role (it needs Final Report read access) [reportStats] stays null
-  /// and the screen works the same four numbers out from the loaded list.
-  Future<void> fetchReportStats() async {
-    final led = reportsLed;
-    final epoch = _epoch;
-    final seq = ++_reportStatsSeq;
-    isLoadingReportStats = true;
-    notifyListeners();
-    ReportStats? stats;
-    try {
-      final params = Map<String, dynamic>.from(filterParams ?? const {});
-      if (led) {
-        params.remove('employeeIds');
-        if (!params.containsKey('locationIds') &&
-            !params.containsKey('departmentIds')) {
-          if (ledLocationIds.isNotEmpty) {
-            params['locationIds'] = ledLocationIds.join(',');
-          }
-          if (ledDepartmentIds.isNotEmpty) {
-            params['departmentIds'] = ledDepartmentIds.join(',');
-          }
-        }
-      }
-      // The Final Report's own rule: only started audits (server:
-      // hideUnstarted) — the same rows its table lists.
-      params['hideUnstarted'] = 'true';
-      // The tiles describe what the list shows: its status chip and search.
-      if (reportsStatus != null) params['status'] = reportsStatus;
-      if (reportsSearch.trim().isNotEmpty) params['search'] = reportsSearch.trim();
-      final res = await _dio.get(
-        ApiConstants.completedStats,
-        queryParameters: params,
-      );
-      stats = ReportStats.tryParse(res.data['data']);
-    } on DioException {
-      stats = null;
-    }
-    if (epoch != _epoch || seq != _reportStatsSeq) return;
-    reportStats = stats;
-    isLoadingReportStats = false;
-    notifyListeners();
   }
 
   // ── "Audits at my location" (Calendar) ──────────────────────────────────
@@ -962,8 +1029,17 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// batch-level `displayStatus`/`timeliness` (the one status the combined
   /// PDF prints — see BatchReport.statusLabel) instead of the bare zone list
   /// this used to, which threw that aggregate away.
-  Future<BatchReport> fetchBatchReport(String batchId) async {
-    final res = await _dio.get(ApiConstants.auditBatchReport(batchId));
+  ///
+  /// [zoneIds] narrows the report to just those zones (sent as `zoneIds`, comma-
+  /// joined; the batch aggregate is then worked out over them) — for a bundle
+  /// card that lists only some of its zones, so the combined PDF matches the card.
+  Future<BatchReport> fetchBatchReport(String batchId, {List<String>? zoneIds}) async {
+    final res = await _dio.get(
+      ApiConstants.auditBatchReport(batchId),
+      queryParameters: {
+        if (zoneIds != null && zoneIds.isNotEmpty) 'zoneIds': zoneIds.join(','),
+      },
+    );
     final data = res.data['data'];
     return BatchReport.fromJson(
       data is Map ? Map<String, dynamic>.from(data) : const {},

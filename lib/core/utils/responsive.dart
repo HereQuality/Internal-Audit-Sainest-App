@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 /// How many columns a fixed-tile-width grid should use at the CURRENT
 /// screen width — the one piece of tablet-readiness math every stat grid in
 /// the app shares (dashboard_screen.dart's AuditStatsGrid,
-/// auditee_dashboard_screen.dart's _AuditeeStatsGrid, reports_screen.dart's
-/// _ReportStatTiles), so a wide tablet actually spreads its tiles out
+/// auditee_dashboard_screen.dart's _AuditeeStatsGrid), so a wide tablet
+/// actually spreads its tiles out
 /// instead of the same fixed 2 columns just stretching wider and wider.
 ///
 /// [tileWidth] is "how wide is one tile comfortable at" — dividing the

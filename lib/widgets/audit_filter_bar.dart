@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../core/utils/place_cascade.dart';
 import '../providers/audit_filter_scope.dart';
 import '../providers/audits_provider.dart';
 import '../providers/filter_options_provider.dart';
@@ -75,6 +76,42 @@ class AuditFilterBar extends StatelessWidget {
     Future<void> change(AuditFilterSelection next) =>
         applyAuditFilterSelection(context, next);
 
+    // Team / Members re-worked for the place [next] carries (people outside the
+    // picked place are set aside, and come back when the place goes) — the same
+    // answer the filter sheet gives, so the pills, the request and the sheet
+    // never disagree. Without the directory nothing can be resolved, so the
+    // picks are left exactly as they were.
+    AuditFilterSelection rewho(
+      AuditFilterSelection next, {
+      required List<String> teams,
+      required List<String> members,
+    }) {
+      if (options.employees.isEmpty) return next;
+      final selfId = scope.selfEmployeeId;
+      final who = WhoCascade.resolve(
+        directory: options.employees,
+        locations: options.locations,
+        teams: teams,
+        members: members,
+        locationIds: next.locations,
+        departmentIds: next.departments,
+        untouchedMembers: !next.isTeam && selfId != null ? [selfId] : const [],
+      );
+      return next.copyWith(
+        teams: who.teams,
+        employees: who.members,
+        teamMembers: who.teamMembers,
+        heldTeams: who.heldTeams,
+        heldEmployees: who.heldMembers,
+      );
+    }
+
+    List<String> withHeld(List<String> picked, List<String> held) => [
+      ...picked,
+      for (final x in held)
+        if (!picked.contains(x)) x,
+    ];
+
     final specificPeople =
         current.employees.isNotEmpty || current.teams.isNotEmpty;
     final pills = <Widget>[
@@ -84,19 +121,27 @@ class AuditFilterBar extends StatelessWidget {
           label: _lookup(options.teams.map((t) => (t.id, t.name)), id, 'Team'),
           onRemove: () {
             final remaining = [...current.teams]..remove(id);
+            // Members cascade from Team: re-resolve them for the teams that are
+            // left (an empty list with teams still picked would read as "a team
+            // with nobody" and match nothing) — within the picked place, same
+            // rule as the filter sheet's Apply.
+            if (options.employees.isEmpty) {
+              // Directory not loaded: keep the previous resolution.
+              change(
+                current.copyWith(
+                  teams: remaining,
+                  teamMembers: remaining.isEmpty ? const [] : current.teamMembers,
+                  employees: const [],
+                  heldEmployees: const [],
+                ),
+              );
+              return;
+            }
             change(
-              current.copyWith(
-                teams: remaining,
-                // Members cascade from Team: re-resolve them for the teams
-                // that are left (an empty list with teams still picked would
-                // read as "a team with nobody" and match nothing). Same rule
-                // as the filter sheet's Apply.
-                teamMembers: remaining.isEmpty
-                    ? const []
-                    : options.employees.isEmpty
-                        ? current.teamMembers // directory not loaded: keep
-                        : options.membersOfTeams(remaining).map((e) => e.id).toList(),
-                employees: const [],
+              rewho(
+                current,
+                teams: withHeld(remaining, current.heldTeams),
+                members: const [],
               ),
             );
           },
@@ -111,7 +156,9 @@ class AuditFilterBar extends StatelessWidget {
                   '1 member',
                 )
               : '${current.employees.length} members',
-          onRemove: () => change(current.copyWith(employees: const [])),
+          onRemove: () => change(
+            current.copyWith(employees: const [], heldEmployees: const []),
+          ),
         ),
       for (final id in current.locations)
         _FilterPill(
@@ -120,16 +167,29 @@ class AuditFilterBar extends StatelessWidget {
           // Employee selections are left alone when a location goes: the two
           // are independent params server-side, and silently dropping people
           // because their location was removed would be a second, invisible
-          // edit to a filter the user did not ask to change.
-          onRemove: () =>
-              change(current.copyWith(locations: [...current.locations]..remove(id))),
+          // edit to a filter the user did not ask to change. What the place had
+          // SET ASIDE comes back (and a team's people are re-resolved for the
+          // wider place), exactly as clearing it in the sheet does.
+          onRemove: () => change(
+            rewho(
+              current.copyWith(locations: [...current.locations]..remove(id)),
+              teams: withHeld(current.teams, current.heldTeams),
+              members: withHeld(current.employees, current.heldEmployees),
+            ),
+          ),
         ),
       for (final id in current.departments)
         _FilterPill(
           icon: Icons.apartment_outlined,
           label: _lookup(options.departments.map((d) => (d.id, d.name)), id, 'Department'),
           onRemove: () => change(
-            current.copyWith(departments: [...current.departments]..remove(id)),
+            rewho(
+              current.copyWith(
+                departments: [...current.departments]..remove(id),
+              ),
+              teams: withHeld(current.teams, current.heldTeams),
+              members: withHeld(current.employees, current.heldEmployees),
+            ),
           ),
         ),
       for (final type in current.auditTypes)
@@ -207,6 +267,8 @@ class AuditFilterBar extends StatelessWidget {
                         teams: const [],
                         teamMembers: const [],
                         employees: const [],
+                        heldTeams: const [],
+                        heldEmployees: const [],
                       ),
                     ),
                   ),

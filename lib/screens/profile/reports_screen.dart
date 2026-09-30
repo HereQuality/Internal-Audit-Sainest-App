@@ -10,13 +10,13 @@ import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_status.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/report_stats.dart';
-import '../../core/utils/responsive.dart';
 import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
 import '../../models/audit_model.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/filter_options_provider.dart';
 import '../../providers/list_view_memory.dart';
+import '../../providers/nc_provider.dart';
 import '../../utils/report_pdf_builder.dart';
 import '../../utils/report_sections.dart';
 import '../../widgets/app_loading.dart';
@@ -25,19 +25,35 @@ import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/max_width_scroll.dart';
+import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
 import '../../widgets/status_filter_chip_row.dart';
 import '../audits/audit_detail_screen.dart';
+import '../reports/nc_report_tab.dart';
+import '../reports/repeated_ncs_tab.dart';
 
-/// Profile -> Reports (titled "Final Report" to match the web app) — every
-/// audit this employee can see, same GET /audits/mine list AuditsProvider.
-/// fetchReportAudits wraps, narrowed by status chips (the same lifecycle
-/// statuses MyAuditsScreen's chips use, plus "Completed" — see
-/// `_statusFilters`) plus a search box
-/// and a completed/scheduled-date range filter, mirroring the web app's
-/// Final Report page (client/src/pages/CompletedAudits.jsx) and its own
-/// search + DateRangeFilter. Each card is downloadable as a real PDF
-/// (utils/report_pdf_builder.dart — deliberately PDF-only on mobile,
+/// The Reports tab (titled "Final Report" to match the web app) — a bottom-bar
+/// destination of BOTH panels, with three tabs like the web page: Audits | NCs |
+/// Repeated NCs, under ONE shared filter bar (Team, Members, Location +
+/// Department, Audit Type, Date; Flag on the NC tabs) that all three honour.
+///
+/// Every list comes from the Final Report's own endpoints, open to every
+/// logged-in user (GET /audits/report, /ncs/report, /ncs/repeats and the stats
+/// beside them): the people + places rule is the server's — Me (the default) is
+/// a real narrowing to the audits (and bundle zones) I am on, All Members is what
+/// adds the places I belong to or lead, a Team / Members pick narrows — so
+/// nothing here re-implements scope.
+///
+/// [embedded] is the shell tab: AppShell already owns the Scaffold and AppBar, so
+/// this draws only its body; standalone (the default) it brings its own. The tab
+/// stays mounted while another tab shows, so [isActive] says whether it is the
+/// one on screen — only then do filter changes refetch it (a change made
+/// elsewhere just marks it stale, and opening it reloads).
+///
+/// The Audits tab is narrowed by status chips, a search box and the tiles (each a
+/// tap-filter), mirroring the web app's Final Report page
+/// (client/src/pages/CompletedAudits.jsx). Each card is downloadable as a real
+/// PDF (utils/report_pdf_builder.dart — deliberately PDF-only on mobile,
 /// unlike the web per-report page's PDF+Excel dropdown (AuditFullReport.
 /// jsx#handleDownloadExcel) — a single format is enough on a phone, and
 /// PDF is what people actually reach for there) AND opens the same in-app
@@ -50,11 +66,10 @@ import '../audits/audit_detail_screen.dart';
 /// sync with the scoring workspace.
 ///
 /// A multi-zone Schedule/Frequency Audit (see AuditModel.scheduleBatchId)
-/// this employee is personally assigned to more than one zone of groups
-/// those zones into one expandable card — same "N locations" tap-to-expand
-/// pattern the web table uses — instead of listing each zone as its own
-/// separate, look-alike row. The group's own header additionally offers a
-/// combined "Download PDF" spanning every zone in it.
+/// groups its zones into one expandable card — same "N locations"
+/// tap-to-expand pattern the web table uses — instead of listing each zone as
+/// its own separate, look-alike row. The group's own header additionally offers
+/// a combined "Download PDF" spanning every zone in it.
 ///
 /// A "per-location" audit (AuditModel.structureMode/locationCount — see
 /// AuditModel.hasMultipleZones) is a DIFFERENT kind of multi-zone shape:
@@ -66,23 +81,142 @@ import '../audits/audit_detail_screen.dart';
 /// fetch via utils/report_sections.dart — the same Dart port of
 /// AuditReportShared.jsx already used to build the downloadable PDF.
 class ReportsScreen extends StatefulWidget {
-  const ReportsScreen({super.key});
+  final bool embedded;
+  final bool isActive;
+
+  const ReportsScreen({super.key, this.embedded = false, this.isActive = true});
 
   @override
   State<ReportsScreen> createState() => _ReportsScreenState();
 }
 
+class _ReportsScreenState extends State<ReportsScreen>
+    with SingleTickerProviderStateMixin {
+  // Also the Audits tab's memory id — the host only adds the picked tab to it.
+  static const _memoryId = 'reports';
+
+  late final ListScreenMemory _saved;
+  late final TabController _tabs;
+  // Held from initState: dispose has no context to read them with.
+  late final AuditsProvider _audits;
+  late final NcProvider _ncs;
+  bool _loaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _saved = context.read<ListViewMemory>().screen(_memoryId);
+    _audits = context.read<AuditsProvider>();
+    _ncs = context.read<NcProvider>();
+    _tabs = TabController(
+      length: 3,
+      vsync: this,
+      initialIndex: _saved.tab.clamp(0, 2),
+    )..addListener(_onTab);
+    if (widget.isActive) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _activate());
+    }
+  }
+
+  @override
+  void didUpdateWidget(ReportsScreen old) {
+    super.didUpdateWidget(old);
+    if (widget.isActive == old.isActive) return;
+    if (widget.isActive) {
+      // Not now: this runs while the shell is building, and the loads below
+      // notify their providers straight away.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _activate());
+    } else {
+      _deactivate();
+    }
+  }
+
+  @override
+  void dispose() {
+    _deactivate();
+    _tabs.dispose();
+    super.dispose();
+  }
+
+  void _onTab() {
+    if (_tabs.index == _saved.tab) return;
+    _saved.tab = _tabs.index;
+    // A search box focused on the tab being left must not follow to the next.
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() {});
+  }
+
+  // This tab is the one on screen: filter changes now refetch its three lists,
+  // and what moved while it was away (or never loaded) is loaded now.
+  void _activate() {
+    if (!mounted || !widget.isActive) return;
+    _audits.reportsInUse = true;
+    _ncs.ncReportsInUse = true;
+    if (!_loaded || _audits.reportsStale || _ncs.ncReportsStale) _load();
+  }
+
+  void _deactivate() {
+    _audits.reportsInUse = false;
+    _ncs.ncReportsInUse = false;
+  }
+
+  Future<void> _load() async {
+    _loaded = true;
+    await Future.wait([
+      _audits.fetchReportAudits(),
+      _audits.fetchReportStats(),
+      _ncs.fetchNcReport(),
+      _ncs.fetchNcReportStats(),
+      _ncs.fetchRepeats(),
+    ]);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final body = Column(
+      children: [
+        // ONE filter bar for all three tabs. Flag only narrows NCs, so it is
+        // offered (and counted, and shown as a pill) on the two NC tabs.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+          child: AuditFilterBar(showFlag: _tabs.index != 0),
+        ),
+        TabBar(
+          controller: _tabs,
+          tabs: const [
+            Tab(text: 'Audits'),
+            Tab(text: 'NCs'),
+            Tab(text: 'Repeated NCs'),
+          ],
+        ),
+        // Not a TabBarView: its horizontal swipe would swallow the drag that
+        // moves the shell to the previous tab (Reports is the last one).
+        Expanded(
+          child: IndexedStack(
+            index: _tabs.index,
+            children: const [
+              _AuditsReportTab(),
+              NcReportTab(),
+              RepeatedNcsTab(),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (widget.embedded) return body;
+    return Scaffold(appBar: AppBar(title: const Text('Final Report')), body: body);
+  }
+}
+
 // Same "fetch once, filter locally" reasoning — and same matching rules
 // (core/utils/audit_status.dart#auditMatchesStatusFilter) — as
 // my_audits_screen.dart's own chips, in this screen's own order:
-//   * 'Completed' (the DEFAULT, and this screen's pre-existing behaviour) is
-//     every audit whose auditor has finished it — matched on the RAW stored
-//     status, whatever its NC stage — so the Final Report list keeps showing
-//     exactly the audits that have a final report. It sits right after 'All'
-//     so the selected default chip is on screen when the row first paints.
+//   * 'All' is the default: the list is every started audit, the same rows
+//     the tiles above count (Total Audits, In Progress, Completed...);
+//   * 'Completed' is every audit whose auditor has finished it — matched on the
+//     RAW stored status, whatever its NC stage;
 //   * the two timeliness chips and the NC-stage chips narrow within it;
-//   * Not Started / In Progress / Overdue are the unfinished stages, kept
-//     from the old chip row (with Overdue new).
+//   * Not Started / In Progress / Overdue are the unfinished stages.
 // Deliberately WITHOUT 'Draft', unlike MyAuditsScreen's own list: Reports
 // is "download a report", and a Draft-status audit (which, per
 // AuditDetailModel.isInstant's own doc comment, is also where every Instant
@@ -105,7 +239,15 @@ const _statusFilters = [
   AuditStatus.overdue,
 ];
 
-class _ReportsScreenState extends State<ReportsScreen> {
+/// The Audits tab: the stat tiles, search, status chips and the report cards.
+class _AuditsReportTab extends StatefulWidget {
+  const _AuditsReportTab();
+
+  @override
+  State<_AuditsReportTab> createState() => _AuditsReportTabState();
+}
+
+class _AuditsReportTabState extends State<_AuditsReportTab> {
   static const _memoryId = 'reports';
 
   // Which row's PDF is currently generating — gates that one row's download
@@ -119,21 +261,20 @@ class _ReportsScreenState extends State<ReportsScreen> {
 
   // Everything the user can set on this screen is remembered in
   // ListViewMemory, so opening a report and pressing Back — or leaving and
-  // returning — finds the same view, chip, search, expanded card and scroll
-  // position (wiped on logout).
+  // returning — finds the same view, chip, search, tiles, expanded card and
+  // scroll position (wiped on logout).
   late final ListScreenMemory _saved;
   late final ScrollController _scroll;
 
-  // Defaults to Completed — this screen's pre-existing behavior and the
-  // web Final Report page's own default view — the other stages
-  // (mirroring MyAuditsScreen's status chips) are one tap away. This is the
-  // raw stored-Completed gate (see _statusFilters), not a display status.
+  // The raw stored-status / display-status chip (see _statusFilters).
   late String _statusFilter;
   late final TextEditingController _searchController;
   late String _search;
-  // false = "My audits", true = "My locations" (audits at places I lead —
-  // only offered to a leader).
-  late bool _led;
+  // The tiles picked as filters ('inProgress' | 'overdue' | 'notStarted' |
+  // 'onTime' | 'delayed' | 'skipped' | 'notAttempted' | 'other' —
+  // ReportStats.idsFor). Several can be on, they OR together, and
+  // they AND with the chip and the search.
+  late Set<String> _tiles;
   // Location-wise view: one header per location above its audits.
   late bool _byLocation;
   // Accordion: the key of the ONE bundle / series card that is open.
@@ -149,9 +290,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
   void initState() {
     super.initState();
     _saved = context.read<ListViewMemory>().screen(_memoryId);
-    _statusFilter = _saved.extra['status'] as String? ?? AuditStatus.completed;
-    _led = _saved.extra['led'] == true;
+    _statusFilter = _saved.extra['status'] as String? ?? 'All';
     _byLocation = _saved.extra['grouped'] == true;
+    // A remembered 'completed' tile (the tile no longer exists) must not linger as a hidden filter.
+    _tiles = {...?((_saved.extra['tiles'] as List?)?.cast<String>().where((k) => k != 'completed'))};
     _expandedKey = _saved.extra['expanded'] as String?;
     _expandedLocationKeys = {
       ...?((_saved.extra['expandedLocations'] as List?)?.cast<String>()),
@@ -162,7 +304,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
       ..addListener(() {
         if (_scroll.hasClients) _saved.scroll = _scroll.offset;
       });
-    WidgetsBinding.instance.addPostFrameCallback((_) => _load());
+    // Before the host's first load: the tiles must describe these rows.
+    _syncQuery(context.read<AuditsProvider>());
   }
 
   @override
@@ -170,13 +313,8 @@ class _ReportsScreenState extends State<ReportsScreen> {
     _statsDebounce?.cancel();
     _searchController.dispose();
     _scroll.dispose();
-    // No context.read here (the tree is being torn down) — the provider is
-    // told through the reference captured while mounted.
-    _provider?.reportsInUse = false;
     super.dispose();
   }
-
-  AuditsProvider? _provider;
 
   // The status chip as the server understands it, for the stat tiles: 'All'
   // means no status filter, the rest are the same labels the list endpoints
@@ -184,36 +322,23 @@ class _ReportsScreenState extends State<ReportsScreen> {
   String? get _statsStatus => _statusFilter == 'All' ? null : _statusFilter;
 
   void _syncQuery(AuditsProvider p) {
-    p.reportsInUse = true;
-    p.reportsLed = _led;
     p.reportsStatus = _statsStatus;
     p.reportsSearch = _search;
+    p.reportsTileKeys = {..._tiles};
+    p.reportsByLocation = _byLocation;
   }
 
-  Future<void> _load() async {
-    final provider = _provider = context.read<AuditsProvider>();
-    _syncQuery(provider);
-    // Who leads what decides whether "My locations" exists at all — fetched
-    // alongside the first list, not before it, so the screen isn't held up.
-    final led = provider.fetchLedPlaces();
-    await Future.wait([
-      provider.fetchReportAudits(),
-      provider.fetchReportStats(),
-    ]);
-    await led;
-    if (!mounted) return;
-    // A remembered "My locations" view for someone who no longer leads
-    // anything falls back to their own audits.
-    if (_led && !provider.isPlaceLeader) {
-      _setLed(false);
-    }
+  Future<void> _reload() {
+    final p = context.read<AuditsProvider>();
+    _syncQuery(p);
+    return Future.wait([p.fetchReportAudits(), p.fetchReportStats()]);
   }
 
   void _remember() {
     _saved
       ..extra['status'] = _statusFilter
-      ..extra['led'] = _led
       ..extra['grouped'] = _byLocation
+      ..extra['tiles'] = _tiles.toList()
       ..extra['expanded'] = _expandedKey
       ..extra['expandedLocations'] = _expandedLocationKeys.toList();
   }
@@ -225,17 +350,36 @@ class _ReportsScreenState extends State<ReportsScreen> {
     _remember();
   }
 
-  void _setLed(bool led) {
-    if (led == _led) return;
-    setState(() {
-      _led = led;
-      _expandedKey = null;
-    });
+  // The place headers follow the tile picks while the location-wise view shows
+  // (the server narrows them to the picked tiles' audits), so the stats are
+  // asked again whenever that narrowing starts, changes or ends — and not
+  // otherwise.
+  bool get _narrowed => _byLocation && _tiles.isNotEmpty;
+
+  void _afterViewChange({required bool wasNarrowed}) {
     _remember();
-    final p = context.read<AuditsProvider>();
-    _syncQuery(p);
-    p.fetchReportAudits();
-    p.fetchReportStats();
+    if (wasNarrowed || _narrowed) {
+      _refreshTiles();
+    } else {
+      _syncQuery(context.read<AuditsProvider>());
+    }
+  }
+
+  void _toggleTile(String key) {
+    final was = _narrowed;
+    setState(
+      () => _tiles = _tiles.contains(key)
+          ? ({..._tiles}..remove(key))
+          : {..._tiles, key},
+    );
+    _afterViewChange(wasNarrowed: was);
+  }
+
+  void _clearTiles() {
+    if (_tiles.isEmpty) return;
+    final was = _narrowed;
+    setState(() => _tiles = {});
+    _afterViewChange(wasNarrowed: was);
   }
 
   // The chip and the search text are client-side filters over the loaded rows
@@ -275,11 +419,17 @@ class _ReportsScreenState extends State<ReportsScreen> {
           .read<AuditsProvider>()
           .fetchAuditReportDetail(audit.id);
       if (detail == null) throw Exception('Could not load this report.');
-      final bytes = await buildReportPdf(detail);
+      final pdfStats = ReportPdfStats();
+      final bytes = await buildReportPdf(detail, stats: pdfStats);
+      if (bytes.isEmpty) throw Exception('Could not generate this report.');
       await Printing.sharePdf(
         bytes: bytes,
         filename: '${_sanitizedFileName(audit.title)}.pdf',
       );
+      // Photos that still failed after the builder's retry are grey boxes in
+      // the PDF — say so, instead of leaving the user to find out on page 90.
+      final photoWarning = pdfStats.photoWarning;
+      if (mounted && photoWarning != null) showErrorSnackBar(context, photoWarning);
     } catch (e) {
       if (!mounted) return;
       showErrorSnackBar(
@@ -293,19 +443,20 @@ class _ReportsScreenState extends State<ReportsScreen> {
     }
   }
 
-  // Every zone in the batch, not just the ones `members` lists (this
-  // employee's own — see _groupByBatch above, sourced from GET
-  // /audits/mine) — AuditsProvider#fetchBatchReport's own header comment
-  // has the full story: looping fetchAuditReportDetail per member here
-  // used to silently drop every OTHER auditor's zone from a "combined"
-  // report, the mobile side of the "only his own coming, not the full
-  // one" gap against the web app's Final Report page. That endpoint's own
-  // access rule (audit.controller.js#getBatchReport) is a per-ROLE menu
-  // grant ("Final Report"/"Schedule Audit" read), which varies by company
-  // setup and isn't something this screen can know ahead of time — a role
-  // without it falls back to the old per-member loop below (still every
-  // zone THIS employee is personally on, same as before) rather than the
-  // combined download just failing outright.
+  // The zones the CARD shows. A card that lists every zone of its bundle asks for
+  // the whole batch; one that lists only some (`members` fewer than the
+  // bundle's batchZoneCount — "Me" lists just the zones you are on) asks for
+  // exactly those, via zoneIds, so the combined PDF matches what the card shows.
+  // AuditsProvider#fetchBatchReport's own header comment has the full story:
+  // looping fetchAuditReportDetail per member here used to silently drop every
+  // OTHER auditor's zone from a "combined" report, the mobile side of the
+  // "only his own coming, not the full one" gap against the web app's Final
+  // Report page. That endpoint (audit.controller.js#getBatchReport) is open to
+  // anyone involved in any zone of the batch or a member of a place it covers;
+  // anything it still refuses (a role outside both, a slow connection's
+  // timeout) falls back to the old per-member loop below (still every zone THIS
+  // employee can open) rather than the combined download just failing
+  // outright.
   Future<void> _downloadCombined(
     String batchId,
     List<AuditModel> members,
@@ -320,7 +471,10 @@ class _ReportsScreenState extends State<ReportsScreen> {
       // where buildCombinedReportPdf reads it off the zones instead.
       String? batchStatus;
       try {
-        final report = await provider.fetchBatchReport(batchId);
+        final report = await provider.fetchBatchReport(
+          batchId,
+          zoneIds: isPartialBundle(members) ? [for (final m in members) m.id] : null,
+        );
         zones = report.zones;
         batchStatus = report.statusLabel;
       } on DioException {
@@ -342,14 +496,19 @@ class _ReportsScreenState extends State<ReportsScreen> {
         }
       }
       if (zones.isEmpty) throw Exception('Could not load this report.');
+      final pdfStats = ReportPdfStats();
       final bytes = await buildCombinedReportPdf(
         zones,
         batchStatus: batchStatus,
+        stats: pdfStats,
       );
+      if (bytes.isEmpty) throw Exception('Could not generate this report.');
       await Printing.sharePdf(
         bytes: bytes,
         filename: '${_sanitizedFileName(title)}-combined.pdf',
       );
+      final photoWarning = pdfStats.photoWarning;
+      if (mounted && photoWarning != null) showErrorSnackBar(context, photoWarning);
     } catch (e) {
       if (!mounted) return;
       showErrorSnackBar(
@@ -366,80 +525,60 @@ class _ReportsScreenState extends State<ReportsScreen> {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<AuditsProvider>();
-    final source = _led ? provider.ledReportAudits : provider.reportAudits;
+    final source = provider.reportAudits;
     final bool showError = provider.reportsError != null && source.isEmpty;
     final bool showLoading =
         provider.isLoadingReports && source.isEmpty && !showError;
-    final filtered = source
+    // The chip and the search narrow the loaded rows on the device; the tiles
+    // then come from the server for the same population (chip + search are sent
+    // with the stats request), tile picks narrowing the rows last.
+    final base = source
         .where((a) => auditMatchesStatusFilter(a, _statusFilter))
         .where(_matchesSearch)
         .toList();
-    final items = _groupTopLevel(filtered);
     final bool showEmptyState =
         !showLoading && !showError && source.isEmpty;
     final hasFilters =
         provider.activeFilterCountFor(status: false, flag: false) > 0;
-    // The tiles are the server's (same population as the list, see
-    // AuditsProvider.fetchReportStats), but only while they agree with the
-    // rows on screen: a planner's server tiles cover every audit while this
-    // list is /audits/mine, and the device's search can be narrower than the
-    // server's. When they differ — or that endpoint isn't open to this role —
-    // the tiles are worked out from the rows, so numbers match what is listed.
-    final rowStats = ReportStats.fromAudits(filtered);
+    // The tiles are the server's (GET /audits/report/stats, the same population
+    // as the list), but only while they agree with the rows on screen: the
+    // device's search can be narrower than the server's. When they differ — or
+    // the request failed — the tiles are worked out from the rows, so numbers
+    // match what is listed.
+    final rowStats = ReportStats.fromAudits(base);
     final serverStats = provider.reportStats;
     final stats = serverStats != null &&
             (showLoading || serverStats.totalAudits == rowStats.totalAudits)
         ? serverStats
         : rowStats;
+    // A tile pick narrows by the audit ids the tile counted (every member of a
+    // bundle is among them) — the ids, not a re-derivation of the rule.
+    final tileIds = _tiles.isEmpty
+        ? null
+        : {for (final k in _tiles) ...stats.idsFor(k)};
+    final filtered = tileIds == null
+        ? base
+        : base.where((a) => tileIds.contains(a.id)).toList();
+    final items = _groupTopLevel(filtered);
     final scheme = Theme.of(context).colorScheme;
     const gutter = EdgeInsets.symmetric(horizontal: 16);
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('Final Report')),
-      body: RefreshIndicator(
-        onRefresh: _load,
-        child: MaxWidthScroll(
-          child: ListView(
+    return RefreshIndicator(
+      onRefresh: _reload,
+      child: MaxWidthScroll(
+        child: ListView(
           controller: _scroll,
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.only(bottom: 24),
           children: [
-            // A leader's second view, like the web's My audits / Audits at
-            // places I lead switch. Nobody else ever sees it.
-            if (provider.isPlaceLeader)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                child: SegmentedButton<bool>(
-                  showSelectedIcon: false,
-                  segments: const [
-                    ButtonSegment(
-                      value: false,
-                      icon: Icon(Icons.person_outline, size: 16),
-                      label: Text('My audits'),
-                    ),
-                    ButtonSegment(
-                      value: true,
-                      icon: Icon(Icons.location_city_outlined, size: 16),
-                      label: Text('My locations'),
-                    ),
-                  ],
-                  selected: {_led},
-                  onSelectionChanged: (s) => _setLed(s.first),
-                ),
-              ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-              child: AuditFilterBar(
-                footnote: _led
-                    ? "Every audit at the places you lead, whoever the auditor is. Team and Members don't apply here."
-                    : null,
-              ),
-            ),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
               child: _ReportStatTiles(
                 stats: stats,
                 scopeLabel: _scopeLabel(provider),
+                picked: _tiles,
+                onToggle: _toggleTile,
+                onClear: _clearTiles,
               ),
             ),
             Padding(
@@ -509,8 +648,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
                       materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       visualDensity: VisualDensity.compact,
                       onSelected: (v) {
+                        final was = _narrowed;
                         setState(() => _byLocation = v);
-                        _remember();
+                        _afterViewChange(wasNarrowed: was);
                       },
                     ),
                   ],
@@ -526,7 +666,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 height: MediaQuery.of(context).size.height * 0.4,
                 child: ErrorState(
                   message: provider.reportsError!,
-                  onRetry: _load,
+                  onRetry: _reload,
                 ),
               )
             else if (showEmptyState)
@@ -547,12 +687,11 @@ class _ReportsScreenState extends State<ReportsScreen> {
                           label: const Text('Clear filters'),
                         ),
                       )
-                    : EmptyState(
+                    : const EmptyState(
                         icon: Icons.description_outlined,
-                        title: _led ? 'No audits at your locations' : 'No reports yet',
-                        subtitle: _led
-                            ? 'Audits scheduled at the places you lead will show up here.'
-                            : "Your audits will show up here once they're scheduled.",
+                        title: 'No reports yet',
+                        subtitle:
+                            'Audits you are on show up here once they start. Pick All Members to include the places you belong to or lead.',
                       ),
               )
             else if (items.isEmpty)
@@ -560,7 +699,9 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 height: MediaQuery.of(context).size.height * 0.4,
                 child: EmptyState(
                   icon: Icons.filter_alt_off_outlined,
-                  title: _search.trim().isNotEmpty
+                  title: _tiles.isNotEmpty
+                      ? 'No audits under the picked tiles'
+                      : _search.trim().isNotEmpty
                       ? 'No audits match your filters'
                       : auditStatusEmptyTitle(_statusFilter),
                 ),
@@ -571,7 +712,7 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: _byLocation
-                      ? _locationSections(items)
+                      ? _locationSections(items, filtered, stats)
                       : [
                           for (int i = 0; i < items.length; i++) ...[
                             _buildItem(items[i]),
@@ -581,13 +722,12 @@ class _ReportsScreenState extends State<ReportsScreen> {
                 ),
               ),
           ],
-          ),
         ),
       ),
     );
   }
 
-  // What the tiles are "of": the picked places (or the ones I lead).
+  // What the tiles are "of": the picked places.
   String? _scopeLabel(AuditsProvider p) {
     final options = context.watch<FilterOptionsProvider>();
     final names = <String>[
@@ -598,30 +738,72 @@ class _ReportsScreenState extends State<ReportsScreen> {
         options.departments.where((d) => d.id == id).map((d) => d.name).firstOrNull ??
             'Department',
     ];
-    if (names.isNotEmpty) return names.join(', ');
-    if (_led && p.ledPlaceNames.isNotEmpty) return p.ledPlaceNames.join(', ');
-    return null;
+    return names.isEmpty ? null : names.join(', ');
   }
 
-  // The location-wise view: one header per REAL location — its name, how
-  // many reports and its cumulative score (Σ achieved / Σ possible of its
-  // finished ones, never an average of percentages) — above its rows. A
-  // multi-location bundle is exploded here into one synthetic single-zone
-  // item per member — each already carries its OWN real location (see
+  // A multi-location bundle is exploded into one synthetic single-zone item per
+  // member — each already carries its OWN real location (see
   // AuditModel.location) — instead of being kept whole and dumped into one
   // shared "Multi-location bundles" bucket regardless of which real places
   // its zones were actually at, which used to mix totally unrelated
   // bundles' scores into one meaningless combined %. Mirrors the identical
   // fix on the web Final Report page (pages/CompletedAudits.jsx).
-  List<Widget> _locationSections(List<_TopLevelItem> items) {
-    final exploded = <_TopLevelItem>[];
-    for (final item in items) {
-      if (item.batchId != null) {
-        exploded.addAll(item.members.map((m) => _TopLevelItem(members: [m])));
-      } else {
-        exploded.add(item);
-      }
+  List<_TopLevelItem> _explodeBundles(List<_TopLevelItem> items) => [
+    for (final item in items)
+      if (item.batchId != null)
+        for (final m in item.members) _TopLevelItem(members: [m])
+      else
+        item,
+  ];
+
+  // The location-wise view: one header per place — its name, how many reports
+  // and its CUMULATIVE score (Σ achieved / Σ possible, never an average of
+  // percentages) — above that place's rows.
+  //
+  // The header numbers are the SERVER's `byLocation` (over the whole filtered
+  // set, narrowed to the tile's audits while a tile is picked), never worked
+  // out from the rows loaded here; `auditIds` says which loaded rows sit under
+  // which header. Only when the server sent no breakdown (an older server, a
+  // failed request) does the view group the rows by their own place and count
+  // them on the device.
+  List<Widget> _locationSections(
+    List<_TopLevelItem> items,
+    List<AuditModel> filtered,
+    ReportStats stats,
+  ) {
+    final places = stats.byLocation;
+    if (places.isEmpty || places.every((p) => p.auditIds.isEmpty)) {
+      return _localLocationSections(items);
     }
+    return [for (final place in places) ..._placeSection(place, filtered)];
+  }
+
+  // One place: its server-numbered header and, once opened, its rows.
+  List<Widget> _placeSection(ReportLocationStats place, List<AuditModel> filtered) {
+    final ids = place.auditIds.toSet();
+    final rows = [for (final a in filtered) if (ids.contains(a.id)) a];
+    final expanded = _expandedLocationKeys.contains(place.key);
+    return [
+      _LocationHeader(
+        label: place.label,
+        count: place.count,
+        // The server's score over the place's FINISHED audits only (none finished:
+        // null, so no score is drawn — never 0 or 100).
+        percentage: place.percentage,
+        isExpanded: expanded,
+        onToggle: () => _toggleLocationGroup(place.key),
+      ),
+      if (expanded)
+        for (final item in _explodeBundles(_groupTopLevel(rows))) ...[
+          _buildItem(item),
+          const SizedBox(height: 10),
+        ],
+    ];
+  }
+
+  // The on-device grouping (see _locationSections): by each row's own place.
+  List<Widget> _localLocationSections(List<_TopLevelItem> items) {
+    final exploded = _explodeBundles(items);
     final groups = <String, List<_TopLevelItem>>{};
     for (final item in exploded) {
       final key = item.members.first.location.isNotEmpty
@@ -638,15 +820,20 @@ class _ReportsScreenState extends State<ReportsScreen> {
       });
     return [
       for (final key in keys) ...[
-        _LocationHeader(
-          label: key,
-          count: groups[key]!.length,
-          stats: ReportStats.fromAudits([
+        () {
+          // Only the Completed audits at the place add to its score (same rule
+          // as the server's byLocation); none finished draws no score.
+          final score = finishedScoreOf([
             for (final i in groups[key]!) ...i.members,
-          ]),
-          isExpanded: _expandedLocationKeys.contains(key),
-          onToggle: () => _toggleLocationGroup(key),
-        ),
+          ]);
+          return _LocationHeader(
+            label: key,
+            count: groups[key]!.length,
+            percentage: score.percentage,
+            isExpanded: _expandedLocationKeys.contains(key),
+            onToggle: () => _toggleLocationGroup(key),
+          );
+        }(),
         if (_expandedLocationKeys.contains(key))
           for (final item in groups[key]!) ...[
             _buildItem(item),
@@ -701,6 +888,33 @@ class _ReportsScreenState extends State<ReportsScreen> {
       onDownloadMember: _download,
     );
   }
+}
+
+/// How many zones the bundle [members] belong to has in total, from the
+/// `batchZoneCount` the server stamps on each row; null when it did not say.
+int? _bundleZoneTotal(List<AuditModel> members) {
+  int? total;
+  for (final m in members) {
+    final n = m.batchZoneCount;
+    if (n != null && (total == null || n > total)) total = n;
+  }
+  return total;
+}
+
+/// Whether a bundle card lists fewer zones than the bundle has — "Me" lists only
+/// the zones you are on.
+bool isPartialBundle(List<AuditModel> members) {
+  final total = _bundleZoneTotal(members);
+  return total != null && members.length < total;
+}
+
+/// The bundle card's "N locations", or "N of M locations" when the card holds
+/// only some of the bundle's zones.
+String bundleLocationsLabel(List<AuditModel> members) {
+  final total = _bundleZoneTotal(members);
+  return isPartialBundle(members)
+      ? '${members.length} of $total locations'
+      : '${members.length} locations';
 }
 
 class _TopLevelItem {
@@ -765,17 +979,29 @@ List<_TopLevelItem> _groupTopLevel(List<AuditModel> audits) {
 
 // ── Stat tiles ──────────────────────────────────────────────────────────
 
-/// The four Final Report tiles, for whatever is in view: cumulative Total
-/// Score (Σ achieved / Σ possible — never an average of each audit's %),
-/// Total Audits, On-Time Completed and Delayed Completed. A 2-per-row grid
-/// on a phone (unchanged), more per row on a tablet-width screen — see
-/// responsiveColumnCount — whose tiles size to their text, so nothing clips
-/// at large text sizes.
+/// The Final Report tiles, for whatever is in view: cumulative Total Score
+/// (Σ achieved / Σ possible — never an average of each audit's %), Total
+/// Audits, then the buckets Total Audits is made of — In Progress, Overdue,
+/// Not Started (only when > 0), On-Time Completed, Delayed Completed, Skipped
+/// (only when > 0) and, muted and outside the sum, Not Attempted (only when
+/// > 0) — so Total = In Progress + Overdue + Not Started + On-Time + Delayed +
+/// Skipped. Every bucket tile is a tap-filter over the list (Total Audits
+/// clears them); the score comes from Completed audits only and Total Audits
+/// leaves out the Not Attempted ones (the owner's rules, 2026-09-30).
 class _ReportStatTiles extends StatelessWidget {
   final ReportStats stats;
   final String? scopeLabel;
+  final Set<String> picked;
+  final ValueChanged<String> onToggle;
+  final VoidCallback onClear;
 
-  const _ReportStatTiles({required this.stats, this.scopeLabel});
+  const _ReportStatTiles({
+    required this.stats,
+    required this.picked,
+    required this.onToggle,
+    required this.onClear,
+    this.scopeLabel,
+  });
 
   String _points(double v) => v == v.roundToDouble() ? '${v.round()}' : v.toStringAsFixed(1);
 
@@ -790,38 +1016,113 @@ class _ReportStatTiles extends StatelessWidget {
         : pct >= 50
         ? Colors.orange
         : Colors.red;
+    ReportTileData filter(
+      String key,
+      String label,
+      String value,
+      IconData icon,
+      Color color, {
+      bool muted = false,
+    }) => ReportTileData(
+      id: key,
+      label: label,
+      value: value,
+      icon: icon,
+      color: color,
+      muted: muted,
+      selected: picked.contains(key),
+      onTap: () => onToggle(key),
+    );
     final tiles = [
-      _StatTileData(
-        icon: Icons.emoji_events_outlined,
+      ReportTileData(
+        id: 'score',
         label: 'Total Score',
-        // "*" once it includes a still-open audit's own progress so far, not
-        // a final grade yet — same convention a row's own partial score
-        // already carries (see stats.isPartial's own doc).
-        value: pct == null ? '—' : '$pct%${stats.isPartial ? '*' : ''}',
+        // Worked out from Completed audits only (the owner's rule, 2026-09-30):
+        // never a "so far" grade over open work, so never starred; "—" while
+        // nothing has finished.
+        value: pct == null ? '—' : '$pct%',
         sub: stats.maxPossible > 0
             ? '${_points(stats.achieved)} / ${_points(stats.maxPossible)} pts'
-                  '${stats.isPartial ? ' · includes in-progress' : ''}'
             : null,
+        icon: Icons.emoji_events_outlined,
         color: scoreColor,
       ),
-      _StatTileData(
-        icon: Icons.assignment_outlined,
+      ReportTileData(
+        id: 'total',
         label: 'Total Audits',
         value: '${stats.totalAudits}',
+        icon: Icons.assignment_outlined,
         color: scheme.primary,
+        onTap: onClear,
       ),
-      _StatTileData(
-        icon: Icons.check_circle_outline,
-        label: 'On-Time Completed',
-        value: '${stats.onTimeCompleted}',
-        color: AppColors.forAuditStatus(AuditStatus.onTimeCompleted),
+      filter(
+        'inProgress',
+        'In Progress',
+        '${stats.inProgress}',
+        Icons.timelapse_rounded,
+        AppColors.forAuditStatus(AuditStatus.inProgress),
       ),
-      _StatTileData(
-        icon: Icons.history_toggle_off_rounded,
-        label: 'Delayed Completed',
-        value: '${stats.delayedCompleted}',
-        color: AppColors.forAuditStatus(AuditStatus.delayedCompleted),
+      // The rest of Total Audits, so the tiles add up (owner, 2026-09-30):
+      // Total = In Progress + Overdue + Not Started + On-Time + Delayed + Skipped
+      // (+ Other). Overdue is always shown; the others only when there is one.
+      filter(
+        'overdue',
+        'Overdue',
+        '${stats.overdue}',
+        Icons.warning_amber_rounded,
+        AppColors.forAuditStatus(AuditStatus.overdue),
       ),
+      if (stats.notStarted > 0)
+        filter(
+          'notStarted',
+          'Not Started',
+          '${stats.notStarted}',
+          Icons.hourglass_empty_rounded,
+          AppColors.forAuditStatus(AuditStatus.notStarted),
+        ),
+      filter(
+        'onTime',
+        'On-Time Completed',
+        '${stats.onTimeCompleted}',
+        Icons.check_circle_outline,
+        AppColors.forAuditStatus(AuditStatus.onTimeCompleted),
+      ),
+      filter(
+        'delayed',
+        'Delayed Completed',
+        '${stats.delayedCompleted}',
+        Icons.history_toggle_off_rounded,
+        AppColors.forAuditStatus(AuditStatus.delayedCompleted),
+      ),
+      if (stats.skipped > 0)
+        filter(
+          'skipped',
+          'Skipped',
+          '${stats.skipped}',
+          Icons.skip_next_rounded,
+          AppColors.forAuditStatus(AuditStatus.skipped),
+        ),
+      // A bundle / audit that fits none of the buckets above — rare, but shown
+      // so the tiles still add up to Total Audits.
+      if (stats.other > 0)
+        filter(
+          'other',
+          'Other',
+          '${stats.other}',
+          Icons.more_horiz_rounded,
+          AppColors.slate,
+          muted: true,
+        ),
+      // Counted apart: never part of Total Audits, so it reads muted.
+      if (stats.notAttempted > 0)
+        filter(
+          'notAttempted',
+          'Not Attempted (not in Total)',
+          '${stats.notAttempted}',
+          Icons.block_rounded,
+          AppColors.forAuditStatus(AuditStatus.notAttempted),
+          muted: true,
+        ),
     ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -844,139 +1145,27 @@ class _ReportStatTiles extends StatelessWidget {
           ),
           const SizedBox(height: 6),
         ],
-        // This screen doesn't use a GridView (it's one card inside the
-        // page's own outer ListView, not a scrollable of its own), so it
-        // can't hand a crossAxisCount to a SliverGridDelegate the way the
-        // two dashboards' grids do — it groups the tiles into its own
-        // N-per-row Rows instead, still driven by the SAME
-        // responsiveColumnCount helper (2 per row on a phone, unchanged).
-        // IntrinsicHeight keeps every tile in a row the same height when
-        // one wraps its label/sub text at a large text size.
-        for (final entry in _chunk(
-          tiles,
-          responsiveColumnCount(context),
-        ).indexed) ...[
-          if (entry.$1 > 0) const SizedBox(height: 8),
-          IntrinsicHeight(
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                for (int i = 0; i < entry.$2.length; i++) ...[
-                  if (i > 0) const SizedBox(width: 8),
-                  Expanded(child: _StatTile(data: entry.$2[i])),
-                ],
-              ],
-            ),
-          ),
-        ],
+        ReportTileGrid(tiles: tiles),
       ],
     );
   }
 }
 
-// Splits [items] into consecutive groups of at most [size] — [size] itself
-// is never 0 (responsiveColumnCount's own `min` clamp already guarantees
-// at least 2), so this can't loop forever. The last group is simply
-// whatever is left over (never padded back up to [size]), which for this
-// screen's fixed 4 tiles only ever shows up as an uneven final row when the
-// column count doesn't evenly divide 4 (3 columns -> a row of 3 then a row
-// of 1) — an acceptable trade for reusing the one shared column-count rule
-// instead of a second, tile-count-aware one just for this screen.
-List<List<T>> _chunk<T>(List<T> items, int size) {
-  final result = <List<T>>[];
-  for (var i = 0; i < items.length; i += size) {
-    final end = i + size < items.length ? i + size : items.length;
-    result.add(items.sublist(i, end));
-  }
-  return result;
-}
-
-class _StatTileData {
-  final IconData icon;
-  final String label;
-  final String value;
-  final String? sub;
-  final Color color;
-
-  const _StatTileData({
-    required this.icon,
-    required this.label,
-    required this.value,
-    required this.color,
-    this.sub,
-  });
-}
-
-class _StatTile extends StatelessWidget {
-  final _StatTileData data;
-
-  const _StatTile({required this.data});
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    // readable(): the palette colours are tuned for a light card and sink
-    // into the dark theme's surface.
-    final color = AppColors.readable(context, data.color);
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: scheme.surface,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: scheme.outlineVariant.withValues(alpha: 0.5)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(
-            children: [
-              Icon(data.icon, size: 16, color: color),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  data.label,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: scheme.outline,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Text(
-            data.value,
-            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-              fontWeight: FontWeight.w800,
-              color: color,
-            ),
-          ),
-          if (data.sub != null)
-            Text(
-              data.sub!,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: scheme.outline,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-/// A location's header in the location-wise view.
+/// A location's header in the location-wise view: the place, how many reports
+/// and their cumulative score.
 class _LocationHeader extends StatelessWidget {
   final String label;
   final int count;
-  final ReportStats stats;
+  // Σ achieved / Σ possible over the place's Completed audits (the server's),
+  // null while none has finished — then no score is shown.
+  final int? percentage;
   final bool isExpanded;
   final VoidCallback onToggle;
 
   const _LocationHeader({
     required this.label,
     required this.count,
-    required this.stats,
+    required this.percentage,
     required this.isExpanded,
     required this.onToggle,
   });
@@ -984,7 +1173,6 @@ class _LocationHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final pct = stats.percentage;
     // Tappable — collapsed by default, revealing this location's own
     // audits only once tapped (see _expandedLocationKeys' own doc).
     return InkWell(
@@ -1013,8 +1201,8 @@ class _LocationHeader extends StatelessWidget {
             const SizedBox(width: 8),
             Text(
               [
-                '$count',
-                if (pct != null) '$pct%${stats.isPartial ? '*' : ''}',
+                '$count ${count == 1 ? 'report' : 'reports'}',
+                if (percentage != null) '$percentage%',
               ].join(' · '),
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: scheme.outline,
@@ -1106,7 +1294,8 @@ class _SeriesReportCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final stats = ReportStats.fromAudits(entry.occurrences);
+    // Completed occurrences only: an open / Not Attempted one has no score yet.
+    final score = finishedScoreOf(entry.occurrences);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -1132,11 +1321,7 @@ class _SeriesReportCard extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(width: 8),
-                      _scoreBadge(
-                        context,
-                        stats.percentage?.toDouble(),
-                        isPartial: stats.isPartial,
-                      ),
+                      _scoreBadge(context, score.percentage?.toDouble()),
                       Icon(
                         isExpanded ? Icons.expand_less : Icons.expand_more,
                         color: scheme.outline,
@@ -1214,9 +1399,9 @@ Color _scoreColor(BuildContext context, double? score) {
   return Colors.red;
 }
 
-// isPartial: a "*" for a score that includes a still-open audit's own
-// progress so far (see ReportStats.isPartial's own doc) — false everywhere
-// this badge shows a single, already-Completed audit's real final score.
+// isPartial: a "*" for a BATCH's score when only some of its zones are
+// finished — the score then covers just the finished ones. Never set for a
+// single audit: an audit that is not Completed shows "—", not a partial grade.
 Widget _scoreBadge(BuildContext context, double? score, {bool isPartial = false}) {
   final color = _scoreColor(context, score);
   return Container(
@@ -1443,31 +1628,18 @@ class _BatchReportCard extends StatelessWidget {
     required this.onDownloadMember,
   });
 
-  // Sum-achieved-over-sum-max across every zone — never an average of
-  // each zone's own %, same rule pages/CompletedAudits.jsx#batchScore
-  // already uses on the web. Null (not 0%) if any member's own score
-  // hasn't come back yet, same "nothing to show" convention as a single
-  // report's own null percentage.
-  // Whether every zone is actually Completed — _combinedPercentage below is
-  // the bundle's real final score only then; otherwise it's the combined
-  // progress of whatever has been scored so far (marked with a "*" where
-  // this is shown — see reports_screen.dart's own _scoreBadge isPartial
-  // param), same rule the server's getCompletedAuditStats#isPartial and the
-  // web's pages/CompletedAudits.jsx now both apply.
+  // Whether every zone is actually Completed. The score below covers only the
+  // finished zones, so a batch that is only partly finished carries a "*" (see
+  // reports_screen.dart's _scoreBadge isPartial param), like the web's
+  // pages/CompletedAudits.jsx; one with no finished zone shows "—".
   bool get _combinedFinished => members.every((m) => m.status == AuditStatus.completed);
 
-  // Σ achieved / Σ possible across whichever zones have actually been scored
-  // (a Skipped one excluded, same rule getBatchReport's own combined score
-  // applies) — null only once nothing at all has a score yet.
-  double? get _combinedPercentage {
-    final live = members.where(
-      (m) => m.status != AuditStatus.skipped && m.status != AuditStatus.draft,
-    );
-    final max = live.fold<double>(0, (sum, m) => sum + (m.scoreMax ?? 0));
-    if (max <= 0) return null;
-    final achieved = live.fold<double>(0, (sum, m) => sum + (m.scoreAchieved ?? 0));
-    return achieved / max * 100;
-  }
+  // Σ achieved / Σ possible across the COMPLETED zones only — never an average
+  // of each zone's own %, and an open, Not Attempted, Skipped or Draft zone is
+  // neither 0 nor 100 but simply left out (the owner's rule, 2026-09-30). Null
+  // while no zone has finished.
+  double? get _combinedPercentage =>
+      finishedScoreOf(members).percentage?.toDouble();
 
   // The batch's ONE status — the server's aggregate over every zone of the
   // batch (batchDisplayStatus: the final status appears only once every zone
@@ -1540,7 +1712,7 @@ class _BatchReportCard extends StatelessWidget {
                                       // give way rather than overflow.
                                       Flexible(
                                         child: Text(
-                                          '${members.length} locations',
+                                          bundleLocationsLabel(members),
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: TextStyle(
@@ -1787,6 +1959,9 @@ class _PerLocationReportCardState extends State<_PerLocationReportCard> {
   // comment (and every other rollup in this app) already follows.
   List<_ZoneScore> _computeZoneScores(AuditDetailModel detail) {
     final isWeightage = detail.scoringSystem == 'weightage';
+    // A zone of an audit that is not Completed yet has no final score: "—",
+    // never its progress so far (the owner's rule, 2026-09-30).
+    final finished = widget.audit.status == AuditStatus.completed;
     return buildReportSections(detail).map((section) {
       final leaves = collectScoredLeaves(section.tree);
       final am = sumAchievedMax(
@@ -1794,7 +1969,10 @@ class _PerLocationReportCardState extends State<_PerLocationReportCard> {
         isWeightage ? 'weightage' : 'normal',
         detail.maxScore,
       );
-      return _ZoneScore(label: section.label, pct: percentageOf(am));
+      return _ZoneScore(
+        label: section.label,
+        pct: finished ? percentageOf(am) : null,
+      );
     }).toList();
   }
 

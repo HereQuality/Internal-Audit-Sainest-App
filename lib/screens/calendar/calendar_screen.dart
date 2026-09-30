@@ -6,6 +6,7 @@ import '../../core/utils/audit_date_range.dart';
 import '../../core/utils/audit_status.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/filter_options_provider.dart';
+import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/filter_sheet.dart';
@@ -27,11 +28,11 @@ import '../nc/nc_review_screen.dart';
 /// implementation, fetching all three sources unconditionally regardless
 /// of AppMode, is what keeps that from happening again.
 ///
-///   - Non-Conformance (red) — NcProvider.raisedAgainstMe, one dot per
+///   - Non-Conformance (red) — NcProvider.calendarNcs, one dot per
 ///     NcModel#targetDate, tap to respond (still "Raised") or review.
 ///   - Audit (coloured by status: Not Started slate, In Progress blue,
 ///     Overdue red, NC Response Pending amber, NC Verification Pending
-///     violet, Total Closed teal) — AuditsProvider.audits (this employee's
+///     violet, Total Closed teal) — AuditsProvider.calendarAudits (this employee's
 ///     own, as auditor), coloured and labelled by AuditModel#displayLabel,
 ///     expanded across every day in AuditModel#scheduledDate..
 ///     scheduledEndDate via daysInAuditRange. Note red and blue are also
@@ -52,11 +53,14 @@ import '../nc/nc_review_screen.dart';
 /// VIEW concern — it scrolls the grid, it is never sent to the server (the
 /// audit endpoints hand back the whole scheduled range and always have;
 /// the calendar simply shows one month of it at a time). Everything else
-/// in the sheet is applied to BOTH AuditsProvider and DashboardProvider,
-/// because `audits` here is the very same list the Audits tab renders and
-/// the dashboard tallies — filtering on one surface and not the others is
-/// how the app would end up quietly disagreeing with itself about what
-/// "my audits" means.
+/// in the sheet is applied to every filter-holding provider (Audits,
+/// Dashboard, NC), so the calendar and the lists never describe different
+/// populations. The exception is what this screen cannot show or clear —
+/// Status, Include skipped and Flag: the calendar reads its OWN audit and NC
+/// lists (AuditsProvider.calendarAudits / NcProvider.calendarNcs), fetched
+/// with the shared filters minus those three, so a pick made on the Audits or
+/// NC screen never silently narrows the calendar (web's Calendar has none of
+/// them either).
 class CalendarScreen extends StatefulWidget {
   const CalendarScreen({super.key});
 
@@ -81,12 +85,41 @@ class _CalendarScreenState extends State<CalendarScreen> {
   /// the spinner.
   bool _hasCompletedFirstLoad = false;
 
+  late final AuditsProvider _audits;
+  late final NcProvider _ncs;
+
   @override
   void initState() {
     super.initState();
+    // The month on screen survives a remount (role switch, shell rebuild) —
+    // held in ListViewMemory, which logout wipes.
+    final remembered = context
+        .read<ListViewMemory>()
+        .screen('calendar')
+        .extra['visibleMonth'];
     final now = DateTime.now();
-    _visibleMonth = DateTime(now.year, now.month, 1);
+    _visibleMonth = remembered is DateTime
+        ? remembered
+        : DateTime(now.year, now.month, 1);
+    // This screen has its own audit + NC lists (no Status / Include skipped /
+    // Flag filter here) — flagging it in use makes filter changes made from
+    // ANY screen reload them too while it is open.
+    _audits = context.read<AuditsProvider>()..calendarInUse = true;
+    _ncs = context.read<NcProvider>()..calendarInUse = true;
     WidgetsBinding.instance.addPostFrameCallback((_) => _loadAll());
+  }
+
+  @override
+  void dispose() {
+    _audits.calendarInUse = false;
+    _ncs.calendarInUse = false;
+    super.dispose();
+  }
+
+  void _setVisibleMonth(DateTime month) {
+    setState(() => _visibleMonth = month);
+    context.read<ListViewMemory>().screen('calendar').extra['visibleMonth'] =
+        month;
   }
 
   /// All three sources at once — awaited together only so the first-load
@@ -96,8 +129,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
     final ncProvider = context.read<NcProvider>();
     final auditsProvider = context.read<AuditsProvider>();
     await Future.wait([
-      ncProvider.fetchAgainstMe(),
-      auditsProvider.fetchMyAudits(),
+      ncProvider.fetchCalendarNcs(),
+      auditsProvider.fetchCalendarAudits(),
       auditsProvider.fetchAuditsAtMyLocation(),
     ]);
     if (!mounted) {
@@ -123,11 +156,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
     // Month first and locally: it never reaches the server, it just moves
     // the grid (and flows down into MonthCalendar.visibleMonth).
     if (result.month != null) {
-      setState(() => _visibleMonth = DateTime(
-        result.month!.year,
-        result.month!.month,
-        1,
-      ));
+      _setVisibleMonth(DateTime(result.month!.year, result.month!.month, 1));
     }
     if (!context.mounted) {
       return;
@@ -166,16 +195,16 @@ class _CalendarScreenState extends State<CalendarScreen> {
     final filterOptions = context.watch<FilterOptionsProvider>();
 
     // Any of the three sources refetching — after a filter change that is
-    // all three at once (AuditsProvider.refetchForFilters + the NC list is
-    // untouched by filters, so realistically the two audit ones).
+    // all three at once (both providers' refetchForFilters reload the
+    // calendar's own NC and audit lists while this screen is open).
     final isBusy =
-        ncProvider.isLoadingMine ||
-        auditsProvider.isLoading ||
+        ncProvider.isLoadingCalendarNcs ||
+        auditsProvider.isLoadingCalendarAudits ||
         auditsProvider.isLoadingAtMyLocation;
 
     final hasAnythingToShow =
-        ncProvider.raisedAgainstMe.isNotEmpty ||
-        auditsProvider.audits.isNotEmpty ||
+        ncProvider.calendarNcs.isNotEmpty ||
+        auditsProvider.calendarAudits.isNotEmpty ||
         auditsProvider.auditsAtMyLocation.isNotEmpty;
 
     // A full-screen spinner is only ever right on a genuinely cold start:
@@ -197,7 +226,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
     // still false there), which otherwise shows one frame of empty grid.
     final showColdStartSpinner = !_hasCompletedFirstLoad && !hasAnythingToShow;
 
-    final myAuditIds = auditsProvider.audits.map((a) => a.id).toSet();
+    final myAuditIds = auditsProvider.calendarAudits.map((a) => a.id).toSet();
 
     return Scaffold(
       appBar: AppBar(
@@ -241,11 +270,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
                     // The grid's own chevrons report back here so the next
                     // filter-sheet open offers the month actually on
                     // screen, not the one this screen opened on.
-                    onVisibleMonthChanged: (month) =>
-                        setState(() => _visibleMonth = month),
+                    onVisibleMonthChanged: _setVisibleMonth,
                     legend: const _CalendarLegend(),
                     events: [
-                      ...ncProvider.raisedAgainstMe
+                      ...ncProvider.calendarNcs
                           .where((nc) => nc.targetDate != null)
                           .map(
                             (nc) => CalendarEvent(
@@ -262,7 +290,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                               ),
                             ),
                           ),
-                      ...auditsProvider.audits
+                      ...auditsProvider.calendarAudits
                           .where((a) => a.scheduledDate != null)
                           .expand(
                             (a) => daysInAuditRange(a).map(

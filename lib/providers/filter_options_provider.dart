@@ -204,9 +204,15 @@ class FilterOptionsProvider extends ChangeNotifier {
 
   /// The teams present in the hierarchy directory, by name, with headcounts
   /// (deactivated people included — picking the team scopes to all of them).
-  List<TeamOption> get teams {
+  List<TeamOption> get teams => teamsOf(employees);
+
+  /// The teams of just [people], by name, with the headcount WITHIN [people] —
+  /// the Team list once a picked place has narrowed the people
+  /// (core/utils/place_cascade.dart#WhoCascade.pool): only the teams of the
+  /// people who belong to the place, counted over those people.
+  List<TeamOption> teamsOf(Iterable<EmployeeOption> people) {
     final byId = <String, TeamOption>{};
-    for (final e in employees) {
+    for (final e in people) {
       for (final t in e.teams) {
         final prev = byId[t.id];
         byId[t.id] = TeamOption(

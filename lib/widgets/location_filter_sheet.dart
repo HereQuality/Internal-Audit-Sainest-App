@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../core/utils/place_cascade.dart' show PlaceSet;
 import '../models/department_option.dart';
 import '../models/location_option.dart';
 import 'picker_sheet.dart' show kPickerSearchThreshold;
@@ -9,6 +10,11 @@ import 'picker_sheet.dart' show kPickerSearchThreshold;
 /// The picked "where": locations (Area / Zone / Sub Zone) and departments —
 /// ONE facet, as on the web's LocationFilterSelect. Both empty = All.
 typedef WhereSelection = ({List<String> locations, List<String> departments});
+
+/// The places the picked Team / Members belong to (null = no narrowing), asked
+/// for the sheet's CURRENT ticks — see WhoCascade.placeRestriction.
+typedef PlaceRestriction =
+    PlaceSet? Function(List<String> locations, List<String> departments);
 
 /// widgets/location_filter_sheet.dart
 /// ────────────────────────────────────
@@ -20,6 +26,11 @@ typedef WhereSelection = ({List<String> locations, List<String> departments});
 /// too (as explicit ids, so each can still be unticked on its own — the Zone
 /// row then shows the dash). Once locations are picked the Department section
 /// narrows to the departments present at them.
+///
+/// [restrictTo]: when the Team / Members filters name people, only the places
+/// those people belong to are offered (the Zone above a Sub Zone and the Sub
+/// Zones under a Zone come along); a ticked place always stays listed so it can
+/// be unticked. Null = every place.
 ///
 /// Returns null when dismissed; otherwise the new selection (Apply).
 Future<WhereSelection?> showLocationFilterSheet(
@@ -33,6 +44,7 @@ Future<WhereSelection?> showLocationFilterSheet(
   bool failed = false,
   bool fullAccess = false,
   bool showDepartments = true,
+  PlaceRestriction? restrictTo,
 }) {
   return showModalBottomSheet<WhereSelection>(
     context: context,
@@ -51,6 +63,7 @@ Future<WhereSelection?> showLocationFilterSheet(
       loading: loading,
       failed: failed,
       fullAccess: fullAccess,
+      restrictTo: restrictTo,
     ),
   );
 }
@@ -84,6 +97,7 @@ class _LocationSheet extends StatefulWidget {
   final bool loading;
   final bool failed;
   final bool fullAccess;
+  final PlaceRestriction? restrictTo;
 
   const _LocationSheet({
     required this.locations,
@@ -94,6 +108,7 @@ class _LocationSheet extends StatefulWidget {
     required this.loading,
     required this.failed,
     required this.fullAccess,
+    this.restrictTo,
   });
 
   @override
@@ -115,10 +130,26 @@ class _LocationSheetState extends State<_LocationSheet> {
 
   bool get _isAll => _locs.isEmpty && _depts.isEmpty;
 
+  // The people filters' narrowing of the places, refreshed on every build for
+  // the CURRENT ticks (null = none). Cached: the zone helpers below read it
+  // several times per frame.
+  PlaceSet? _restriction;
+
+  // The places on offer: all of them, or — with picked people — only theirs. A
+  // ticked place always stays, so it can be unticked.
+  List<LocationOption> get _offered {
+    final r = _restriction;
+    if (r == null) return widget.locations;
+    return [
+      for (final l in widget.locations)
+        if (r.locations.contains(l.id) || _locs.contains(l.id)) l,
+    ];
+  }
+
   // Sub Zones offered under each Zone — what ticking that Zone ticks.
   Map<String, List<String>> get _childrenOfZone {
     final map = <String, List<String>>{};
-    for (final l in widget.locations) {
+    for (final l in _offered) {
       if (l.locationType == 'SubZone' && l.parentZoneId != null) {
         map.putIfAbsent(l.parentZoneId!, () => []).add(l.id);
       }
@@ -128,8 +159,13 @@ class _LocationSheetState extends State<_LocationSheet> {
 
   List<_Section> _buildSections() {
     final children = _childrenOfZone;
+    final offered = _offered;
+    final restricted = _restriction != null;
+    // Said under an empty list while people narrow it, instead of "None linked
+    // to you" (which would be untrue).
+    final noneHint = restricted ? 'None for the picked team / people.' : null;
     final zoneName = {
-      for (final l in widget.locations)
+      for (final l in offered)
         if (l.locationType == 'Zone') l.id: l.name,
     };
     int byLabel(_Row a, _Row b) =>
@@ -139,11 +175,11 @@ class _LocationSheetState extends State<_LocationSheet> {
         _Row(l.id, l.display, sublabel: sub);
 
     final areas = [
-      for (final l in widget.locations)
+      for (final l in offered)
         if (l.locationType == 'Area') row(l),
     ]..sort(byLabel);
     final zones = [
-      for (final l in widget.locations)
+      for (final l in offered)
         if (l.locationType == 'Zone')
           row(
             l,
@@ -155,7 +191,7 @@ class _LocationSheetState extends State<_LocationSheet> {
     // Grouped under the parent Zone's name; one whose Zone isn't offered
     // still shows the name the server sent.
     final subs = [
-      for (final l in widget.locations)
+      for (final l in offered)
         if (l.locationType == 'SubZone')
           (
             zone: zoneName[l.parentZoneId] ?? l.parentZoneName ?? '',
@@ -174,7 +210,7 @@ class _LocationSheetState extends State<_LocationSheet> {
         return z != 0 ? z : byLabel(a.row, b.row);
       });
     final other = [
-      for (final l in widget.locations)
+      for (final l in offered)
         if (!_sectionTitles.containsKey(l.locationType)) row(l),
     ]..sort(byLabel);
 
@@ -185,25 +221,36 @@ class _LocationSheetState extends State<_LocationSheet> {
       for (final id in picked) ...(widget.departmentsByLocation[id] ?? const []),
     };
     final narrow = picked.isNotEmpty;
-    final offered = [
+    final restriction = _restriction;
+    final offeredDepartments = [
       for (final d in widget.departments)
-        if (!narrow || atPicked.contains(d.id) || _depts.contains(d.id))
+        if ((!narrow || atPicked.contains(d.id) || _depts.contains(d.id)) &&
+            (restriction == null ||
+                restriction.departments.contains(d.id) ||
+                _depts.contains(d.id)))
           _Row(d.id, d.display, isDepartment: true),
     ]..sort(byLabel);
 
     return [
-      _Section('Area', 'Area', areas),
-      _Section('Zone', 'Zone', zones),
-      _Section('SubZone', 'Sub Zone', [for (final s in subs) s.row]),
+      _Section('Area', 'Area', areas, hint: noneHint),
+      _Section('Zone', 'Zone', zones, hint: noneHint),
+      _Section(
+        'SubZone',
+        'Sub Zone',
+        [for (final s in subs) s.row],
+        hint: noneHint,
+      ),
       if (other.isNotEmpty) _Section('other', 'Location', other),
       if (widget.departments.isNotEmpty)
         _Section(
           'department',
           'Department',
-          offered,
-          hint: narrow && offered.isEmpty
+          offeredDepartments,
+          hint: offeredDepartments.isNotEmpty
+              ? null
+              : narrow
               ? 'No departments at the selected locations.'
-              : null,
+              : noneHint,
         ),
     ];
   }
@@ -247,6 +294,7 @@ class _LocationSheetState extends State<_LocationSheet> {
     final media = MediaQuery.of(context);
     final q = _query.trim().toLowerCase();
     final total = widget.locations.length + widget.departments.length;
+    _restriction = widget.restrictTo?.call(_locs.toList(), _depts.toList());
     final sections = _buildSections();
     final maxHeight = math.min(
       media.size.height * 0.9,
@@ -314,6 +362,16 @@ class _LocationSheetState extends State<_LocationSheet> {
                   ],
                 ),
               ),
+              if (_restriction != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 2, 20, 0),
+                  child: Text(
+                    'Showing only the places of the picked team / people.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: scheme.outline,
+                    ),
+                  ),
+                ),
               if (total >= kPickerSearchThreshold)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 6, 16, 4),

@@ -22,6 +22,10 @@ class EmployeeOption {
   // hierarchy. Unpopulated ObjectId strings are enough since it's only
   // ever compared against another location's id, never displayed.
   final List<String> locationIds;
+  // The departments the person belongs to (same unpopulated-id shape as
+  // locationIds) — with locationIds, what "belongs to this place" means for the
+  // filter sheet's Location <-> People cascade (core/utils/place_cascade.dart).
+  final List<String> departmentIds;
   // Teams the person belongs to (only when the endpoint populated them —
   // the hierarchy scope does, an unpopulated id has no name and is skipped).
   // Drives the Team filter and the muted "Team A, Team B" second line under
@@ -39,6 +43,7 @@ class EmployeeOption {
     required this.id,
     required this.name,
     this.locationIds = const [],
+    this.departmentIds = const [],
     this.teams = const [],
     this.isActive = true,
     this.auditTypeIds = const [],
@@ -49,6 +54,10 @@ class EmployeeOption {
       id: (json['_id'] ?? '').toString(),
       name: json['employeeName']?.toString() ?? 'Unnamed',
       locationIds: (json['locationIds'] as List? ?? [])
+          .map((e) => (e is Map ? e['_id'] : e)?.toString() ?? '')
+          .where((id) => id.isNotEmpty)
+          .toList(),
+      departmentIds: (json['departmentIds'] as List? ?? [])
           .map((e) => (e is Map ? e['_id'] : e)?.toString() ?? '')
           .where((id) => id.isNotEmpty)
           .toList(),

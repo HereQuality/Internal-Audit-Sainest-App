@@ -3,11 +3,13 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
+import 'package:intl/intl.dart';
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
 import '../models/nc_model.dart';
+import '../models/nc_report_model.dart';
 import 'audit_filter_scope.dart';
 
 /// Same two-sided access rule as the web app's NCManagement.jsx (auditor:
@@ -42,8 +44,21 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   }
 
   @override
-  Future<void> refetchForFilters() =>
-      Future.wait([fetchRaisedByMe(), fetchAgainstMe()]);
+  Future<void> refetchForFilters() {
+    // The Reports tab is not the one showing (it stays mounted in the shell): it
+    // is not refetched behind the user's back — it notes it is out of date and
+    // reloads when it is opened again.
+    if (!ncReportsInUse) ncReportsStale = true;
+    return Future.wait([
+      fetchRaisedByMe(),
+      fetchRaisedStats(),
+      fetchAgainstMe(),
+      if (calendarInUse) fetchCalendarNcs(),
+      // The Reports tab is showing: its NCs, Repeated NCs and tiles follow the
+      // filters too.
+      if (ncReportsInUse) ...[fetchNcReport(), fetchNcReportStats(), fetchRepeats()],
+    ]);
+  }
 
   // Bumped on logout: a fetch already on the wire for the previous account
   // finds the number changed when it lands and drops its answer — its error
@@ -55,7 +70,12 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   // the wire, and the older answer may land last — only the newest call of
   // each fetch may write its result, error or loading flag.
   int _raisedSeq = 0;
+  int _raisedStatsSeq = 0;
   int _mineSeq = 0;
+  int _calendarSeq = 0;
+  int _ncReportSeq = 0;
+  int _ncReportStatsSeq = 0;
+  int _repeatsSeq = 0;
 
   // NCs whose move-to-Verification already succeeded but whose verify did not
   // — a retry must go straight to verify (moving again is a 400).
@@ -76,6 +96,29 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     _selfEmployeeId = null;
     raisedByMe = [];
     raisedAgainstMe = [];
+    calendarNcs = [];
+    calendarInUse = false;
+    isLoadingCalendarNcs = false;
+    raisedStats = null;
+    isLoadingRaisedStats = false;
+    reportNcs = [];
+    ncReportTotalNcs = null;
+    ncReportTotalAudits = null;
+    ncReportStats = null;
+    ncReportError = null;
+    isLoadingNcReport = false;
+    isLoadingNcReportStats = false;
+    ncReportsInUse = false;
+    ncReportsStale = false;
+    ncReportSearch = '';
+    ncReportTileKeys = const {};
+    ncReportByLocation = false;
+    repeatRows = [];
+    repeatsTotal = 0;
+    repeatsMinCount = 2;
+    repeatsError = null;
+    isLoadingRepeats = false;
+    isLoadingMoreRepeats = false;
     activeNc = null;
     _movedToVerification.clear();
     raisedError = null;
@@ -94,6 +137,67 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   bool isLoadingMine = false;
   String? mineError;
   List<NcModel> raisedAgainstMe = [];
+
+  /// The Calendar's own copy of "NCs raised against me". The Calendar has no
+  /// Flag filter (web's neither), so it must not read [raisedAgainstMe]: that
+  /// list is fetched with the NC screen's Flag pick as `severity`, which would
+  /// narrow the calendar with a filter it cannot show or clear. Fetched with
+  /// [filterParams] (no severity); [calendarInUse] keeps it following filter
+  /// changes while the Calendar is open.
+  bool calendarInUse = false;
+  bool isLoadingCalendarNcs = false;
+  List<NcModel> calendarNcs = [];
+
+  /// NC Monitoring's six tiles (GET /ncs/raised/stats) under the same filters as
+  /// [raisedByMe] — null until loaded or when the request failed (the tiles are
+  /// then simply not drawn; the list is unaffected).
+  NcTileStats? raisedStats;
+  bool isLoadingRaisedStats = false;
+
+  // ── Final Report · NCs tab and Repeated NCs tab ────────────────────────
+  // GET /ncs/report lists every NC the caller may see, GET /ncs/report/stats
+  // gives its six tiles, the id list behind each and the per-place tallies
+  // (byLocation) over the whole filtered set, and GET /ncs/repeats the groups of
+  // the same checkpoint wording raised again at the same place. The people rule
+  // is the server's (an NC is a person's as raiser or auditee; a Team / specific
+  // Members pick narrows): this sends the shared filters and renders what comes
+  // back —
+  // the bucket and the place label of each row are the server's, never derived.
+
+  /// True while the Reports tab is the one showing, so a filter change reaches
+  /// these lists too; [ncReportsStale] says one moved while it was not.
+  bool ncReportsInUse = false;
+  bool ncReportsStale = false;
+
+  /// The search box (server-side, so the tiles and the list describe the same
+  /// NCs) and the tile picks (NcBucket keys) + whether the location-wise view is
+  /// on — with both, the place tallies are asked for over just the picked tiles'
+  /// NCs (the server's `onlyIds`), while the tiles keep the whole set.
+  String ncReportSearch = '';
+  Set<String> ncReportTileKeys = const {};
+  bool ncReportByLocation = false;
+
+  bool isLoadingNcReport = false;
+  String? ncReportError;
+  List<NcModel> reportNcs = [];
+
+  /// How many NCs and how many audits the filters match (GET /ncs/report with
+  /// groupBy=audit: `totalNcs` and `total`) — the count line's numbers, true even
+  /// when fewer rows were loaded. Null until the first answer.
+  int? ncReportTotalNcs;
+  int? ncReportTotalAudits;
+  NcTileStats? ncReportStats;
+  bool isLoadingNcReportStats = false;
+
+  /// The Repeated NCs tab: the "min. times" pick (2, 3, 4, 5, 10), the groups
+  /// loaded so far (paged — [repeatsTotal] is how many there are) and its state.
+  int repeatsMinCount = 2;
+  List<RepeatGroup> repeatRows = [];
+  int repeatsTotal = 0;
+  bool isLoadingRepeats = false;
+  bool isLoadingMoreRepeats = false;
+  String? repeatsError;
+  static const _repeatsPageSize = 30;
 
   bool isLoadingDetail = false;
   NcModel? activeNc;
@@ -118,7 +222,10 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
         _refreshTimer?.cancel();
         _refreshTimer = Timer(const Duration(milliseconds: 500), () {
           fetchRaisedByMe();
+          fetchRaisedStats();
           fetchAgainstMe();
+          if (calendarInUse) fetchCalendarNcs();
+          _refreshReports();
         });
       }
     };
@@ -205,6 +312,271 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
+  /// NC Monitoring's tiles: GET /ncs/raised/stats under the same filters as
+  /// [fetchRaisedByMe]. Fails quietly — a failed request only hides the tiles.
+  Future<void> fetchRaisedStats() async {
+    final epoch = _epoch;
+    final seq = ++_raisedStatsSeq;
+    bool stale() => epoch != _epoch || seq != _raisedStatsSeq;
+    isLoadingRaisedStats = true;
+    notifyListeners();
+    NcTileStats? stats;
+    try {
+      final res = await _dio.get(
+        ApiConstants.ncsRaisedStats,
+        queryParameters: ncFilterParams,
+      );
+      stats = NcTileStats.tryParse(res.data['data']);
+    } on DioException {
+      stats = null;
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchRaisedStats: unreadable answer: $e\n$st');
+      stats = null;
+    }
+    if (stale()) return;
+    raisedStats = stats;
+    isLoadingRaisedStats = false;
+    notifyListeners();
+  }
+
+  /// What both Final Report NC requests take: the shared filters (people, place,
+  /// Audit Type, Date, Flag) plus the search box.
+  Map<String, dynamic> get _ncReportParams => {
+    ...?ncFilterParams,
+    if (ncReportSearch.trim().isNotEmpty) 'search': ncReportSearch.trim(),
+  };
+
+  /// The Reports tab's NC list — every page of GET /ncs/report, 100 at a time
+  /// (the endpoint's maximum), so the tiles and place headers can be matched to
+  /// rows by id.
+  ///
+  /// Paged with `groupBy=audit`: a page is `limit` whole AUDITS (every matching NC
+  /// of each), `total` counts audits and `totalNcs` the NCs, so the several NCs of
+  /// one audit always arrive together and the tab can show them as one bundle.
+  /// (Never sent with `ids` — a tile pick is applied here on the device.)
+  Future<void> fetchNcReport() async {
+    final epoch = _epoch;
+    final seq = ++_ncReportSeq;
+    bool stale() => epoch != _epoch || seq != _ncReportSeq;
+    isLoadingNcReport = true;
+    ncReportError = null;
+    notifyListeners();
+    try {
+      const limit = 100;
+      final params = {..._ncReportParams, 'limit': limit, 'groupBy': 'audit'};
+      final seen = <String>{};
+      final all = <NcModel>[];
+      int? totalNcs;
+      int? totalAudits;
+      var page = 1;
+      while (page <= 30) {
+        final res = await _dio.get(
+          ApiConstants.ncsReport,
+          queryParameters: {...params, 'page': page},
+        );
+        if (stale()) return;
+        final data = res.data['data'];
+        final rows = data is Map ? (data['ncs'] as List? ?? []) : const [];
+        for (final e in rows.whereType<Map>()) {
+          final nc = NcModel.fromJson(Map<String, dynamic>.from(e));
+          if (seen.add(nc.id)) all.add(nc);
+        }
+        final total = data is Map ? (data['total'] as num?)?.toInt() ?? 0 : 0;
+        totalAudits = total;
+        totalNcs = data is Map ? (data['totalNcs'] as num?)?.toInt() : null;
+        // `total` counts audits, `limit` audits a page: the last page comes from
+        // those, not from how many NCs have arrived.
+        if (rows.isEmpty || page * limit >= total) break;
+        page++;
+      }
+      reportNcs = all;
+      ncReportTotalAudits = totalAudits;
+      ncReportTotalNcs = totalNcs;
+      ncReportsStale = false;
+    } on DioException catch (e) {
+      if (!stale()) {
+        ncReportError = extractErrorMessage(e, fallback: 'Could not load the NCs.');
+      }
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchNcReport: unreadable answer: $e\n$st');
+      if (!stale()) ncReportError = 'Could not load the NCs.';
+    } finally {
+      if (!stale()) {
+        isLoadingNcReport = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// The six tiles and the place tallies for the same NCs (GET /ncs/report/stats).
+  Future<void> fetchNcReportStats() async {
+    final epoch = _epoch;
+    final seq = ++_ncReportStatsSeq;
+    bool stale() => epoch != _epoch || seq != _ncReportStatsSeq;
+    isLoadingNcReportStats = true;
+    notifyListeners();
+    NcTileStats? stats;
+    try {
+      final params = _ncReportParams;
+      final res = await _dio.get(ApiConstants.ncsReportStats, queryParameters: params);
+      stats = NcTileStats.tryParse(res.data['data']);
+      // Location-wise AND a tile picked: the place tallies must describe the
+      // tile's NCs, so ask again for just them. Best effort — without it the
+      // headers keep the whole set's numbers.
+      if (stats != null && ncReportByLocation && ncReportTileKeys.isNotEmpty) {
+        final ids = {for (final k in ncReportTileKeys) ...stats.idsFor(k)};
+        try {
+          final narrowed = await _dio.get(
+            ApiConstants.ncsReportStats,
+            queryParameters: {...params, 'onlyIds': ids.join(',')},
+          );
+          final rows = NcTileStats.tryParse(narrowed.data['data'])?.byLocation;
+          if (rows != null) stats = stats.withByLocation(rows);
+        } on DioException {
+          // keep the whole set's headers
+        }
+      }
+    } on DioException {
+      stats = null;
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchNcReportStats: unreadable answer: $e\n$st');
+      stats = null;
+    }
+    if (stale()) return;
+    ncReportStats = stats;
+    isLoadingNcReportStats = false;
+    notifyListeners();
+  }
+
+  /// What GET /ncs/repeats takes. The server groups org-wide — who raised or
+  /// received an NC never enters a group — so the people half of the shared
+  /// filters (Me / All Members / Team / Members) is NOT sent; Location +
+  /// Department, Audit Type, Flag and Date are. With no date picked the tab looks
+  /// back six months, like the web's, and says so.
+  Map<String, dynamic> get repeatParams {
+    final params = <String, dynamic>{'minCount': repeatsMinCount};
+    if (locationFilter.isNotEmpty) params['locationIds'] = locationFilter.join(',');
+    if (departmentFilter.isNotEmpty) params['departmentIds'] = departmentFilter.join(',');
+    if (auditTypeFilter.isNotEmpty) params['auditType'] = auditTypeFilter.join(',');
+    if (flagFilter.isNotEmpty) params['severity'] = flagFilter.join(',');
+    final from = dateFrom ?? (hasDateFilter ? null : repeatDefaultFrom());
+    if (from != null) params['fromDate'] = DateFormat('yyyy-MM-dd').format(from);
+    if (dateTo != null) params['toDate'] = DateFormat('yyyy-MM-dd').format(dateTo!);
+    return params;
+  }
+
+  /// Six months before [now] — the Repeated NCs tab's window when no date range
+  /// is picked.
+  static DateTime repeatDefaultFrom([DateTime? now]) {
+    final n = now ?? DateTime.now();
+    return DateTime(n.year, n.month - 6, n.day);
+  }
+
+  /// Whether the Repeated NCs tab is using its own last-six-months window.
+  bool get repeatsUseDefaultWindow => !hasDateFilter;
+
+  /// The first page of Repeated NCs groups (or the next one, [more]) under the
+  /// current filters and "min. times" pick.
+  Future<void> fetchRepeats({bool more = false}) async {
+    final epoch = _epoch;
+    final seq = ++_repeatsSeq;
+    bool stale() => epoch != _epoch || seq != _repeatsSeq;
+    final page = more ? (repeatRows.length ~/ _repeatsPageSize) + 1 : 1;
+    if (more) {
+      isLoadingMoreRepeats = true;
+    } else {
+      isLoadingRepeats = true;
+      repeatsError = null;
+    }
+    notifyListeners();
+    try {
+      final res = await _dio.get(
+        ApiConstants.ncsRepeats,
+        queryParameters: {...repeatParams, 'page': page, 'limit': _repeatsPageSize},
+      );
+      if (stale()) return;
+      final data = res.data['data'];
+      final rows = data is Map ? (data['rows'] as List? ?? []) : const [];
+      final parsed = [
+        for (final e in rows)
+          ?RepeatGroup.tryParse(e),
+      ];
+      repeatRows = more ? [...repeatRows, ...parsed] : parsed;
+      repeatsTotal = data is Map ? (data['total'] as num?)?.toInt() ?? repeatRows.length : 0;
+    } on DioException catch (e) {
+      if (!stale()) {
+        repeatsError = extractErrorMessage(e, fallback: 'Could not load the repeated NCs.');
+      }
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchRepeats: unreadable answer: $e\n$st');
+      if (!stale()) repeatsError = 'Could not load the repeated NCs.';
+    } finally {
+      if (!stale()) {
+        isLoadingRepeats = false;
+        isLoadingMoreRepeats = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// The NCs behind one Repeated NCs row (GET /ncs/repeats/rows) — populated
+  /// with their audit, raiser and auditee. Null when the request failed.
+  Future<List<NcModel>?> fetchRepeatNcs(List<String> ids) async {
+    if (ids.isEmpty) return const [];
+    final epoch = _epoch;
+    try {
+      final res = await _dio.get(
+        ApiConstants.ncsRepeatRows,
+        queryParameters: {'ids': ids.join(',')},
+      );
+      if (epoch != _epoch) return null;
+      return [
+        for (final e in (res.data['data'] as List? ?? []).whereType<Map>())
+          NcModel.fromJson(Map<String, dynamic>.from(e)),
+      ];
+    } on DioException {
+      return null;
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchRepeatNcs: unreadable answer: $e\n$st');
+      return null;
+    }
+  }
+
+  // An NC moved (this person responded, approved or sent one back): the Reports
+  // tab follows, straight away when it is showing, else on its next opening.
+  void _refreshReports() {
+    if (ncReportsInUse) {
+      fetchNcReport();
+      fetchNcReportStats();
+      fetchRepeats();
+    } else {
+      ncReportsStale = true;
+    }
+  }
+
+  Future<void> fetchCalendarNcs() async {
+    final epoch = _epoch;
+    final seq = ++_calendarSeq;
+    bool stale() => epoch != _epoch || seq != _calendarSeq;
+    isLoadingCalendarNcs = true;
+    notifyListeners();
+    try {
+      final res = await _dio.get(ApiConstants.ncsMine, queryParameters: filterParams);
+      if (stale()) return;
+      calendarNcs = (res.data['data'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => NcModel.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+    } catch (e, st) {
+      debugPrint('NcProvider.fetchCalendarNcs: $e\n$st');
+    } finally {
+      if (!stale()) {
+        isLoadingCalendarNcs = false;
+        notifyListeners();
+      }
+    }
+  }
+
   void setActive(NcModel nc) {
     activeNc = nc;
     notifyListeners();
@@ -281,6 +653,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
       final res = await _dio.post(ApiConstants.ncRespond(ncId), data: form);
       activeNc = NcModel.fromJson(Map<String, dynamic>.from(res.data['data']));
       notifyListeners();
+      _refreshReports();
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(
@@ -323,6 +696,8 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
       _movedToVerification.remove(ncId);
       activeNc = NcModel.fromJson(Map<String, dynamic>.from(res.data['data']));
       notifyListeners();
+      fetchRaisedStats();
+      _refreshReports();
       return null;
     } on DioException catch (e) {
       return extractErrorMessage(e, fallback: 'Could not update this NC.');

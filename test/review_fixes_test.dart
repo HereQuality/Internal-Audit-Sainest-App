@@ -66,7 +66,9 @@ void main() {
 
     final older = provider.fetchMyAudits();
     final newer = provider.fetchMyAudits();
-    await settle();
+    // Both requests must have reached the adapter before the gates are opened. A fixed number
+    // of event-loop turns (settle) is not enough when the whole suite runs in parallel.
+    await waitFor(() => gates.length == 2);
     gates[1].complete();
     await newer;
     gates[0].complete();
@@ -88,7 +90,7 @@ void main() {
 
     final older = provider.fetchAuditDetail('a1', quiet: true);
     final newer = provider.fetchAuditDetail('a1', quiet: true);
-    await settle();
+    await waitFor(() => gates.length == 2); // see fetchMyAudits above: not a fixed settle() under load
     expect(provider.isLoadingDetail, isFalse);
     gates[1].complete();
     await newer;
