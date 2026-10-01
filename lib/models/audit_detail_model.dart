@@ -283,6 +283,10 @@ class AuditDetailModel {
   // upload is server-blocked until then (audit.controller.js's
   // isBeforeScheduledDate), Instant Audits exempt.
   final bool scheduledInFuture;
+  // A repeated audit whose repeat window has closed — "Not Attempted" (server: utils/auditWindow.js).
+  // Its raw [status] stays Not Started / In Progress, so [isNotAttempted] is what screens gate on:
+  // it takes no more work (every action is refused server-side).
+  final bool windowClosed;
   // An Instant Audit stays in "Draft" status for its whole build-and-score
   // life (server forces this on every save) — screens that gate scoring on
   // status (this app reuses one screen for every audit type, unlike the
@@ -355,6 +359,7 @@ class AuditDetailModel {
     required this.isDistributed,
     this.scheduledDate,
     this.scheduledInFuture = false,
+    this.windowClosed = false,
     this.isInstant = false,
     this.auditeeId,
     this.auditeeName,
@@ -380,6 +385,9 @@ class AuditDetailModel {
   });
 
   int get openNcCount => ncs.where((n) => n.status != 'Closed').length;
+
+  /// Closed for good: its repeat window ended before it was completed.
+  bool get isNotAttempted => windowClosed || displayStatus == 'Not Attempted';
 
   /// What the header badge / PDF prints: the unified [displayStatus], else
   /// the raw [status] (older server). Gates keep reading [status].
@@ -407,6 +415,7 @@ class AuditDetailModel {
       isDistributed: json['isDistributed'] as bool? ?? false,
       scheduledDate: json['scheduledDate'] != null ? DateTime.tryParse(json['scheduledDate'].toString()) : null,
       scheduledInFuture: json['scheduledInFuture'] as bool? ?? false,
+      windowClosed: json['windowClosed'] as bool? ?? false,
       isInstant: json['isInstant'] as bool? ?? false,
       auditeeId: idOf(json['auditeeId'])?.toString(),
       auditeeName: json['auditeeId'] is Map ? (json['auditeeId']['employeeName']?.toString()) : null,

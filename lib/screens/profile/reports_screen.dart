@@ -52,7 +52,11 @@ import '../reports/repeated_ncs_tab.dart';
 ///
 /// The Audits tab is narrowed by status chips, a search box and the tiles (each a
 /// tap-filter), mirroring the web app's Final Report page
-/// (client/src/pages/CompletedAudits.jsx). Each card is downloadable as a real
+/// (client/src/pages/CompletedAudits.jsx) — and, like it, all three are the
+/// SERVER's filters: the list is read one page of 20 groups at a time (the next
+/// page as the user scrolls near the end), "N reports" is the server's total, and
+/// a place of the location-wise view loads its own rows when opened, 20 at a time
+/// ("Show more"). Each card is downloadable as a real
 /// PDF (utils/report_pdf_builder.dart — deliberately PDF-only on mobile,
 /// unlike the web per-report page's PDF+Excel dropdown (AuditFullReport.
 /// jsx#handleDownloadExcel) — a single format is enough on a phone, and
@@ -208,9 +212,10 @@ class _ReportsScreenState extends State<ReportsScreen>
   }
 }
 
-// Same "fetch once, filter locally" reasoning — and same matching rules
-// (core/utils/audit_status.dart#auditMatchesStatusFilter) — as
-// my_audits_screen.dart's own chips, in this screen's own order:
+// The chips, in this screen's own order — each one a `status` the SERVER filters
+// the list by (a page is a page of that status; see AuditsProvider
+// #fetchReportAudits), with the same meaning as
+// core/utils/audit_status.dart#auditMatchesStatusFilter gives my_audits_screen's:
 //   * 'All' is the default: the list is every started audit, the same rows
 //     the tiles above count (Total Audits, In Progress, Completed...);
 //   * 'Completed' is every audit whose auditor has finished it — matched on the
@@ -272,8 +277,12 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   late String _search;
   // The tiles picked as filters ('inProgress' | 'overdue' | 'notStarted' |
   // 'onTime' | 'delayed' | 'skipped' | 'notAttempted' | 'other' —
-  // ReportStats.idsFor). Several can be on, they OR together, and
-  // they AND with the chip and the search.
+  // ReportStats.tileStatusLabels / idsFor). Several can be on, they OR together
+  // into the server's `status`, and they AND with the search. The chip and the
+  // tiles are ONE status pick: the server ORs a status list, so "chip AND tile"
+  // cannot be asked for and OR-ing them would list rows the (chip-narrowed) tile
+  // counts do not include — tapping a tile puts the chip back on 'All', tapping a
+  // chip drops the tiles.
   late Set<String> _tiles;
   // Location-wise view: one header per location above its audits.
   late bool _byLocation;
@@ -284,7 +293,11 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   // that header is tapped. More than one can be open at once, unlike
   // _expandedKey above.
   Set<String> _expandedLocationKeys = {};
-  Timer? _statsDebounce;
+  // The search goes to the server once typing pauses (it changes on every key).
+  Timer? _searchDebounce;
+  static const _searchDelay = Duration(milliseconds: 400);
+  // The next page is read when the end of what is loaded is this close.
+  static const _loadMoreExtent = 300.0;
 
   @override
   void initState() {
@@ -294,6 +307,8 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
     _byLocation = _saved.extra['grouped'] == true;
     // A remembered 'completed' tile (the tile no longer exists) must not linger as a hidden filter.
     _tiles = {...?((_saved.extra['tiles'] as List?)?.cast<String>().where((k) => k != 'completed'))};
+    // One status pick (see _tiles): a view remembered with both keeps the tiles.
+    if (_tiles.isNotEmpty) _statusFilter = 'All';
     _expandedKey = _saved.extra['expanded'] as String?;
     _expandedLocationKeys = {
       ...?((_saved.extra['expandedLocations'] as List?)?.cast<String>()),
@@ -302,7 +317,9 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
     _searchController = TextEditingController(text: _saved.search);
     _scroll = ScrollController(initialScrollOffset: _saved.scroll)
       ..addListener(() {
-        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
+        if (!_scroll.hasClients) return;
+        _saved.scroll = _scroll.offset;
+        _maybeLoadMore();
       });
     // Before the host's first load: the tiles must describe these rows.
     _syncQuery(context.read<AuditsProvider>());
@@ -310,15 +327,16 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
 
   @override
   void dispose() {
-    _statsDebounce?.cancel();
+    _searchDebounce?.cancel();
     _searchController.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
-  // The status chip as the server understands it, for the stat tiles: 'All'
-  // means no status filter, the rest are the same labels the list endpoints
-  // take (the legacy 'Completed' is stored-status equality there).
+  // The status chip as the server understands it: 'All' means no status
+  // filter, the rest are the same labels the list endpoints take (the legacy
+  // 'Completed' is stored-status equality there). Both the list and the stat
+  // tiles are asked for it.
   String? get _statsStatus => _statusFilter == 'All' ? null : _statusFilter;
 
   void _syncQuery(AuditsProvider p) {
@@ -328,10 +346,21 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
     p.reportsByLocation = _byLocation;
   }
 
+  // Pull-to-refresh / retry: the first page again (and the tiles).
   Future<void> _reload() {
     final p = context.read<AuditsProvider>();
     _syncQuery(p);
     return Future.wait([p.fetchReportAudits(), p.fetchReportStats()]);
+  }
+
+  // The chip, the search or a tile pick moved: all three are the server's
+  // filters, so the list starts over from its first page ([stats]: and the
+  // tiles / place headers are asked again).
+  void _applyQuery({bool stats = true}) {
+    final p = context.read<AuditsProvider>();
+    _syncQuery(p);
+    p.fetchReportAudits();
+    if (stats) p.fetchReportStats();
   }
 
   void _remember() {
@@ -356,55 +385,89 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   // otherwise.
   bool get _narrowed => _byLocation && _tiles.isNotEmpty;
 
+  // The location-wise switch: the list itself is unchanged, only the place
+  // headers may need the narrowing above.
   void _afterViewChange({required bool wasNarrowed}) {
     _remember();
-    if (wasNarrowed || _narrowed) {
-      _refreshTiles();
-    } else {
-      _syncQuery(context.read<AuditsProvider>());
-    }
+    final p = context.read<AuditsProvider>();
+    _syncQuery(p);
+    if (wasNarrowed || _narrowed) p.fetchReportStats();
+  }
+
+  // A tile tap becomes a `status` on the list request (several OR together), not
+  // a long list of ids. 'other' has no status label (it is asked by ids, which
+  // cannot be OR-ed with a status), so it stands alone.
+  void _setTiles(Set<String> next) {
+    final wasNarrowed = _narrowed;
+    // The chip moves back to 'All' (see _tiles), which changes what the tiles count.
+    final chipMoved = next.isNotEmpty && _statusFilter != 'All';
+    setState(() {
+      _tiles = next;
+      if (next.isNotEmpty) _statusFilter = 'All';
+    });
+    _remember();
+    _applyQuery(stats: chipMoved || wasNarrowed || _narrowed);
   }
 
   void _toggleTile(String key) {
-    final was = _narrowed;
-    setState(
-      () => _tiles = _tiles.contains(key)
-          ? ({..._tiles}..remove(key))
-          : {..._tiles, key},
-    );
-    _afterViewChange(wasNarrowed: was);
+    if (_tiles.contains(key)) {
+      _setTiles({..._tiles}..remove(key));
+      return;
+    }
+    final alone = key == 'other' || _tiles.contains('other');
+    _setTiles(alone ? {key} : {..._tiles, key});
   }
 
   void _clearTiles() {
     if (_tiles.isEmpty) return;
-    final was = _narrowed;
-    setState(() => _tiles = {});
-    _afterViewChange(wasNarrowed: was);
+    _setTiles({});
   }
 
-  // The chip and the search text are client-side filters over the loaded rows
-  // (as ever); the stat tiles ask the server for the same population, so they
-  // are re-requested — the search debounced, it changes on every keystroke.
-  void _refreshTiles({bool debounce = false}) {
+  void _selectChip(String v) {
+    if (v == _statusFilter && _tiles.isEmpty) return;
+    setState(() {
+      _statusFilter = v;
+      _tiles = {};
+    });
+    _remember();
+    _applyQuery();
+  }
+
+  void _onSearchChanged(String v) {
+    _saved.search = v;
+    setState(() => _search = v);
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(_searchDelay, () {
+      if (mounted) _applyQuery();
+    });
+  }
+
+  void _searchNow() {
+    _searchDebounce?.cancel();
+    _applyQuery();
+  }
+
+  // Whether the location-wise view is drawn from the server's place breakdown
+  // (each place then pages its OWN rows) rather than grouping the loaded rows on
+  // the device.
+  bool _serverPlaces(ReportStats? stats) =>
+      stats != null &&
+      stats.byLocation.isNotEmpty &&
+      !stats.byLocation.every((p) => p.auditIds.isEmpty);
+
+  // The next page of the list when the user is within [_loadMoreExtent] of the end
+  // of what is loaded (also called after a build, for a first page too short to
+  // scroll at all). The provider guards a second request while one is on its way,
+  // and a failed page waits for its "Try again". Not in the server-numbered
+  // location-wise view, where it is the open places that page.
+  void _maybeLoadMore() {
+    if (!mounted || !_scroll.hasClients) return;
     final p = context.read<AuditsProvider>();
-    _syncQuery(p);
-    _statsDebounce?.cancel();
-    if (debounce) {
-      _statsDebounce = Timer(const Duration(milliseconds: 450), () {
-        if (mounted) p.fetchReportStats();
-      });
-    } else {
-      p.fetchReportStats();
-    }
-  }
-
-  bool _matchesSearch(AuditModel a) {
-    final q = _search.trim().toLowerCase();
-    if (q.isEmpty) return true;
-    return a.title.toLowerCase().contains(q) ||
-        a.location.toLowerCase().contains(q) ||
-        (a.auditee.name?.toLowerCase().contains(q) ?? false) ||
-        a.auditorNames.any((n) => n.toLowerCase().contains(q));
+    if (!p.reportsHasMore) return;
+    if (_byLocation && _serverPlaces(p.reportStats)) return;
+    final position = _scroll.position;
+    if (!position.hasContentDimensions || position.extentAfter > _loadMoreExtent) return;
+    p.fetchMoreReportAudits();
   }
 
   String _sanitizedFileName(String title) {
@@ -525,48 +588,37 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<AuditsProvider>();
+    // Only the pages loaded so far: the chip, the search and the tile picks are
+    // the server's filters, so these rows are already what they ask for.
     final source = provider.reportAudits;
     final bool showError = provider.reportsError != null && source.isEmpty;
     final bool showLoading =
         provider.isLoadingReports && source.isEmpty && !showError;
-    // The chip and the search narrow the loaded rows on the device; the tiles
-    // then come from the server for the same population (chip + search are sent
-    // with the stats request), tile picks narrowing the rows last.
-    final base = source
-        .where((a) => auditMatchesStatusFilter(a, _statusFilter))
-        .where(_matchesSearch)
-        .toList();
     final bool showEmptyState =
         !showLoading && !showError && source.isEmpty;
     final hasFilters =
         provider.activeFilterCountFor(status: false, flag: false) > 0;
     // The tiles are the server's (GET /audits/report/stats, the same population
-    // as the list), but only while they agree with the rows on screen: the
-    // device's search can be narrower than the server's. When they differ — or
-    // the request failed — the tiles are worked out from the rows, so numbers
-    // match what is listed.
-    final rowStats = ReportStats.fromAudits(base);
-    final serverStats = provider.reportStats;
-    final stats = serverStats != null &&
-            (showLoading || serverStats.totalAudits == rowStats.totalAudits)
-        ? serverStats
-        : rowStats;
-    // A tile pick narrows by the audit ids the tile counted (every member of a
-    // bundle is among them) — the ids, not a re-derivation of the rule.
-    final tileIds = _tiles.isEmpty
-        ? null
-        : {for (final k in _tiles) ...stats.idsFor(k)};
-    final filtered = tileIds == null
-        ? base
-        : base.where((a) => tileIds.contains(a.id)).toList();
-    final items = _groupTopLevel(filtered);
+    // as the list) whenever that request answered. Only a failed one leaves them
+    // to be worked out on the device, from the rows loaded so far — which, the
+    // list being paged, is not necessarily everything: a stopgap that still adds
+    // up to its own Total, never the full-set numbers.
+    final stats = provider.reportStats ?? ReportStats.fromAudits(source);
+    final items = _groupTopLevel(source);
     final scheme = Theme.of(context).colorScheme;
     const gutter = EdgeInsets.symmetric(horizontal: 16);
+    final serverPlaces = _byLocation && _serverPlaces(provider.reportStats);
+    final reportCount = provider.reportsTotal > 0 ? provider.reportsTotal : items.length;
+    // A first page too short to scroll must not leave the next one unread.
+    if (provider.reportsHasMore && !serverPlaces) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _maybeLoadMore());
+    }
 
     return RefreshIndicator(
       onRefresh: _reload,
       child: MaxWidthScroll(
         child: ListView(
+          key: const ValueKey('reports-audits-list'),
           controller: _scroll,
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.only(bottom: 24),
@@ -584,6 +636,7 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
               child: TextField(
+                key: const ValueKey('reports-search'),
                 controller: _searchController,
                 textInputAction: TextInputAction.search,
                 decoration: InputDecoration(
@@ -599,18 +652,15 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                             _searchController.clear();
                             _saved.search = '';
                             setState(() => _search = '');
-                            _refreshTiles();
+                            _searchNow();
                           },
                         ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(10),
                   ),
                 ),
-                onChanged: (v) {
-                  _saved.search = v;
-                  setState(() => _search = v);
-                  _refreshTiles(debounce: true);
-                },
+                onChanged: _onSearchChanged,
+                onSubmitted: (_) => _searchNow(),
               ),
             ),
             StatusFilterChipRow(
@@ -621,11 +671,7 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
               dotColorFor: (o) => o == 'All' || o == AuditStatus.completed
                   ? null
                   : AppColors.readable(context, AppColors.forAuditStatus(o)),
-              onSelected: (v) {
-                setState(() => _statusFilter = v);
-                _remember();
-                _refreshTiles();
-              },
+              onSelected: _selectChip,
             ),
             if (items.isNotEmpty)
               Padding(
@@ -634,7 +680,9 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                   children: [
                     Expanded(
                       child: Text(
-                        '${items.length} ${items.length == 1 ? 'report' : 'reports'}',
+                        // The server's count of every report that matches, not
+                        // only the pages loaded so far.
+                        '$reportCount ${reportCount == 1 ? 'report' : 'reports'}',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: scheme.outline,
                           fontWeight: FontWeight.w600,
@@ -672,39 +720,7 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
             else if (showEmptyState)
               SizedBox(
                 height: MediaQuery.of(context).size.height * 0.4,
-                child: hasFilters
-                    ? EmptyState(
-                        icon: Icons.filter_alt_off_outlined,
-                        title: 'No audits match your filters',
-                        subtitle:
-                            'Try widening the people, place or date range.',
-                        action: OutlinedButton.icon(
-                          onPressed: () => applyAuditFilterSelection(
-                            context,
-                            AuditFilterSelection.cleared,
-                          ),
-                          icon: const Icon(Icons.filter_alt_off_outlined),
-                          label: const Text('Clear filters'),
-                        ),
-                      )
-                    : const EmptyState(
-                        icon: Icons.description_outlined,
-                        title: 'No reports yet',
-                        subtitle:
-                            'Audits you are on show up here once they start. Pick All Members to include the places you belong to or lead.',
-                      ),
-              )
-            else if (items.isEmpty)
-              SizedBox(
-                height: MediaQuery.of(context).size.height * 0.4,
-                child: EmptyState(
-                  icon: Icons.filter_alt_off_outlined,
-                  title: _tiles.isNotEmpty
-                      ? 'No audits under the picked tiles'
-                      : _search.trim().isNotEmpty
-                      ? 'No audits match your filters'
-                      : auditStatusEmptyTitle(_statusFilter),
-                ),
+                child: _emptyState(hasFilters),
               )
             else
               Padding(
@@ -712,7 +728,7 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: _byLocation
-                      ? _locationSections(items, filtered, stats)
+                      ? _locationSections(provider, items, stats)
                       : [
                           for (int i = 0; i < items.length; i++) ...[
                             _buildItem(items[i]),
@@ -721,10 +737,81 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                         ],
                 ),
               ),
+            // The next page: a spinner while it loads, "Try again" when it failed
+            // (what is loaded stays). Not under the server-numbered location-wise
+            // view, whose places page their own rows.
+            if (!serverPlaces && !showLoading && !showError && source.isNotEmpty)
+              _loadMoreFooter(provider),
           ],
         ),
       ),
     );
+  }
+
+  Widget _emptyState(bool hasFilters) {
+    if (_tiles.isNotEmpty) {
+      return const EmptyState(
+        icon: Icons.filter_alt_off_outlined,
+        title: 'No audits under the picked tiles',
+      );
+    }
+    if (_search.trim().isNotEmpty) {
+      return const EmptyState(
+        icon: Icons.filter_alt_off_outlined,
+        title: 'No audits match your filters',
+      );
+    }
+    if (_statusFilter != 'All') {
+      return EmptyState(
+        icon: Icons.filter_alt_off_outlined,
+        title: auditStatusEmptyTitle(_statusFilter),
+      );
+    }
+    return hasFilters
+        ? EmptyState(
+            icon: Icons.filter_alt_off_outlined,
+            title: 'No audits match your filters',
+            subtitle: 'Try widening the people, place or date range.',
+            action: OutlinedButton.icon(
+              onPressed: () => applyAuditFilterSelection(
+                context,
+                AuditFilterSelection.cleared,
+              ),
+              icon: const Icon(Icons.filter_alt_off_outlined),
+              label: const Text('Clear filters'),
+            ),
+          )
+        : const EmptyState(
+            icon: Icons.description_outlined,
+            title: 'No reports yet',
+            subtitle:
+                'Audits you are on show up here once they start. Pick All Members to include the places you belong to or lead.',
+          );
+  }
+
+  // The end of the flat list: the next page loading, or why it did not.
+  Widget _loadMoreFooter(AuditsProvider p) {
+    if (p.isLoadingMoreReports) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: SizedBox(
+            key: ValueKey('reports-more-spinner'),
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (p.reportsMoreError != null) {
+      return _RetryRow(
+        message: p.reportsMoreError!,
+        buttonKey: const ValueKey('reports-more-retry'),
+        onRetry: () => p.fetchMoreReportAudits(retry: true),
+      );
+    }
+    return const SizedBox.shrink();
   }
 
   // What the tiles are "of": the picked places.
@@ -762,27 +849,37 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   //
   // The header numbers are the SERVER's `byLocation` (over the whole filtered
   // set, narrowed to the tile's audits while a tile is picked), never worked
-  // out from the rows loaded here; `auditIds` says which loaded rows sit under
-  // which header. Only when the server sent no breakdown (an older server, a
-  // failed request) does the view group the rows by their own place and count
+  // out from the rows loaded here. A place's rows are read lazily, once its
+  // header is opened, by the audit ids that header counted — [_placeSection].
+  // Only when the server sent no breakdown (an older server, a failed request)
+  // does the view group the rows loaded so far by their own place and count
   // them on the device.
   List<Widget> _locationSections(
+    AuditsProvider provider,
     List<_TopLevelItem> items,
-    List<AuditModel> filtered,
     ReportStats stats,
   ) {
-    final places = stats.byLocation;
-    if (places.isEmpty || places.every((p) => p.auditIds.isEmpty)) {
-      return _localLocationSections(items);
-    }
-    return [for (final place in places) ..._placeSection(place, filtered)];
+    if (!_serverPlaces(stats)) return _localLocationSections(items);
+    return [for (final place in stats.byLocation) ..._placeSection(provider, place)];
   }
 
-  // One place: its server-numbered header and, once opened, its rows.
-  List<Widget> _placeSection(ReportLocationStats place, List<AuditModel> filtered) {
-    final ids = place.auditIds.toSet();
-    final rows = [for (final a in filtered) if (ids.contains(a.id)) a];
+  // One place: its server-numbered header and, once opened, its rows — the first
+  // [AuditsProvider.reportPlacePageSize] of its audits, then "Show more".
+  List<Widget> _placeSection(AuditsProvider provider, ReportLocationStats place) {
     final expanded = _expandedLocationKeys.contains(place.key);
+    final loaded = provider.reportPlaces[place.key];
+    if (expanded && loaded == null && !provider.isLoadingReportStats) {
+      // An opened place nobody has read yet. Not while the stats are on their way
+      // again: its audit ids come from them, and what is asked then is the
+      // newest ids, looked up by the place's key when the frame is over.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        final p = context.read<AuditsProvider>();
+        final current = p.reportStats?.byLocation.where((x) => x.key == place.key).firstOrNull;
+        if (current != null && !p.isLoadingReportStats) p.loadReportPlaceRows(current);
+      });
+    }
+    final remaining = place.auditIds.length - (loaded?.consumed ?? 0);
     return [
       _LocationHeader(
         label: place.label,
@@ -793,15 +890,45 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
         isExpanded: expanded,
         onToggle: () => _toggleLocationGroup(place.key),
       ),
-      if (expanded)
-        for (final item in _explodeBundles(_groupTopLevel(rows))) ...[
-          _buildItem(item),
-          const SizedBox(height: 10),
-        ],
+      if (expanded) ...[
+        if (loaded != null)
+          for (final item in _explodeBundles(_groupTopLevel(loaded.audits))) ...[
+            _buildItem(item),
+            const SizedBox(height: 10),
+          ],
+        if (loaded == null || loaded.loading)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          )
+        else if (loaded.error != null)
+          _RetryRow(
+            message: loaded.error!,
+            buttonKey: ValueKey('place-retry-${place.key}'),
+            onRetry: () => provider.loadReportPlaceRows(place),
+          )
+        else if (remaining > 0)
+          Align(
+            alignment: Alignment.center,
+            child: TextButton.icon(
+              key: ValueKey('place-more-${place.key}'),
+              onPressed: () => provider.loadReportPlaceRows(place),
+              icon: const Icon(Icons.expand_more),
+              label: const Text('Show more'),
+            ),
+          ),
+      ],
     ];
   }
 
-  // The on-device grouping (see _locationSections): by each row's own place.
+  // The on-device grouping (see _locationSections): by each row's own place — of
+  // the rows loaded so far (the scroll keeps reading pages while this is drawn).
   List<Widget> _localLocationSections(List<_TopLevelItem> items) {
     final exploded = _explodeBundles(items);
     final groups = <String, List<_TopLevelItem>>{};
@@ -1147,6 +1274,39 @@ class _ReportStatTiles extends StatelessWidget {
         ],
         ReportTileGrid(tiles: tiles),
       ],
+    );
+  }
+}
+
+/// "Could not load more" with a "Try again" button — the foot of a page, or of one
+/// place's rows, that failed (what is loaded stays above it).
+class _RetryRow extends StatelessWidget {
+  final String message;
+  final Key buttonKey;
+  final VoidCallback onRetry;
+
+  const _RetryRow({required this.message, required this.buttonKey, required this.onRetry});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        children: [
+          Text(
+            message,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.error),
+          ),
+          TextButton.icon(
+            key: buttonKey,
+            onPressed: onRetry,
+            icon: const Icon(Icons.refresh, size: 18),
+            label: const Text('Try again'),
+          ),
+        ],
+      ),
     );
   }
 }

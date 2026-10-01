@@ -85,6 +85,29 @@ class ReportLocationStats {
   }
 }
 
+/// One place header's rows in the location-wise view, loaded lazily a slice of
+/// its audit ids at a time (AuditsProvider#loadReportPlaceRows).
+class ReportPlaceRows {
+  /// The rows read so far, in the server's order.
+  final List<AuditModel> audits;
+
+  /// How many of the header's [ReportLocationStats.auditIds] have been read —
+  /// where the next slice starts.
+  final int consumed;
+
+  /// A slice is on its way / the last slice could not be read (what was read
+  /// stays, the next call retries it).
+  final bool loading;
+  final String? error;
+
+  const ReportPlaceRows({
+    this.audits = const [],
+    this.consumed = 0,
+    this.loading = false,
+    this.error,
+  });
+}
+
 double _num0(dynamic v) => v is num ? v.toDouble() : double.tryParse('$v') ?? 0;
 int _int0(dynamic v) => v is num ? v.toInt() : int.tryParse('$v') ?? 0;
 List<String> _strings(dynamic v) =>
@@ -194,6 +217,37 @@ class ReportStats {
   int get bucketsTotal =>
       inProgress + overdue + notStarted + onTimeCompleted + delayedCompleted + skipped + other;
 
+  /// The `status` label the list endpoint (GET /audits/report) filters by for each
+  /// tile — what a tap on the tile asks the server for, instead of a long list of
+  /// ids. Each is the label the tile counts ("zones in that state": a Skipped tile
+  /// really returns the Skipped audits, the server lifting its default Skipped
+  /// exclusion for it). Not here: 'other' (a bundle that fits no bucket has no
+  /// label — it is asked by [idsFor]) and the retired 'completed'.
+  static const tileStatusLabels = <String, String>{
+    'inProgress': AuditStatus.inProgress,
+    'overdue': AuditStatus.overdue,
+    'notStarted': AuditStatus.notStarted,
+    'onTime': AuditStatus.onTimeCompleted,
+    'delayed': AuditStatus.delayedCompleted,
+    'skipped': AuditStatus.skipped,
+    'notAttempted': AuditStatus.notAttempted,
+  };
+
+  /// The comma-separated `status` value (the server ORs the labels) for the status
+  /// [chip] ('All' or null = none) together with the picked [tiles]; null when
+  /// nothing narrows. Deduplicated, the chip first, then the tiles in the order
+  /// the tile row shows them (never in the order they were tapped, so the same
+  /// picks always read as the same query).
+  static String? statusCsv({String? chip, Iterable<String> tiles = const []}) {
+    final picked = tiles.toSet();
+    final labels = <String>{
+      if (chip != null && chip != 'All') chip,
+      for (final e in tileStatusLabels.entries)
+        if (picked.contains(e.key)) e.value,
+    };
+    return labels.isEmpty ? null : labels.join(',');
+  }
+
   /// The ids behind the tile [key] ('inProgress' | 'completed' | 'onTime' |
   /// 'delayed' | 'overdue' | 'notStarted' | 'skipped' | 'notAttempted' |
   /// 'other'), empty for anything else.
@@ -279,9 +333,12 @@ class ReportStats {
     );
   }
 
-  /// The same numbers worked out from the audits already loaded — the
-  /// fallback when the stats endpoint isn't reachable for this role, and what
-  /// keeps the tiles honest for exactly the rows on screen. Bundles (same
+  /// The same numbers worked out from the audits already loaded — ONLY the
+  /// fallback for a failed stats request (the endpoint isn't reachable for this
+  /// role). The list is read one page at a time now, so this describes the rows
+  /// loaded SO FAR (and, with a status / tile / search narrowing, only those the
+  /// server returned for it) — not the whole filtered set the server's tiles
+  /// count; the screen says nothing more than the numbers. Bundles (same
   /// scheduleBatchId, more than one visible) count once.
   ///
   /// The server's two 2026-09-30 rules apply here too: [totalAudits] leaves out

@@ -372,7 +372,10 @@ void main() {
       await pump(tester);
       await tester.tap(find.widgetWithText(FilterChip, 'Group by location'));
       await tester.pumpAndSettle();
-      expect(find.text('1 report'), findsOneWidget);
+      // The list's own count line and the place header both read "1 report"; the header carries no score
+      // ("1 report", not "1 report · 0%").
+      expect(find.text('1 report'), findsNWidgets(2));
+      expect(find.textContaining('1 report ·'), findsNothing);
     });
   });
 }

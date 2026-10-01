@@ -29,6 +29,7 @@ import 'package:internal_audit_app/screens/root/app_shell.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'support/report_list_fake.dart';
 import 'support/session_fakes.dart';
 
 /// The Reports tab (Final Report): the ReportStats / NC tile models, the
@@ -205,7 +206,9 @@ void main() {
       await p.fetchReportAudits();
       expect(adapter.requests.last.path, ApiConstants.auditsReport);
       expect(adapter.requests.last.queryParameters['employeeIds'], 'me');
-      expect(adapter.requests.last.queryParameters['limit'], 100);
+      // One page of 20 groups at a time (was: every page, 100 groups each).
+      expect(adapter.requests.last.queryParameters['limit'], 20);
+      expect(adapter.requests.last.queryParameters['page'], 1);
 
       p.setFilterState(isTeam: true, locations: ['zoneA'], departments: ['qa'], auditTypes: ['Safety']);
       await p.fetchReportAudits();
@@ -219,20 +222,26 @@ void main() {
       expect(adapter.requests.where((r) => r.path == ApiConstants.auditsAtPlacesILead), isEmpty);
     });
 
-    test('pages over GROUPS: the last page comes from `total`, not from how many rows arrived', () async {
-      // 120 groups; the first page holds a bundle whose zones push it to 103 rows.
+    test('pages over GROUPS: one page is read at a time, and the end comes from `total`, not from how many rows arrived', () async {
+      // 120 groups, 20 to a page; the first page holds a bundle whose zones push it to 23 rows.
       Map<String, dynamic> row(int i) => {'_id': 'r$i', 'title': 'T$i', 'scope': '', 'status': 'Completed'};
       adapter.handler = (o) async {
         if (o.path != ApiConstants.auditsReport) return json(200, {'isOk': true, 'data': []});
         final page = o.queryParameters['page'] as int;
-        final rows = page == 1 ? [for (var i = 0; i < 103; i++) row(i)] : [for (var i = 103; i < 123; i++) row(i)];
-        return json(200, {'isOk': true, 'data': {'audits': rows, 'total': 120, 'page': page, 'limit': 100}});
+        final rows = page == 1 ? [for (var i = 0; i < 23; i++) row(i)] : [for (var i = 23; i < 43; i++) row(i)];
+        return json(200, {'isOk': true, 'data': {'audits': rows, 'total': 120, 'page': page, 'limit': 20}});
       };
       final p = AuditsProvider();
       await p.fetchReportAudits();
-      expect(adapter.requests.where((r) => r.path == ApiConstants.auditsReport), hasLength(2));
-      expect(p.reportAudits, hasLength(123));
+      // Was: every page of the 120 up front. Now: just the first.
+      expect(adapter.requests.where((r) => r.path == ApiConstants.auditsReport), hasLength(1));
+      expect(p.reportAudits, hasLength(23));
+      expect(p.reportsTotal, 120);
+      expect(p.reportsHasMore, isTrue, reason: '23 rows is not 120 groups: more pages are left');
       expect(p.reportsError, isNull);
+      await p.fetchMoreReportAudits();
+      expect(p.reportAudits, hasLength(43));
+      expect(p.reportsHasMore, isTrue, reason: 'two pages of 20 groups is not 120');
     });
 
     test('a filter change refetches the list and tiles only while the tab is showing; otherwise it is marked stale', () async {
@@ -311,7 +320,10 @@ void main() {
       expect(q['fromDate'], '2026-01-05');
       expect(q['toDate'], '2026-02-06');
       expect(q['search'], 'guard');
-      expect(q['limit'], 100);
+      // One page of 20 audits at a time (was: every page, 100 audits each).
+      expect(q['limit'], 20);
+      expect(q['page'], 1);
+      expect(q['groupBy'], 'audit');
 
       await p.fetchNcReportStats();
       final s = adapter.requests.firstWhere((r) => r.path == ApiConstants.ncsReportStats).queryParameters;
@@ -441,7 +453,7 @@ void main() {
       expect(find.text('Weekly hygiene'), findsOneWidget);
     });
 
-    testWidgets('an audit tile is a tap-filter by the ids the server counted; Total Audits clears it', (tester) async {
+    testWidgets('an audit tile is a tap-filter by the `status` the server filters on; Total Audits clears it', (tester) async {
       backend
         ..audits = [
           _audit('d1', title: 'Late one'),
@@ -453,21 +465,30 @@ void main() {
       expect(find.text('Late one'), findsOneWidget);
       expect(find.text('On time one'), findsOneWidget);
       expect(find.text('Running one'), findsOneWidget);
+      Map<String, dynamic> lastList() =>
+          adapter.requests.lastWhere((r) => r.path == ApiConstants.auditsReport).queryParameters;
+      expect(lastList().containsKey('status'), isFalse);
 
+      // Was: the screen kept the tile's ids and narrowed the loaded list itself.
       await tester.tap(find.byKey(const ValueKey('report-tile-delayed')));
       await tester.pumpAndSettle();
+      expect(lastList()['status'], 'Delayed Completed');
+      expect(lastList()['page'], 1);
+      expect(lastList().containsKey('ids'), isFalse, reason: 'a tile is a status, not a long list of ids');
       expect(find.text('Late one'), findsOneWidget);
       expect(find.text('On time one'), findsNothing);
       expect(find.text('Running one'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('report-tile-inProgress')));
       await tester.pumpAndSettle();
-      expect(find.text('Late one'), findsOneWidget, reason: 'picked tiles OR together');
+      expect(lastList()['status'], 'In Progress,Delayed Completed', reason: 'picked tiles OR together as a csv');
+      expect(find.text('Late one'), findsOneWidget);
       expect(find.text('Running one'), findsOneWidget);
       expect(find.text('On time one'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('report-tile-total')));
       await tester.pumpAndSettle();
+      expect(lastList().containsKey('status'), isFalse);
       expect(find.text('On time one'), findsOneWidget);
     });
 
@@ -498,6 +519,10 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('Late one'), findsOneWidget);
       expect(find.text('On time one'), findsOneWidget);
+      // Read when the place was opened, by exactly the ids its header counted.
+      final placeRead = adapter.requests.where((r) => r.path == ApiConstants.auditsReport && r.queryParameters.containsKey('ids'));
+      expect(placeRead, hasLength(1));
+      expect(placeRead.single.queryParameters['ids'], 'd1,o1');
     });
 
     testWidgets('location-wise with a tile picked asks the server for headers over just the tile\'s audits', (tester) async {
@@ -987,32 +1012,40 @@ void main() {
       expect(find.text('Floor wet'), findsNothing, reason: 'that one is at Plant B');
     });
 
-    test('groupBy=audit goes with every paged NC request (never with ids), pages by AUDIT, and the totals are the server\'s', () async {
+    test('groupBy=audit goes with every paged NC request (never with ids), pages by AUDIT, one page at a time, and the totals are the server\'s', () async {
       Map<String, dynamic> one(int i) => _nc('r$i');
       adapter.handler = (o) async {
         if (o.path != ApiConstants.ncsReport) return json(200, {'isOk': true, 'data': []});
         final page = o.queryParameters['page'] as int;
-        // 120 audits; the first page holds a 3-NC audit, so more rows than `limit`.
+        // 120 audits, 20 to a page; the first page holds a 3-NC audit, so more rows than `limit`.
         final rows = page == 1
-            ? [for (var i = 0; i < 102; i++) one(i)]
-            : [for (var i = 102; i < 122; i++) one(i)];
+            ? [for (var i = 0; i < 22; i++) one(i)]
+            : [for (var i = 22; i < 42; i++) one(i)];
         return json(200, {
           'isOk': true,
-          'data': {'ncs': rows, 'total': 120, 'totalNcs': 122, 'page': page, 'limit': 100},
+          'data': {'ncs': rows, 'total': 120, 'totalNcs': 142, 'page': page, 'limit': 20},
         });
       };
       final p = NcProvider()..setSelfEmployeeId('me');
       await p.fetchNcReport();
-      final paged = adapter.requests.where((r) => r.path == ApiConstants.ncsReport).toList();
-      expect(paged, hasLength(2), reason: 'the last page comes from the audit total');
+      // Was: every page of the 120 audits up front. Now: just the first.
+      var paged = adapter.requests.where((r) => r.path == ApiConstants.ncsReport).toList();
+      expect(paged, hasLength(1));
+      expect(p.reportNcs, hasLength(22));
+      expect(p.reportList.hasMore, isTrue, reason: '22 NCs is not 120 audits: the end comes from `total`');
+      expect(p.ncReportTotalAudits, 120);
+      expect(p.ncReportTotalNcs, 142);
+
+      await p.reportList.loadMore();
+      paged = adapter.requests.where((r) => r.path == ApiConstants.ncsReport).toList();
+      expect(paged, hasLength(2));
+      expect(paged.last.queryParameters['page'], 2);
+      expect(p.reportNcs, hasLength(42));
       for (final r in paged) {
         expect(r.queryParameters['groupBy'], 'audit');
         expect(r.queryParameters.containsKey('ids'), isFalse);
-        expect(r.queryParameters['limit'], 100);
+        expect(r.queryParameters['limit'], 20);
       }
-      expect(p.reportNcs, hasLength(122));
-      expect(p.ncReportTotalAudits, 120);
-      expect(p.ncReportTotalNcs, 122);
 
       // Tile stats are not paged: no groupBy there.
       await p.fetchNcReportStats();
@@ -1204,10 +1237,8 @@ class _Backend {
   Future<ResponseBody> handle(RequestOptions o) async {
     switch (o.path) {
       case ApiConstants.auditsReport:
-        return json(200, {
-          'isOk': true,
-          'data': {'audits': audits, 'total': audits.length, 'page': 1, 'limit': 100},
-        });
+        // The server filters by status / search / ids and pages over groups.
+        return json(200, {'isOk': true, 'data': reportListData(audits, o.queryParameters)});
       case ApiConstants.auditsReportStats:
         return auditStats == null ? json(403, {'isOk': false}) : json(200, {'isOk': true, 'data': auditStats});
       case ApiConstants.ncsReport:

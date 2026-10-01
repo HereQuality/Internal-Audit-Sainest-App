@@ -9,11 +9,13 @@ import '../../models/nc_model.dart';
 import '../../models/nc_report_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/list_view_memory.dart';
+import '../../providers/nc_paged_list.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/max_width_scroll.dart';
+import '../../widgets/nc_page_footer.dart';
 import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
 import '../nc/nc_response_screen.dart';
@@ -39,13 +41,18 @@ void openNcFromReport(BuildContext context, NcModel nc) {
 
 /// The Final Report's NCs tab: the six NC tiles (each a tap-filter by the NC ids
 /// it counted), search, "Group by location" and the NC list — every NC the
-/// caller may see under the shared filter bar (GET /ncs/report).
+/// caller may see under the shared filter bar (GET /ncs/report), ONE page (20
+/// audits, every NC of each) at a time: the next page loads by itself as the tab
+/// scrolls near its end.
 ///
 /// The bucket pill and the place of each row are the SERVER's (`bucket`,
-/// `placeLabel`) — nothing here decides which bucket an NC is in. In the
-/// location-wise view the place headers are the server's `byLocation` too (its
-/// total and bucket tallies over the whole filtered set), with `ncIds` saying
-/// which loaded rows sit under which header.
+/// `placeLabel`) — nothing here decides which bucket an NC is in. A tile pick is
+/// the server's too: the tab reads just the NCs the tiles counted (by id, a page
+/// at a time). In the location-wise view the place headers are the server's
+/// `byLocation` (its total and bucket tallies over the whole filtered set), and
+/// each place that is opened reads ITS NCs (the header's `ncIds`) a page at a
+/// time — "Show N more" under the rows, or by itself for the lowest open place as
+/// the tab scrolls.
 class NcReportTab extends StatefulWidget {
   const NcReportTab({super.key});
 
@@ -55,6 +62,9 @@ class NcReportTab extends StatefulWidget {
 
 class _NcReportTabState extends State<NcReportTab> {
   static const _memoryId = 'reports-ncs';
+
+  /// Search text goes to the server this long after the last keystroke.
+  static const _searchDelay = Duration(milliseconds: 400);
 
   late final ListScreenMemory _saved;
   late final ScrollController _scroll;
@@ -67,6 +77,10 @@ class _NcReportTabState extends State<NcReportTab> {
   // location-wise view — one audit can sit under two places).
   Set<String> _expandedAudits = {};
   Timer? _searchDebounce;
+  bool _afterBuildQueued = false;
+  // How many first pages had landed when this tab last looked: one more means the
+  // list was replaced (a filter moved) and the scroll goes back to the top.
+  late int _seenFirstPages;
 
   @override
   void initState() {
@@ -77,12 +91,11 @@ class _NcReportTabState extends State<NcReportTab> {
     _expandedPlaces = {...?((_saved.extra['expandedLocations'] as List?)?.cast<String>())};
     _expandedAudits = {...?((_saved.extra['expandedAudits'] as List?)?.cast<String>())};
     _searchController = TextEditingController(text: _saved.search);
-    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
-      ..addListener(() {
-        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
-      });
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)..addListener(_onScroll);
     // Before the host's first load: the request must carry what this tab shows.
-    _syncQuery(context.read<NcProvider>());
+    final p = context.read<NcProvider>();
+    _syncQuery(p);
+    _seenFirstPages = p.reportList.firstPageCount;
   }
 
   @override
@@ -118,10 +131,13 @@ class _NcReportTabState extends State<NcReportTab> {
   // again whenever that narrowing starts, changes or ends — and not otherwise.
   bool get _narrowed => _byLocation && _tiles.isNotEmpty;
 
-  void _afterChange({required bool wasNarrowed}) {
+  // [reloadList]: the tile picks changed, so the NC list is a different list —
+  // its page 1 is read again (the ids it needs are already held).
+  void _afterChange({required bool wasNarrowed, bool reloadList = false}) {
     _remember();
     final p = context.read<NcProvider>();
     _syncQuery(p);
+    if (reloadList) p.fetchNcReport(fresh: false);
     if (wasNarrowed || _narrowed) p.fetchNcReportStats();
   }
 
@@ -132,14 +148,14 @@ class _NcReportTabState extends State<NcReportTab> {
           ? ({..._tiles}..remove(bucket))
           : {..._tiles, bucket},
     );
-    _afterChange(wasNarrowed: was);
+    _afterChange(wasNarrowed: was, reloadList: true);
   }
 
   void _clearTiles() {
     if (_tiles.isEmpty) return;
     final was = _narrowed;
     setState(() => _tiles = {});
-    _afterChange(wasNarrowed: was);
+    _afterChange(wasNarrowed: was, reloadList: true);
   }
 
   // The search goes to the server (GET /ncs/report?search=) so the list, the
@@ -149,28 +165,97 @@ class _NcReportTabState extends State<NcReportTab> {
     _saved.search = v;
     setState(() {});
     _searchDebounce?.cancel();
-    _searchDebounce = Timer(Duration(milliseconds: v.isEmpty ? 0 : 450), () {
+    _searchDebounce = Timer(v.isEmpty ? Duration.zero : _searchDelay, () {
       if (mounted) _reload();
+    });
+  }
+
+  // ── paging ────────────────────────────────────────────────────────────────
+
+  /// The places the server tallied, when it also said which NCs sit under each
+  /// (without that — a failed stats request — the loaded rows are grouped by their
+  /// own `placeLabel` on the device instead).
+  List<NcLocationStats> _serverPlaces(NcTileStats? stats) {
+    final places = stats?.byLocation ?? const <NcLocationStats>[];
+    return places.any((pl) => pl.ncIds.isNotEmpty) ? places : const [];
+  }
+
+  // The list a scroll to the end loads more of: the NC list itself, or — in the
+  // location-wise view — the lowest opened place that has more left.
+  NcPagedList? _loadMoreList(NcProvider p) {
+    if (!_byLocation) return p.reportList;
+    final places = _serverPlaces(p.ncReportStats);
+    if (places.isEmpty) return p.reportList;
+    NcPagedList? last;
+    for (final place in places) {
+      if (!_expandedPlaces.contains(place.key)) continue;
+      final list = p.peekNcReportPlaceList(place.key);
+      if (list != null && list.hasMore) last = list;
+    }
+    return last;
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    _saved.scroll = _scroll.offset;
+    _maybeLoadMore();
+  }
+
+  void _maybeLoadMore() {
+    final list = _loadMoreList(context.read<NcProvider>());
+    if (list == null || !list.hasMore || list.isLoading || list.isLoadingMore) return;
+    if (nearListEnd(_scroll)) list.loadMore();
+  }
+
+  // After each build: back to the top when the list was replaced, and keep loading
+  // while the end is still near (a tall screen — or a short page — would otherwise
+  // never scroll, so never ask for more).
+  void _afterBuild(NcProvider p) {
+    if (_afterBuildQueued) return;
+    final replaced = p.reportList.firstPageCount != _seenFirstPages;
+    final list = _loadMoreList(p);
+    final canLoad =
+        list != null && list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
+    if (!replaced && !canLoad) return;
+    _afterBuildQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _afterBuildQueued = false;
+      if (!mounted) return;
+      final count = context.read<NcProvider>().reportList.firstPageCount;
+      if (count != _seenFirstPages) {
+        _seenFirstPages = count;
+        _saved.scroll = 0;
+        if (_scroll.hasClients && _scroll.offset > 0) _scroll.jumpTo(0);
+      }
+      _maybeLoadMore();
+    });
+  }
+
+  // A place that was opened reads its NCs when first shown (and again after its
+  // ids moved — NcProvider drops or refreshes the lists then).
+  void _ensurePlaceLoaded(NcProvider p, String key, NcPagedList list) {
+    if (list.hasLoaded || list.isLoading || list.error != null || p.isLoadingNcReportStats) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || list.hasLoaded || list.isLoading || list.error != null) return;
+      // Not one NcProvider has since dropped (the filters moved meanwhile).
+      if (!identical(context.read<NcProvider>().peekNcReportPlaceList(key), list)) return;
+      list.loadFirst();
     });
   }
 
   @override
   Widget build(BuildContext context) {
     final p = context.watch<NcProvider>();
+    final list = p.reportList;
     final rows = p.reportNcs;
     final stats = p.ncReportStats;
     final showError = p.ncReportError != null && rows.isEmpty;
-    final showLoading = p.isLoadingNcReport && rows.isEmpty && !showError;
-    // A tile pick narrows by the NC ids the tile counted — the server's list,
-    // not a re-derivation of its bucket rule.
-    final tileIds = _tiles.isEmpty || stats == null
-        ? null
-        : {for (final k in _tiles) ...stats.idsFor(k)};
-    final filtered = tileIds == null
-        ? rows
-        : [for (final nc in rows) if (tileIds.contains(nc.id)) nc];
+    final showLoading = !showError && rows.isEmpty && (p.isLoadingNcReport || !list.hasLoaded);
+    final places = _serverPlaces(stats);
+    final placeMode = _byLocation && places.isNotEmpty;
     final scheme = Theme.of(context).colorScheme;
     final hasFilters = p.activeFilterCountFor(status: false) > 0;
+    _afterBuild(p);
 
     return RefreshIndicator(
       onRefresh: _reload,
@@ -216,14 +301,14 @@ class _NcReportTabState extends State<NcReportTab> {
                 ),
               ),
             ),
-            if (filtered.isNotEmpty)
+            if (rows.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                 child: Row(
                   children: [
                     Expanded(
                       child: Text(
-                        _countLine(p, filtered, tileIds != null),
+                        _countLine(p),
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: scheme.outline,
                           fontWeight: FontWeight.w600,
@@ -255,7 +340,12 @@ class _NcReportTabState extends State<NcReportTab> {
             else if (rows.isEmpty)
               SizedBox(
                 height: MediaQuery.of(context).size.height * 0.4,
-                child: hasFilters || _searchController.text.isNotEmpty
+                child: _tiles.isNotEmpty
+                    ? const EmptyState(
+                        icon: Icons.filter_alt_off_outlined,
+                        title: 'No NCs under the picked tiles',
+                      )
+                    : hasFilters || _searchController.text.isNotEmpty
                     ? EmptyState(
                         icon: Icons.filter_alt_off_outlined,
                         title: 'No NCs match your filters',
@@ -273,22 +363,26 @@ class _NcReportTabState extends State<NcReportTab> {
                         subtitle: 'NCs you raised or are answerable for show up here.',
                       ),
               )
-            else if (filtered.isEmpty)
-              SizedBox(
-                height: MediaQuery.of(context).size.height * 0.4,
-                child: const EmptyState(
-                  icon: Icons.filter_alt_off_outlined,
-                  title: 'No NCs under the picked tiles',
-                ),
-              )
             else
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: _byLocation
-                      ? _placeSections(filtered, stats)
-                      : _auditItems(filtered, scope: ''),
+                  children: [
+                    if (_byLocation)
+                      ..._placeSections(p, rows, places)
+                    else
+                      ..._auditItems(rows, scope: ''),
+                    // The place view reads each opened place's own pages (their
+                    // footers sit under their rows); everything else is the one list.
+                    if (!placeMode)
+                      NcPageFooter(
+                        hasMore: list.hasMore,
+                        isLoadingMore: list.isLoadingMore,
+                        error: list.moreError,
+                        onRetry: () => list.loadMore(retry: true),
+                      ),
+                  ],
                 ),
               ),
           ],
@@ -297,15 +391,17 @@ class _NcReportTabState extends State<NcReportTab> {
     );
   }
 
-  // "86 NCs · 41 audits": the server's own totals for what the filters match
-  // (true even when fewer rows were loaded); with a tile picked, what the tile
-  // leaves — counted from those rows.
-  String _countLine(NcProvider p, List<NcModel> rows, bool tilePicked) {
-    final ncs = tilePicked ? rows.length : (p.ncReportTotalNcs ?? rows.length);
-    final audits = tilePicked
-        ? groupNcsByAudit(rows).length
-        : (p.ncReportTotalAudits ?? groupNcsByAudit(rows).length);
-    return '$ncs ${ncs == 1 ? 'NC' : 'NCs'} · $audits ${audits == 1 ? 'audit' : 'audits'}';
+  // "86 NCs · 41 audits": the server's own totals for what the filters match (true
+  // even when fewer rows were loaded). With a tile picked the NCs are read by id:
+  // the server counts the audits only for its own pages, so that half appears once
+  // every NC of the pick has arrived and the audits can be counted from them.
+  String _countLine(NcProvider p) {
+    final rows = p.reportNcs;
+    final ncs = p.ncReportTotalNcs ?? rows.length;
+    final audits =
+        p.ncReportTotalAudits ?? (p.reportList.hasMore ? null : groupNcsByAudit(rows).length);
+    final nc = '$ncs ${ncs == 1 ? 'NC' : 'NCs'}';
+    return audits == null ? nc : '$nc · $audits ${audits == 1 ? 'audit' : 'audits'}';
   }
 
   void _toggleAudit(String key) {
@@ -317,7 +413,8 @@ class _NcReportTabState extends State<NcReportTab> {
 
   // [rows] as cards: the NCs of one audit together as ONE expandable bundle, an
   // audit's lone NC (or an NC with no audit) as a plain card. Only the NCs that
-  // are in [rows] — what the filters and tile picks leave — are in a bundle.
+  // are in [rows] — what the filters, tile picks and pages loaded so far leave —
+  // are in a bundle.
   List<Widget> _auditItems(List<NcModel> rows, {required String scope}) {
     final groups = groupNcsByAudit(rows);
     return [
@@ -344,59 +441,99 @@ class _NcReportTabState extends State<NcReportTab> {
 
   // The location-wise view: one header per place — its NC count and the bucket
   // tallies — above that place's rows. The numbers are the SERVER's `byLocation`
-  // (whole filtered set, narrowed to the tile's NCs while a tile is picked); only
-  // with no breakdown (a failed request) are the rows grouped by their own
-  // `placeLabel` and counted on the device.
-  List<Widget> _placeSections(List<NcModel> filtered, NcTileStats? stats) {
-    final places = stats?.byLocation ?? const <NcLocationStats>[];
-    final fromServer = places.isNotEmpty && places.any((pl) => pl.ncIds.isNotEmpty);
-    final List<(NcLocationStats, List<NcModel>)> groups;
-    if (fromServer) {
-      groups = [
-        for (final place in places)
-          (place, [for (final nc in filtered) if (place.ncIds.contains(nc.id)) nc]),
-      ];
-    } else {
-      final byLabel = <String, List<NcModel>>{};
-      for (final nc in filtered) {
-        byLabel.putIfAbsent(nc.placeLabel ?? 'No location', () => []).add(nc);
-      }
-      final labels = byLabel.keys.toList()
-        ..sort((a, b) {
-          final an = a == 'No location', bn = b == 'No location';
-          if (an != bn) return an ? 1 : -1;
-          return a.toLowerCase().compareTo(b.toLowerCase());
-        });
-      groups = [
-        for (final label in labels)
-          (
-            NcLocationStats(
-              key: label,
-              label: label,
-              total: byLabel[label]!.length,
-              inProgress: byLabel[label]!.where((n) => n.bucket == NcBucket.inProgress).length,
-              overdue: byLabel[label]!.where((n) => n.bucket == NcBucket.overdue).length,
-              pendingApproval:
-                  byLabel[label]!.where((n) => n.bucket == NcBucket.pendingApproval).length,
-              delayed: byLabel[label]!.where((n) => n.bucket == NcBucket.delayed).length,
-              onTime: byLabel[label]!.where((n) => n.bucket == NcBucket.onTime).length,
-            ),
-            byLabel[label]!,
+  // (whole filtered set, narrowed to the tile's NCs while a tile is picked) and so
+  // are the rows: an opened place reads its own NCs (the header's `ncIds`) a page
+  // at a time. Only with no breakdown (a failed request) are the loaded rows
+  // grouped by their own `placeLabel` and counted on the device.
+  List<Widget> _placeSections(NcProvider p, List<NcModel> rows, List<NcLocationStats> places) {
+    if (places.isNotEmpty) {
+      return [
+        for (final place in places) ...[
+          _PlaceHeader(
+            place: place,
+            isExpanded: _expandedPlaces.contains(place.key),
+            onToggle: () => _togglePlace(place.key),
           ),
+          if (_expandedPlaces.contains(place.key)) ..._placeBody(p, place),
+        ],
       ];
     }
+    final byLabel = <String, List<NcModel>>{};
+    for (final nc in rows) {
+      byLabel.putIfAbsent(nc.placeLabel ?? 'No location', () => []).add(nc);
+    }
+    final labels = byLabel.keys.toList()
+      ..sort((a, b) {
+        final an = a == 'No location', bn = b == 'No location';
+        if (an != bn) return an ? 1 : -1;
+        return a.toLowerCase().compareTo(b.toLowerCase());
+      });
+    final groups = [
+      for (final label in labels)
+        (
+          NcLocationStats(
+            key: label,
+            label: label,
+            total: byLabel[label]!.length,
+            inProgress: byLabel[label]!.where((n) => n.bucket == NcBucket.inProgress).length,
+            overdue: byLabel[label]!.where((n) => n.bucket == NcBucket.overdue).length,
+            pendingApproval:
+                byLabel[label]!.where((n) => n.bucket == NcBucket.pendingApproval).length,
+            delayed: byLabel[label]!.where((n) => n.bucket == NcBucket.delayed).length,
+            onTime: byLabel[label]!.where((n) => n.bucket == NcBucket.onTime).length,
+          ),
+          byLabel[label]!,
+        ),
+    ];
     return [
-      for (final (place, rows) in groups) ...[
+      for (final (place, placeRows) in groups) ...[
         _PlaceHeader(
           place: place,
           isExpanded: _expandedPlaces.contains(place.key),
           onToggle: () => _togglePlace(place.key),
         ),
         if (_expandedPlaces.contains(place.key)) ...[
-          ..._auditItems(rows, scope: '${place.key}|'),
+          ..._auditItems(placeRows, scope: '${place.key}|'),
           const SizedBox(height: 10),
         ],
       ],
+    ];
+  }
+
+  // What sits under an opened place's header: its NCs (audit bundles and plain
+  // cards), then a spinner / "Show N more" / "Try again" row for its next page.
+  List<Widget> _placeBody(NcProvider p, NcLocationStats place) {
+    final list = p.ncReportPlaceList(place.key);
+    _ensurePlaceLoaded(p, place.key, list);
+    final items = list.items;
+    final left = list.total == null ? null : list.total! - items.length;
+    return [
+      if (items.isEmpty && list.error != null)
+        NcPageFooter(
+          hasMore: false,
+          isLoadingMore: false,
+          error: list.error,
+          onRetry: () => list.loadFirst(),
+        )
+      else if (items.isEmpty && !list.hasLoaded)
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 16),
+          child: Center(
+            child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+          ),
+        )
+      else ...[
+        ..._auditItems(items, scope: '${place.key}|'),
+        NcPageFooter(
+          hasMore: list.hasMore,
+          isLoadingMore: list.isLoadingMore,
+          error: list.moreError,
+          onRetry: () => list.loadMore(retry: true),
+          onLoadMore: () => list.loadMore(),
+          remaining: left,
+        ),
+      ],
+      const SizedBox(height: 10),
     ];
   }
 }

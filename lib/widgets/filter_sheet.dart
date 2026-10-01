@@ -47,6 +47,18 @@ class AuditFilterSelection {
   /// [employees] or [teams] narrow the people — see AuditFilterScope.
   final bool isTeam;
 
+  /// What an untouched [isTeam] reads for the signed-in account: false = Me, true
+  /// = All Members (a Full Access account — AuditFilterScope.defaultTeamScope; the
+  /// Calendar's own default is Me for everybody). The sheet's reset, its count
+  /// badge and the bar's pill / Clear all measure [isTeam] against it, so the
+  /// default itself is never counted as an active filter.
+  final bool defaultIsTeam;
+
+  /// True = "put Me / All Members back to this account's default" whatever
+  /// [isTeam] says: set by [cleared], whose callers cannot know the default.
+  /// [applyAuditFilterSelection] then hands each provider its own.
+  final bool resetScope;
+
   /// Explicit Members picks (employee ids), empty for "no specific people".
   final List<String> employees;
 
@@ -90,6 +102,8 @@ class AuditFilterSelection {
 
   const AuditFilterSelection({
     this.isTeam = false,
+    this.defaultIsTeam = false,
+    this.resetScope = false,
     this.employees = const [],
     this.teams = const [],
     this.teamMembers = const [],
@@ -106,16 +120,21 @@ class AuditFilterSelection {
     this.month,
   });
 
-  /// The resting state: just me, everywhere, every type, any date.
-  static const cleared = AuditFilterSelection();
+  /// The resting state: the account's default scope (Me, or All Members for a
+  /// Full Access account), everywhere, every type, any date.
+  static const cleared = AuditFilterSelection(resetScope: true);
 
-  /// What a provider holds right now, as a selection.
+  /// What a provider holds right now, as a selection. [calendar] reads the
+  /// Calendar's own scope ([AuditFilterScope.calendarTeamScope]), whose resting
+  /// state is Me for everybody.
   factory AuditFilterSelection.fromScope(
     AuditFilterScope scope, {
     DateTime? month,
+    bool calendar = false,
   }) {
     return AuditFilterSelection(
-      isTeam: scope.isTeamScope,
+      isTeam: calendar ? scope.calendarTeamScope : scope.isTeamScope,
+      defaultIsTeam: calendar ? false : scope.defaultTeamScope,
       employees: scope.employeeFilter,
       teams: scope.teamFilter,
       teamMembers: scope.teamMemberIds,
@@ -135,6 +154,8 @@ class AuditFilterSelection {
 
   AuditFilterSelection copyWith({
     bool? isTeam,
+    bool? defaultIsTeam,
+    bool? resetScope,
     List<String>? employees,
     List<String>? teams,
     List<String>? teamMembers,
@@ -151,6 +172,8 @@ class AuditFilterSelection {
   }) {
     return AuditFilterSelection(
       isTeam: isTeam ?? this.isTeam,
+      defaultIsTeam: defaultIsTeam ?? this.defaultIsTeam,
+      resetScope: resetScope ?? this.resetScope,
       employees: employees ?? this.employees,
       teams: teams ?? this.teams,
       teamMembers: teamMembers ?? this.teamMembers,
@@ -175,21 +198,34 @@ class AuditFilterSelection {
 /// tiles and the NC list are computed under too (the web keeps filters across
 /// pages the same way).
 ///
+/// A [selection] with [AuditFilterSelection.resetScope] puts Me / All Members
+/// back to each provider's own account default ([AuditFilterScope.defaultTeamScope]).
+/// [calendarAllMembers], when given, records whether the user picked All Members
+/// ON the Calendar (see [AuditFilterScope.calendarAllMembers]); only the Calendar
+/// passes it.
+///
 /// Providers are read before the first await so there is no `context` use
 /// afterwards.
 Future<void> applyAuditFilterSelection(
   BuildContext context,
-  AuditFilterSelection selection,
-) {
+  AuditFilterSelection selection, {
+  bool? calendarAllMembers,
+}) {
   final providers = <AuditFilterScope>[
     context.read<AuditsProvider>(),
     context.read<DashboardProvider>(),
     context.read<NcProvider>(),
   ];
+  if (calendarAllMembers != null) {
+    for (final p in providers) {
+      p.calendarAllMembers = calendarAllMembers;
+    }
+  }
   return Future.wait([
     for (final p in providers)
       p.applyFilters(
         isTeam: selection.isTeam,
+        resetScope: selection.resetScope,
         employees: selection.employees,
         teams: selection.teams,
         teamMembers: selection.teamMembers,
@@ -335,7 +371,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   /// providers until Apply.
   void _reset() {
     setState(() {
-      _isTeam = false;
+      _isTeam = widget.initial.defaultIsTeam;
       _teams = [];
       _members = [];
       _locations = [];
@@ -354,7 +390,10 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
   // Counts what is really applied: a pick the place set aside is not one.
   int _draftCountFor(WhoCascade who) =>
       (who.teams.isNotEmpty ? 1 : 0) +
-      (who.members.isNotEmpty || (who.teams.isEmpty && _isTeam) ? 1 : 0) +
+      (who.members.isNotEmpty ||
+              (who.teams.isEmpty && _isTeam != widget.initial.defaultIsTeam)
+          ? 1
+          : 0) +
       (_locations.isNotEmpty || _departments.isNotEmpty ? 1 : 0) +
       (_auditTypes.isNotEmpty ? 1 : 0) +
       (widget.showDateRange && (_from != null || _to != null) ? 1 : 0) +
@@ -569,6 +608,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     Navigator.of(context).pop(
       AuditFilterSelection(
         isTeam: _isTeam,
+        defaultIsTeam: widget.initial.defaultIsTeam,
         employees: members,
         teams: teams,
         teamMembers: teamMembers,

@@ -107,12 +107,14 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
     // The socket-driven refetch in NcProvider only fires for the OTHER
     // party's notification — the raiser (acting here) never gets notified
     // of their own action, so this list needs an explicit refresh for
-    // _resolveNc above to pick up the new status right away. Same reasoning
-    // extends to the dashboard's NC/completed tallies, which this action
-    // also moves but has no refresh path of its own for the actor.
+    // _resolveNc above to pick up the new status right away (the pages of the
+    // list that are loaded are re-read in place, so the list behind this screen
+    // keeps its scroll position). Same reasoning extends to the dashboard's
+    // NC/completed tallies, which this action also moves but has no refresh
+    // path of its own for the actor.
     try {
       await Future.wait([
-        ncProvider.fetchRaisedByMe(),
+        ncProvider.refreshRaisedByMe(),
         context.read<DashboardProvider>().refreshAll(),
       ]);
     } catch (_) {

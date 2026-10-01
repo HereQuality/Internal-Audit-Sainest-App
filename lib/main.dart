@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/foundation.dart' show kDebugMode, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
@@ -11,6 +13,7 @@ import 'core/theme/app_theme.dart';
 import 'providers/announcement_provider.dart';
 import 'providers/app_mode_provider.dart';
 import 'providers/app_update_provider.dart';
+import 'providers/audit_filter_scope.dart';
 import 'providers/audits_provider.dart';
 import 'providers/auth_provider.dart';
 import 'providers/dashboard_provider.dart';
@@ -343,6 +346,34 @@ class _RootGateState extends State<RootGate> with WidgetsBindingObserver {
           context.read<AuditsProvider>().setSelfEmployeeId(selfId);
           context.read<DashboardProvider>().setSelfEmployeeId(selfId);
           context.read<NcProvider>().setSelfEmployeeId(selfId);
+        }
+
+        // What an untouched Me / All Members toggle reads for THIS account:
+        // All Members for a Full Access Role (and a SuperAdmin — the model
+        // makes it true for that roleType, which is also why a SuperAdmin,
+        // who has no employee id above, keeps behaving as the whole
+        // organisation), Me for everyone else. Same moment, same reasons as
+        // the self id: before any screen's first fetch, plain field writes,
+        // safe to repeat on every rebuild. resetForLogout() forgets it, so a
+        // different account on the same phone is computed afresh here.
+        final fullAccess = auth.user?.hasFullAccess ?? false;
+        final movedDefault = <AuditFilterScope>[
+          for (final AuditFilterScope p in [
+            context.read<AuditsProvider>(),
+            context.read<DashboardProvider>(),
+            context.read<NcProvider>(),
+          ])
+            if (p.setDefaultTeamScope(fullAccess)) p,
+        ];
+        if (movedDefault.isNotEmpty) {
+          // Only a role that changed MID-session gets here (screens already
+          // fetched under the old scope): reload them, outside this build.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            for (final p in movedDefault) {
+              unawaited(p.applyFilters());
+            }
+          });
         }
 
         // Only now — logged in, not blocked, app shell about to actually

@@ -27,6 +27,8 @@ import 'package:internal_audit_app/widgets/status_badge.dart';
 import 'package:internal_audit_app/widgets/status_filter_chip_row.dart';
 import 'package:internal_audit_app/widgets/today_audits_section.dart';
 
+import 'support/report_list_fake.dart';
+
 /// The unified audit statuses on screen: the badges and pills, the filter
 /// chip row, the dashboard's status tiles and where they route, the
 /// dashboard's In Progress / Overdue sections and the agenda card following
@@ -877,8 +879,10 @@ void main() {
 void _ignore(String _) {}
 
 /// GET /audits/mine answers with [audits], GET /audits/report with the same rows
-/// in the report's paged shape; everything else with an empty list. Records
-/// whether the app ever sent a `status` query parameter.
+/// in the report's paged shape — filtered by the `status` / `search` it is sent and
+/// paged over groups, as the server does (the Final Report's chips are the server's
+/// filters now, no longer narrowed on the device); everything else with an empty
+/// list. Records whether the app ever sent a `status` query parameter.
 class _AuditsAdapter implements HttpClientAdapter {
   List<Map<String, dynamic>> audits = [];
   bool sawStatusParam = false;
@@ -893,7 +897,7 @@ class _AuditsAdapter implements HttpClientAdapter {
     final Object data = options.path == ApiConstants.myAudits
         ? audits
         : options.path == ApiConstants.auditsReport
-        ? {'audits': audits, 'total': audits.length, 'page': 1, 'limit': 100}
+        ? reportListData(audits, options.queryParameters)
         : <dynamic>[];
     return ResponseBody.fromString(
       jsonEncode({'isOk': true, 'data': data}),

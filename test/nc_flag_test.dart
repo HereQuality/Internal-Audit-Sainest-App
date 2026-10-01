@@ -1,3 +1,4 @@
+import 'package:internal_audit_app/models/upload_phase.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -228,7 +229,7 @@ void main() {
                 DateTime? targetDate,
                 String? severity,
               }) async => null,
-              onUploadPhotos: ({required photos, onProgress}) async => null,
+              onUploadPhotos: ({required photos, onProgress}) async => const UploadPhotosResult(),
               linkedNc: nc,
             ),
           ),

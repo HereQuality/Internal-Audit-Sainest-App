@@ -49,11 +49,12 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
         context.read<NcProvider>().setSelfEmployeeId(selfId);
       }
       context.read<DashboardProvider>().fetchAuditeeStats();
-      // Same list the NCs tab's "Against me" view fetches (NcProvider.
-      // raisedAgainstMe) — reused here just to answer "what do I need to
-      // do" without a second, dashboard-only endpoint, same reasoning as
-      // the auditor DashboardScreen reusing AuditsProvider.audits.
-      context.read<NcProvider>().fetchAgainstMe();
+      // The same NCs the NCs tab's "Against me" view lists, but ALL of them
+      // (NcProvider.againstMeAll — that screen pages its list, 20 at a time):
+      // reused here just to answer "what do I need to do" without a second,
+      // dashboard-only endpoint, same reasoning as the auditor
+      // DashboardScreen reusing AuditsProvider.audits.
+      context.read<NcProvider>().fetchAgainstMeAll();
     });
   }
 
@@ -67,7 +68,7 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
     return RefreshIndicator(
       onRefresh: () => Future.wait([
         context.read<DashboardProvider>().fetchAuditeeStats(),
-        context.read<NcProvider>().fetchAgainstMe(),
+        context.read<NcProvider>().fetchAgainstMeAll(),
       ]),
       // Wraps the WHOLE CustomScrollView, not each sliver — see
       // MaxWidthScroll's own doc for why that's safe for a sliver tree
@@ -169,26 +170,26 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
                 child: ExpandableSection(
                   title: "What needs attention",
                   icon: Icons.checklist_rounded,
-                  count: ncActivityCount(ncProvider.raisedAgainstMe),
+                  count: ncActivityCount(ncProvider.againstMeAll),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       TodayNcsSection(
-                        ncs: ncProvider.raisedAgainstMe,
+                        ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
                             : () => widget.onNavigateToTab!(1),
                       ),
                       const SizedBox(height: 14),
                       OngoingNcsSection(
-                        ncs: ncProvider.raisedAgainstMe,
+                        ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
                             : () => widget.onNavigateToTab!(1),
                       ),
                       const SizedBox(height: 14),
                       OverdueNcsSection(
-                        ncs: ncProvider.raisedAgainstMe,
+                        ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
                             : () => widget.onNavigateToTab!(1),

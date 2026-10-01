@@ -19,9 +19,11 @@ import '../models/audit_model.dart';
 /// keeps the two providers' copies in step, exactly as ScopeToggle already
 /// does for `isTeamScope`.
 ///
-/// Server semantics to keep in mind: the default scope is Me; Me + a
-/// Location = only my audits there; All Members + a Location = every audit
-/// at that location (for places I belong to or lead), whoever the auditor is.
+/// Server semantics to keep in mind: the default scope is Me for an ordinary
+/// employee and All Members for a Full Access account ([defaultTeamScope]);
+/// Me + a Location = only my audits there; All Members + a Location = every
+/// audit at that location (for places I belong to or lead), whoever the
+/// auditor is.
 ///
 /// Every param here is understood by the server already — see
 /// audit.controller.js's `resolveScopedEmployeeIds` (employeeIds),
@@ -30,11 +32,71 @@ import '../models/audit_model.dart';
 /// name rather than a ref).
 mixin AuditFilterScope on ChangeNotifier {
   /// "Me" vs "All Members" — the coarse toggle that most users never move
-  /// off. Defaults to Me; see the implementing provider's own field comment.
+  /// off. Starts at [defaultTeamScope] (Me for an ordinary employee, All
+  /// Members for Full Access); see the implementing provider's own field comment.
   bool get isTeamScope;
   set isTeamScope(bool value);
 
   String? get selfEmployeeId;
+
+  /// What an UNTOUCHED Me / All Members toggle reads for the signed-in account:
+  /// false = Me (every ordinary employee, managers included), true = All Members
+  /// (a SuperAdmin, or a user whose Role has Full Access). The web does the same
+  /// (client/src/hooks/useSelfScope.js): a plant head or QA head opens on the
+  /// whole organisation, because "just me" would open nearly empty and look
+  /// broken. The server already treats an absent employeeIds as org-wide for
+  /// that role, so this only changes what the phone asks for.
+  ///
+  /// Everything that used to hard-code "Me is the resting state" reads this
+  /// instead — the untouched state, [clearFilters], the filter sheet's reset,
+  /// the active-filter count (the default itself never lights the badge or the
+  /// Clear button; leaving it, in either direction, does). Picking Me as a Full
+  /// Access user is therefore a real narrowing (`employeeIds=<self>`) and stays
+  /// possible. Set from the signed-in user by main.dart's _RootGate
+  /// ([setDefaultTeamScope]) and wiped on logout, so a different account on
+  /// the same phone recomputes it.
+  bool defaultTeamScope = false;
+
+  // True once [setDefaultTeamScope] has run for the current login; lets a
+  // LATER change of the default (the account's role changed mid-session) be
+  // told apart from the first one, which happens before any screen has
+  // fetched and needs no reload.
+  bool _defaultTeamScopeKnown = false;
+
+  /// Calendar only: the user explicitly picked All Members ON the Calendar.
+  /// The Calendar loads unpaginated data, so — like the web's
+  /// `useScopeFilter({ fullAccessDefault: false })` — it opens on Me for
+  /// everybody, a Full Access user included, and only widens when asked
+  /// ([calendarTeamScope]). Cleared whenever Me is picked anywhere, on Clear
+  /// and on logout.
+  bool calendarAllMembers = false;
+
+  /// Adopts the signed-in account's default scope. Plain field writes, no
+  /// notify, so main.dart's _RootGate may repeat it on every authenticated
+  /// build. An untouched toggle follows the new default; one the user has
+  /// moved is left alone.
+  ///
+  /// Returns true only when it moved an untouched toggle that screens may
+  /// already have fetched under (the account's role changed mid-session) — the
+  /// caller then reloads. The first call after a login returns false: no
+  /// screen has fetched yet, so there is nothing stale.
+  bool setDefaultTeamScope(bool value) {
+    final firstTime = !_defaultTeamScopeKnown;
+    _defaultTeamScopeKnown = true;
+    if (value == defaultTeamScope) return false;
+    final untouched = isTeamScope == defaultTeamScope;
+    defaultTeamScope = value;
+    if (untouched) isTeamScope = value;
+    return untouched && !firstTime;
+  }
+
+  /// The Me / All Members scope the Calendar's OWN requests use: the shared
+  /// [isTeamScope], except that a Full Access user's untouched All Members
+  /// default does not carry into the Calendar (it stays on Me, as on the web)
+  /// unless they picked All Members there ([calendarAllMembers]). For an
+  /// ordinary employee it is simply [isTeamScope], as before.
+  bool get calendarTeamScope =>
+      isTeamScope && (!defaultTeamScope || calendarAllMembers);
 
   /// A precise pick of people from the Members filter. Non-empty always
   /// WINS over [isTeamScope] — picking specific people is a more specific
@@ -96,12 +158,12 @@ mixin AuditFilterScope on ChangeNotifier {
   /// under which a picked Location shows EVERY audit there — see
   /// audit.controller.js#whereWithScope). Me is an explicit `self`, which the
   /// server treats as a deliberate narrowing (only my audits at that place).
-  String? get _employeeIdsParam {
+  String? _employeeIdsParamFor(bool teamScope) {
     if (employeeFilter.isNotEmpty) return employeeFilter.join(',');
     if (teamFilter.isNotEmpty) {
       return teamMemberIds.isEmpty ? noneSentinel : teamMemberIds.join(',');
     }
-    if (!isTeamScope && selfEmployeeId != null) return selfEmployeeId;
+    if (!teamScope && selfEmployeeId != null) return selfEmployeeId;
     return null;
   }
 
@@ -119,9 +181,17 @@ mixin AuditFilterScope on ChangeNotifier {
   /// full hierarchy — main.dart's _RootGate sets it on every authenticated
   /// build specifically so that can't happen; keep it that way if you add
   /// a new fetch entry point.
-  Map<String, dynamic>? get filterParams {
+  Map<String, dynamic>? get filterParams => _filterParamsFor(isTeamScope);
+
+  /// [filterParams] for the Calendar's own requests: the same filters under
+  /// [calendarTeamScope], so a Full Access user's All Members default does not
+  /// make the (unpaginated) calendar pull the whole organisation.
+  Map<String, dynamic>? get calendarFilterParams =>
+      _filterParamsFor(calendarTeamScope);
+
+  Map<String, dynamic>? _filterParamsFor(bool teamScope) {
     final params = <String, dynamic>{};
-    final people = _employeeIdsParam;
+    final people = _employeeIdsParamFor(teamScope);
     if (people != null) params['employeeIds'] = people;
     if (locationFilter.isNotEmpty) {
       params['locationIds'] = locationFilter.join(',');
@@ -166,9 +236,10 @@ mixin AuditFilterScope on ChangeNotifier {
 
   bool get hasDateFilter => dateFrom != null || dateTo != null;
 
-  /// Whether anything is narrowed beyond the plain Me default — drives the
-  /// dot on the Filters button. Me alone is the resting state, so it does
-  /// NOT count as an active filter; All Members (a deliberate widening) does.
+  /// Whether anything differs from the untouched state — drives the dot on the
+  /// Filters button. The account's own default scope ([defaultTeamScope]: Me,
+  /// or All Members for Full Access) is the resting state, so it does NOT count
+  /// as an active filter; moving off it to the other end does.
   bool get hasActiveFilters => activeFilterCount > 0;
 
   /// How many distinct filters are narrowing the view — shown as a count
@@ -178,17 +249,26 @@ mixin AuditFilterScope on ChangeNotifier {
   /// The same count for a screen that only offers some dimensions — a Status
   /// pick made on the Audits tab must not light the badge on the Dashboard
   /// (whose tiles ignore it) or a Flag pick on an audit screen.
+  ///
+  /// [calendar] counts the Calendar's own scope ([calendarTeamScope], whose
+  /// resting state is Me for everyone) instead of the shared one.
   int activeFilterCountFor({
     bool status = true,
     bool date = true,
     bool flag = true,
+    bool calendar = false,
   }) =>
       // Mirrors filterParams' own precedence: a specific-people pick WINS
       // over isTeamScope entirely (the flag is ignored once employeeFilter
       // is non-empty), so counting both here would let the badge read a
       // dimension the filter bar has already replaced with a people chip.
+      // The scope counts only when it differs from the account's default.
       (teamFilter.isNotEmpty ? 1 : 0) +
-      (employeeFilter.isNotEmpty || (teamFilter.isEmpty && isTeamScope)
+      (employeeFilter.isNotEmpty ||
+              (teamFilter.isEmpty &&
+                  (calendar
+                      ? calendarTeamScope
+                      : isTeamScope != defaultTeamScope))
           ? 1
           : 0) +
       (locationFilter.isNotEmpty || departmentFilter.isNotEmpty ? 1 : 0) +
@@ -207,9 +287,12 @@ mixin AuditFilterScope on ChangeNotifier {
   /// optional so a caller can move one dimension without restating the
   /// rest; pass an empty list to clear one. The dates are the exception
   /// (null can't mean both "leave" and "clear"): [dateRange] replaces both
-  /// ends whenever it is passed, `(null, null)` clearing it.
+  /// ends whenever it is passed, `(null, null)` clearing it. [resetScope] puts
+  /// Me / All Members back to the account's default ([defaultTeamScope]) and
+  /// wins over [isTeam].
   Future<void> applyFilters({
     bool? isTeam,
+    bool resetScope = false,
     List<String>? employees,
     List<String>? teams,
     List<String>? teamMembers,
@@ -225,6 +308,7 @@ mixin AuditFilterScope on ChangeNotifier {
   }) {
     setFilterState(
       isTeam: isTeam,
+      resetScope: resetScope,
       employees: employees,
       teams: teams,
       teamMembers: teamMembers,
@@ -253,6 +337,7 @@ mixin AuditFilterScope on ChangeNotifier {
   /// a caller that batches several providers and refetches itself.
   void setFilterState({
     bool? isTeam,
+    bool resetScope = false,
     List<String>? employees,
     List<String>? teams,
     List<String>? teamMembers,
@@ -266,7 +351,14 @@ mixin AuditFilterScope on ChangeNotifier {
     List<String>? heldTeams,
     List<String>? heldEmployees,
   }) {
-    if (isTeam != null) isTeamScope = isTeam;
+    if (resetScope) {
+      isTeamScope = defaultTeamScope;
+      calendarAllMembers = false;
+    } else if (isTeam != null) {
+      isTeamScope = isTeam;
+      // Me, picked anywhere, ends a Calendar-level All Members as well.
+      if (!isTeam) calendarAllMembers = false;
+    }
     if (heldTeams != null) heldTeamFilter = List.unmodifiable(heldTeams);
     if (heldEmployees != null) heldEmployeeFilter = List.unmodifiable(heldEmployees);
     if (employees != null) employeeFilter = List.unmodifiable(employees);
@@ -284,9 +376,10 @@ mixin AuditFilterScope on ChangeNotifier {
     if (flags != null) flagFilter = List.unmodifiable(flags);
   }
 
-  /// Back to the resting state: just me, everywhere, every type, any date.
+  /// Back to the resting state: the account's default scope ([defaultTeamScope]
+  /// — Me, or All Members for Full Access), everywhere, every type, any date.
   Future<void> clearFilters() => applyFilters(
-    isTeam: false,
+    resetScope: true,
     employees: const [],
     teams: const [],
     teamMembers: const [],
@@ -313,14 +406,20 @@ mixin AuditFilterScope on ChangeNotifier {
   /// out, hands the NEXT person who logs in on that same device a filter
   /// still narrowed to the previous account's colleagues — ids that mean
   /// nothing (or, worse, resolve to someone ELSE's reports) under the new
-  /// login. `isTeamScope` also goes back to its Me default explicitly
-  /// (not left at whatever the previous account had it set to), matching
-  /// what a fresh install would show. Deliberately doesn't touch
+  /// login. `isTeamScope` also goes back to Me explicitly (not left at
+  /// whatever the previous account had it set to), matching what a fresh
+  /// install would show — and [defaultTeamScope] goes back to Me with it:
+  /// the previous account may have been Full Access, the next one need not
+  /// be, so main.dart's _RootGate recomputes it from whoever signs in.
+  /// Deliberately doesn't touch
   /// [selfEmployeeId] — main.dart's _RootGate always calls
   /// setSelfEmployeeId with the NEWLY authenticated user's own id before
   /// any fetch can run, so the stale value can never actually be read.
   void resetForLogout() {
     isTeamScope = false;
+    defaultTeamScope = false;
+    _defaultTeamScopeKnown = false;
+    calendarAllMembers = false;
     setFilterState(
       employees: const [],
       teams: const [],

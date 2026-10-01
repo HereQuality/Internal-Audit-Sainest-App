@@ -477,7 +477,10 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   bool _isActiveForScoring(AuditDetailModel audit) {
     if (audit.isInstant)
       return audit.status != 'Completed' && audit.status != 'Skipped';
+    // A Not Attempted audit (repeat window closed) keeps a raw status of Not Started / In Progress
+    // but takes no more work — the server refuses every action — so it is read-only here.
     return !audit.scheduledInFuture &&
+        !audit.isNotAttempted &&
         (audit.status == 'Not Started' || audit.status == 'In Progress');
   }
 

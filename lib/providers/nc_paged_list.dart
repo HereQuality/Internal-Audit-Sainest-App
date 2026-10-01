@@ -51,10 +51,66 @@ NcChipQuery ncChipQuery(String chip, {required bool raised}) {
   return NcChipQuery(params: {'status': chip});
 }
 
+/// A tile-stats request that several callers share: one request in flight per
+/// query at a time (the list's "ids behind this bucket" and the tiles themselves
+/// ask for the same numbers within one tick), and the last answer kept so a chip
+/// or tile tap re-uses it instead of asking again.
+///
+/// `key` is whatever distinguishes one query from another (the filter params and
+/// the search text); `fresh` skips the kept answer (a pull-to-refresh, a filter
+/// change) but still joins a request that is already on its way.
+class NcStatsLoader {
+  NcTileStats? _value;
+  String? _valueKey;
+  Future<NcTileStats?>? _flight;
+  String? _flightKey;
+  int _generation = 0;
+
+  Future<NcTileStats?> get(
+    String key,
+    Future<NcTileStats?> Function() request, {
+    bool fresh = false,
+  }) {
+    final running = _flight;
+    if (running != null && _flightKey == key) return running;
+    if (!fresh && _value != null && _valueKey == key) return Future.value(_value);
+    final generation = _generation;
+    late final Future<NcTileStats?> flight;
+    flight = request()
+        .then((stats) {
+          if (stats != null && generation == _generation) {
+            _value = stats;
+            _valueKey = key;
+          }
+          return stats;
+        })
+        .whenComplete(() {
+          if (identical(_flight, flight)) {
+            _flight = null;
+            _flightKey = null;
+          }
+        });
+    _flight = flight;
+    _flightKey = key;
+    return flight;
+  }
+
+  /// Forgets the kept answer and lets a request still on the wire land unseen
+  /// (logout).
+  void clear() {
+    _generation++;
+    _value = null;
+    _valueKey = null;
+    _flight = null;
+    _flightKey = null;
+  }
+}
+
 class _Snap {
   const _Snap({
     this.items = const <NcModel>[],
     this.total,
+    this.totalNcs,
     this.pages = 0,
     this.ids,
     this.cursor = 0,
@@ -63,16 +119,23 @@ class _Snap {
 
   final List<NcModel> items;
   final int? total;
+  final int? totalNcs;
   // Server pages read so far (plain mode)...
   final int pages;
-  // ...or, for a bucket chip, the ids to read and how many were read (ids mode).
+  // ...or, for a bucket chip / tile pick / a fixed set, the ids to read and how
+  // many were read (ids mode).
   final List<String>? ids;
   final int cursor;
   final bool hasMore;
 }
 
-/// One NC list (NC Monitoring's "raised by me" or the auditee's "against me")
-/// that loads ONE page of [pageSize] at a time.
+/// The tile stats a bucket narrowing is answered from: [search] is only a
+/// request to narrow the ids by it too (when the endpoint can).
+typedef NcStatsSource = Future<NcTileStats?> Function({required bool fresh, required String search});
+
+/// One NC list (NC Monitoring's "raised by me", the auditee's "against me", the
+/// Final Report's NCs tab, or one place of its location-wise view) that loads ONE
+/// page of [pageSize] at a time.
 ///
 ///  * [loadFirst]      page 1 — on open, on a filter / chip / search change, on
 ///                     pull-to-refresh.
@@ -83,26 +146,36 @@ class _Snap {
 ///                     (no spinner, no flicker) — a live update, so the scroll
 ///                     position survives.
 ///
-/// The status chip and the search text go to the server (`status`/`open`/`ids`,
-/// `search`), so a page is always a page of what is being looked at and `total` is
-/// the true count. Every call takes a number; an answer whose number is no longer
-/// the newest — or whose account has signed out ([epoch] moved) — is dropped
-/// without touching the list, its error or its loading flags.
+/// The status chip, the tile picks and the search text go to the server
+/// (`status`/`open`, `search`; a derived bucket as the `ids` the tiles counted), so
+/// a page is always a page of what is being looked at and `total` is the true
+/// count. Every call takes a number; an answer whose number is no longer the
+/// newest — or whose account has signed out ([epoch] moved) — is dropped without
+/// touching the list, its error or its loading flags.
+///
+/// A bucket chip / tile pick has no query param, so its list is read by `ids`:
+/// the ids come from the stats endpoint ([loadStats]), newest first, and are asked
+/// for [pageSize] at a time (a short URL however many NCs the bucket holds). A
+/// [fixedIds] list (a place of the location-wise view) is read the same way.
 class NcPagedList {
   NcPagedList({
     required this.dio,
     required this.path,
-    required this.raised,
     required this.failure,
     required this.filters,
     required this.epoch,
     required this.onChanged,
-    required this.loadStats,
+    this.raised = true,
+    this.loadStats,
+    this.statsHaveSearch = false,
+    this.pageParams = const {},
+    this.fixedIds,
   });
 
   static const pageSize = 20;
-  // With a search text a bucket chip cannot know how many of its ids match, so it
-  // reads its ids in bigger slices and keeps going until a page is filled.
+  // With a search text a bucket chip whose stats cannot be narrowed by it does not
+  // know how many of its ids match, so it reads its ids in bigger slices and keeps
+  // going until a page is filled.
   static const _searchSlice = 100;
 
   final Dio dio;
@@ -122,13 +195,28 @@ class NcPagedList {
   final VoidCallback onChanged;
 
   /// The tile stats (the ids behind each bucket); throws when the request fails.
-  final Future<NcTileStats?> Function() loadStats;
+  /// Null for a list that has no bucket narrowing.
+  final NcStatsSource? loadStats;
+
+  /// Whether [loadStats] narrows the ids by the search text itself (the raised
+  /// and report stats endpoints take `search`; /ncs/ats-summary does not).
+  final bool statsHaveSearch;
+
+  /// Extra params of every plain page (the report's `groupBy=audit`).
+  final Map<String, dynamic> pageParams;
+
+  /// A list of exactly these NCs (a place's), read by id; null for a normal list.
+  final List<String>? Function()? fixedIds;
 
   List<NcModel> items = [];
 
-  /// How many NCs the server says match (null while unknown: a bucket chip with a
-  /// search text cannot say until every one of its ids has been read).
+  /// How many the server says match, in the unit it pages by (null while unknown:
+  /// a bucket chip with a search text its stats cannot narrow cannot say until
+  /// every one of its ids has been read). With `groupBy=audit` that is AUDITS.
   int? total;
+
+  /// How many NCs match — [total] unless the answer counted something else.
+  int? totalNcs;
   bool hasMore = false;
 
   /// A first page (or a reload) is on its way / the next page is.
@@ -142,6 +230,13 @@ class NcPagedList {
   String chip = 'All';
   String search = '';
 
+  /// The bucket tiles picked as filters (several OR together).
+  Set<String> tiles = const {};
+
+  /// How many first pages have landed — a screen that sees it move after a filter
+  /// change knows the list was replaced and scrolls back to the top.
+  int firstPageCount = 0;
+
   int _seq = 0;
   bool _loaded = false;
   bool _refreshing = false;
@@ -149,36 +244,48 @@ class NcPagedList {
   List<String>? _ids;
   int _cursor = 0;
 
-  /// Whether [items] is an answer for the current chip and search.
+  /// Whether [items] is an answer for the current chip, tiles and search.
   bool get hasLoaded => _loaded;
 
-  /// Sets the status chip and/or the search text; true when either moved. The
-  /// list is not reloaded here — that is the caller's [loadFirst].
-  bool setNarrowing({String? chip, String? search}) {
+  /// Whether the list is read by id (a bucket chip, tile picks, a fixed set).
+  bool get idsMode => _ids != null;
+
+  bool get _usesIds => fixedIds != null || _bucketKeys.isNotEmpty;
+
+  Set<String> get _bucketKeys => {...tiles, ?ncBucketOfChip(chip)};
+
+  // The ids already say which NCs match the search text, or the list's own search
+  // has to run on each slice.
+  bool get _scanBySearch => search.isNotEmpty && !statsHaveSearch && fixedIds == null;
+
+  /// Sets the status chip, the tile picks and/or the search text; true when any
+  /// moved. What was loaded belongs to the previous narrowing, so it is dropped at
+  /// once (an answer still on its way for it will be ignored) and the list is not
+  /// reloaded here — that is the caller's [loadFirst].
+  bool setNarrowing({String? chip, String? search, Set<String>? tiles}) {
     final nextChip = chip ?? this.chip;
     final nextSearch = (search ?? this.search).trim();
-    if (nextChip == this.chip && nextSearch == this.search) return false;
+    final nextTiles = tiles ?? this.tiles;
+    if (nextChip == this.chip && nextSearch == this.search && setEquals(nextTiles, this.tiles)) {
+      return false;
+    }
     this.chip = nextChip;
     this.search = nextSearch;
-    // What is loaded belongs to the previous chip/search: nothing may be appended
-    // to it, and it is not a starting point for a refresh.
-    _loaded = false;
-    hasMore = false;
+    this.tiles = {...nextTiles};
+    _seq++;
+    _clear();
     return true;
   }
 
-  /// Back to empty and to the "All", no-search default — on logout.
-  void reset() {
-    _seq++;
+  void _clear() {
     items = [];
     total = null;
+    totalNcs = null;
     hasMore = false;
     isLoading = false;
     isLoadingMore = false;
     error = null;
     moreError = null;
-    chip = 'All';
-    search = '';
     _loaded = false;
     _refreshing = false;
     _pages = 0;
@@ -186,19 +293,31 @@ class NcPagedList {
     _cursor = 0;
   }
 
+  /// Back to empty and to the "All", no-search default — on logout.
+  void reset() {
+    _seq++;
+    chip = 'All';
+    search = '';
+    tiles = const {};
+    _clear();
+  }
+
   // ── requests ────────────────────────────────────────────────────────────
 
-  Map<String, dynamic> _params() => {
+  Map<String, dynamic> _params({bool withSearch = true}) => {
     ...?filters(),
     ...ncChipQuery(chip, raised: raised).params,
-    if (search.isNotEmpty) 'search': search,
+    if (withSearch && search.isNotEmpty) 'search': search,
   };
 
-  Future<({List<NcModel> rows, int? total, bool plain})> _get(Map<String, dynamic> params) async {
+  Future<({List<NcModel> rows, int? total, int? totalNcs, bool plain})> _get(
+    Map<String, dynamic> params,
+  ) async {
     final res = await dio.get(path, queryParameters: params);
     final data = res.data['data'];
     final Iterable<dynamic> raw;
     int? total;
+    int? totalNcs;
     var plain = false;
     if (data == null) {
       raw = const [];
@@ -211,6 +330,7 @@ class NcPagedList {
     } else if (data is Map) {
       raw = (data['ncs'] as List?) ?? const [];
       total = (data['total'] as num?)?.toInt();
+      totalNcs = (data['totalNcs'] as num?)?.toInt();
     } else {
       throw const FormatException('Unexpected NC list answer');
     }
@@ -218,7 +338,7 @@ class NcPagedList {
       for (final e in raw)
         if (e is Map) NcModel.fromJson(Map<String, dynamic>.from(e)),
     ];
-    return (rows: rows, total: total, plain: plain);
+    return (rows: rows, total: total, totalNcs: totalNcs, plain: plain);
   }
 
   /// Pages `from.pages + 1 .. untilPage` of the plain (server-paged) list,
@@ -229,9 +349,10 @@ class NcPagedList {
     var page = from.pages;
     var more = from.hasMore;
     var total = from.total;
+    var totalNcs = from.totalNcs;
     while (page < untilPage && more) {
       final next = page + 1;
-      final r = await _get({..._params(), 'page': next, 'limit': pageSize});
+      final r = await _get({..._params(), ...pageParams, 'page': next, 'limit': pageSize});
       if (stale()) return null;
       for (final n in r.rows) {
         if (seen.add(n.id)) items.add(n);
@@ -239,19 +360,21 @@ class NcPagedList {
       page = next;
       if (r.plain) {
         total = items.length;
+        totalNcs = total;
         more = false;
       } else {
         total = r.total ?? items.length;
+        totalNcs = r.totalNcs ?? total;
         // An empty page ends the list however large `total` claims to be.
         more = r.rows.isNotEmpty && page * pageSize < total;
       }
     }
-    return _Snap(items: items, total: total, pages: page, hasMore: more);
+    return _Snap(items: items, total: total, totalNcs: totalNcs, pages: page, hasMore: more);
   }
 
-  /// The bucket chip's slice of ids from `from.cursor` on, until [minRows] rows
-  /// were gathered AND the cursor reached [untilCursor] (or the ids ran out). The
-  /// answer is narrowed to the ids asked for, whatever the server sent back.
+  /// The ids' slice from `from.cursor` on, until [minRows] rows were gathered AND
+  /// the cursor reached [untilCursor] (or the ids ran out). The answer is narrowed
+  /// to the ids asked for, whatever the server sent back.
   Future<_Snap?> _nextSlices(
     _Snap from,
     bool Function() stale, {
@@ -259,14 +382,15 @@ class NcPagedList {
     int untilCursor = 0,
   }) async {
     final ids = from.ids!;
-    final slice = search.isEmpty ? pageSize : _searchSlice;
+    final scan = _scanBySearch;
+    final slice = scan ? _searchSlice : pageSize;
     final items = [...from.items];
     final seen = {for (final n in items) n.id};
     var cursor = from.cursor;
     var gathered = 0;
     while (cursor < ids.length && (gathered < minRows || cursor < untilCursor)) {
       final part = ids.sublist(cursor, math.min(cursor + slice, ids.length));
-      final r = await _get({..._params(), 'ids': part.join(',')});
+      final r = await _get({..._params(withSearch: scan), 'ids': part.join(',')});
       if (stale()) return null;
       final asked = part.toSet();
       for (final n in r.rows) {
@@ -278,25 +402,35 @@ class NcPagedList {
       cursor += part.length;
     }
     final more = cursor < ids.length;
-    // Without a search every id is a row the tile counted: the total is the
-    // tile's number. With one it is known only once every id has been read.
-    final total = search.isEmpty ? ids.length : (more ? null : items.length);
-    return _Snap(items: items, total: total, ids: ids, cursor: cursor, hasMore: more);
+    // Every id is an NC the tile counted: the total is the tile's number. With a
+    // search the stats cannot narrow it is known only once every id has been read.
+    final total = scan ? (more ? null : items.length) : ids.length;
+    return _Snap(items: items, total: total, totalNcs: total, ids: ids, cursor: cursor, hasMore: more);
   }
 
-  /// The ids behind a bucket, newest first (an ObjectId's leading bytes are its
-  /// creation time), so a bucket reads in the order the plain list does.
-  Future<List<String>> _bucketIds(String bucket) async {
-    final stats = await loadStats();
-    if (stats == null || !stats.hasBuckets) {
-      throw const FormatException('No bucket ids in the stats answer');
+  /// The ids to read, newest first (an ObjectId's leading bytes are its creation
+  /// time), so a bucket reads in the order the plain list does.
+  Future<List<String>> _resolveIds(bool fresh) async {
+    final fixed = fixedIds;
+    final Iterable<String> ids;
+    if (fixed != null) {
+      ids = fixed() ?? const <String>[];
+    } else {
+      final source = loadStats;
+      if (source == null) throw const FormatException('No stats source for a bucket list');
+      final stats = await source(fresh: fresh, search: statsHaveSearch ? search : '');
+      if (stats == null || !stats.hasBuckets) {
+        throw const FormatException('No bucket ids in the stats answer');
+      }
+      ids = {for (final bucket in _bucketKeys) ...stats.idsFor(bucket)};
     }
-    return [...stats.idsFor(bucket)]..sort((a, b) => b.compareTo(a));
+    return {...ids}.toList()..sort((a, b) => b.compareTo(a));
   }
 
   _Snap _current() => _Snap(
     items: items,
     total: total,
+    totalNcs: totalNcs,
     pages: _pages,
     ids: _ids,
     cursor: _cursor,
@@ -306,6 +440,7 @@ class NcPagedList {
   void _apply(_Snap s) {
     items = s.items;
     total = s.total;
+    totalNcs = s.totalNcs;
     _pages = s.pages;
     _ids = s.ids;
     _cursor = s.cursor;
@@ -315,10 +450,11 @@ class NcPagedList {
 
   // ── the three loads ─────────────────────────────────────────────────────
 
-  /// Page 1 under the current filters, chip and search — replaces the list. What
-  /// was showing stays until the answer lands (a failure then leaves it, with
-  /// [error] set, rather than blanking the screen).
-  Future<void> loadFirst() async {
+  /// Page 1 under the current filters, chip, tiles and search — replaces the
+  /// list. What was showing stays until the answer lands (a failure then leaves
+  /// it, with [error] set, rather than blanking the screen). [fresh] asks the
+  /// stats again instead of re-using the last answer (a bucket list only).
+  Future<void> loadFirst({bool fresh = true}) async {
     final owner = epoch();
     final seq = ++_seq;
     bool stale() => owner != epoch() || seq != _seq;
@@ -330,10 +466,9 @@ class NcPagedList {
     _refreshing = false;
     onChanged();
     try {
-      final bucket = ncBucketOfChip(chip);
       final _Snap? snap;
-      if (bucket != null) {
-        final ids = await _bucketIds(bucket);
+      if (_usesIds) {
+        final ids = await _resolveIds(fresh);
         if (stale()) return;
         snap = await _nextSlices(_Snap(ids: ids), stale);
       } else {
@@ -341,6 +476,7 @@ class NcPagedList {
       }
       if (snap == null) return;
       _apply(snap);
+      firstPageCount++;
     } on DioException catch (e) {
       if (!stale()) error = extractErrorMessage(e, fallback: failure);
     } catch (e, st) {
@@ -388,9 +524,9 @@ class NcPagedList {
     }
   }
 
-  /// Re-reads the pages that are on screen (page 1..N, or the same number of a
-  /// bucket's ids) and swaps them in at once. Quiet: no loading flag, and a failure
-  /// keeps what is shown. With nothing loaded yet it is a first page.
+  /// Re-reads the pages that are on screen (page 1..N, or the same number of the
+  /// ids) and swaps them in at once. Quiet: no loading flag, and a failure keeps
+  /// what is shown. With nothing loaded yet it is a first page.
   Future<void> refreshLoaded() async {
     if (isLoading) return; // a first page is on its way and will be the freshest
     if (!_loaded) return loadFirst();
@@ -402,10 +538,9 @@ class NcPagedList {
     _refreshing = true;
     if (hadMore) onChanged();
     try {
-      final bucket = ncBucketOfChip(chip);
       final _Snap? snap;
-      if (bucket != null && _ids != null) {
-        final ids = await _bucketIds(bucket);
+      if (_usesIds && _ids != null) {
+        final ids = await _resolveIds(true);
         if (stale()) return;
         snap = await _nextSlices(
           _Snap(ids: ids),

@@ -1,19 +1,22 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
-import '../../core/utils/nc_timeliness.dart';
 import '../../models/nc_model.dart';
 import '../../models/nc_report_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/list_view_memory.dart';
+import '../../providers/nc_paged_list.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart' show AuditFilterSelection, applyAuditFilterSelection;
 import '../../widgets/audit_filter_bar.dart';
 import '../../widgets/max_width_scroll.dart';
+import '../../widgets/nc_page_footer.dart';
 import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
 import 'nc_response_screen.dart';
@@ -38,18 +41,20 @@ enum NcListMode { auditorOnly, auditeeOnly }
 // which is a lot of half-overlapping options to scan on a phone — "Pending
 // Approval" and "Response Submitted" read as two different things until
 // you realise one is a raw status and the other already includes it. Each
-// value still runs through the SAME _matchesFilter below (same mutually-
-// exclusive bucket rules as server's nc.controller.js#computeNcBuckets),
-// only which values are OFFERED narrows per screen.
+// value still means the SAME as before (same mutually-exclusive bucket rules
+// as server's nc.controller.js#computeNcBuckets — but the SERVER now applies
+// them: a stored status goes as `status=`, a derived bucket as the ids the
+// stat tiles counted, see nc_paged_list.dart#ncChipQuery), only which values
+// are OFFERED narrows per screen.
 //
 // Auditor ("Raised by me" / NC Monitoring) — Total NC / Awaiting Approval
 // / Overdue / Closed, the 4 tiles on AuditorDashboard's own NC card.
 // 'Pending Approval' is the underlying value (Response Submitted or
-// Verification, not yet overdue — see _matchesFilter) that tile's own
-// "Awaiting Approval" label describes; the raw Raised/Response Submitted/
-// Verification split and the auditee-side In Progress/On Time/Delayed
-// tracking THEIR OWN response speed aren't a distinction the raising
-// auditor's own dashboard makes, so neither is this list.
+// Verification, not yet overdue) that tile's own "Awaiting Approval" label
+// describes; the raw Raised/Response Submitted/Verification split and the
+// auditee-side In Progress/On Time/Delayed tracking THEIR OWN response speed
+// aren't a distinction the raising auditor's own dashboard makes, so neither
+// is this list.
 const _auditorStatusFilters = ['All', 'Pending Approval', 'Overdue', 'Closed'];
 const _auditorStatusFilterLabels = {
   'All': 'Total NC',
@@ -77,8 +82,8 @@ const _auditeeStatusFilterLabels = {
 
 // The six tiles NC Monitoring shows (GET /ncs/raised/stats) speak in the
 // server's bucket keys; the list's own filter speaks in the labels above. A
-// tile tap sets the same _statusFilter a dashboard jump does, so the two are
-// one mechanism — these two helpers just translate.
+// tile tap sets the same chip a dashboard jump does, so the two are one
+// mechanism — this map just translates.
 const _bucketFilterLabels = {
   NcBucket.inProgress: 'In Progress',
   NcBucket.overdue: 'Overdue',
@@ -86,62 +91,6 @@ const _bucketFilterLabels = {
   NcBucket.delayed: 'Delayed',
   NcBucket.onTime: 'On Time',
 };
-
-/// The bucket a filter value stands for, null for All / Open / Closed / a raw
-/// status (those have no tile of their own).
-String? _bucketOfFilter(String filter) {
-  for (final e in _bucketFilterLabels.entries) {
-    if (e.value == filter) return e.key;
-  }
-  return null;
-}
-
-// Same bucket rules as server/controllers/nc.controller.js#computeNcBuckets
-// — kept in sync by hand since there's no shared-across-platforms source
-// of truth for this logic (mirrors today_ncs_section.dart's own
-// _dueToday/_overdue/_ongoing helpers, just as exact-match filter
-// predicates instead of a "what's due soon" summary).
-bool _matchesFilter(NcModel n, String filter) {
-  if (filter == 'All') return true;
-  // Not one of _auditorStatusFilters/_auditeeStatusFilters — this is the
-  // value DashboardScreen's own "NC Pending" tile jumps here with
-  // (stats.ncPending counts server-side `status != "Closed"`, i.e. every
-  // OPEN status regardless of overdue-ness: Raised, Response Submitted AND
-  // Verification). Neither side's picker offers a single chip for exactly
-  // that ("Awaiting Approval"/'Pending Approval' excludes plain Raised,
-  // same as the web app's own tile; 'Overdue' excludes a Raised-but-not-
-  // yet-overdue NC) — deliberately outside the trimmed vocabulary rather
-  // than adding a 7th/5th option nobody would tap on purpose, the same way
-  // a tile-driven jump to a raw status ('Closed', say) needs no chip of
-  // its own either.
-  if (filter == 'Open') return n.status != 'Closed';
-  if (![
-    'In Progress',
-    'Pending Approval',
-    'Overdue',
-    'On Time',
-    'Delayed',
-  ].contains(filter)) {
-    return n.status == filter;
-  }
-  final target = n.targetDate;
-  if (n.status == 'Closed') {
-    final completed = n.completionDate;
-    final isDelayed = target != null &&
-        completed != null &&
-        completed.isAfter(effectiveDeadline(target));
-    if (filter == 'Delayed') return isDelayed;
-    if (filter == 'On Time') return !isDelayed;
-    return false;
-  }
-  final isOverdue = target != null && DateTime.now().isAfter(effectiveDeadline(target));
-  if (filter == 'Overdue') return isOverdue;
-  if (isOverdue) return false;
-  if (filter == 'In Progress') return n.status == 'Raised';
-  if (filter == 'Pending Approval')
-    return n.status == 'Response Submitted' || n.status == 'Verification';
-  return false;
-}
 
 class NcListScreen extends StatefulWidget {
   final NcListMode? mode;
@@ -163,32 +112,12 @@ class _NcListScreenState extends State<NcListScreen>
     with SingleTickerProviderStateMixin {
   TabController? _tabController;
 
-  bool get _showRaised => widget.mode != NcListMode.auditeeOnly;
-  bool get _showAgainst => widget.mode != NcListMode.auditorOnly;
-
   @override
   void initState() {
     super.initState();
     if (widget.mode == null) {
       _tabController = TabController(length: 2, vsync: this);
     }
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final provider = context.read<NcProvider>();
-      // Must be set before either fetch below — see DashboardProvider/
-      // AuditsProvider's identical _scopeParams pattern: "Me" resolves to an
-      // explicit employeeIds=<selfId>, which needs this known first. Used to
-      // only run when _showRaised (auditor mode) — an auditee-only session
-      // (widget.mode == auditeeOnly) never hit this at all, on this screen
-      // or on AuditeeDashboardScreen, so fetchAgainstMe's own "Me" scope
-      // below silently ran unscoped instead.
-      final selfId = context.read<AuthProvider>().user?.id;
-      if (selfId != null) provider.setSelfEmployeeId(selfId);
-      if (_showRaised) {
-        provider.fetchRaisedByMe();
-        provider.fetchRaisedStats();
-      }
-      if (_showAgainst) provider.fetchAgainstMe();
-    });
   }
 
   @override
@@ -197,24 +126,15 @@ class _NcListScreenState extends State<NcListScreen>
     super.dispose();
   }
 
+  // Each list loads itself (one page at a time) when it is first built — see
+  // _NcListBodyState — so a side that is never opened never asks the server.
   @override
   Widget build(BuildContext context) {
-    // The list and its tiles are two requests under the same filters.
-    Future<void> refreshRaised() {
-      final p = context.read<NcProvider>();
-      return Future.wait([p.fetchRaisedByMe(), p.fetchRaisedStats()]);
-    }
     if (widget.mode == NcListMode.auditorOnly) {
-      return _RaisedByMeList(
-        onRefresh: refreshRaised,
-        initialStatusFilter: widget.initialStatusFilter,
-      );
+      return _NcListBody(raised: true, initialStatusFilter: widget.initialStatusFilter);
     }
     if (widget.mode == NcListMode.auditeeOnly) {
-      return _AgainstMeList(
-        onRefresh: () => context.read<NcProvider>().fetchAgainstMe(),
-        initialStatusFilter: widget.initialStatusFilter,
-      );
+      return _NcListBody(raised: false, initialStatusFilter: widget.initialStatusFilter);
     }
     return Column(
       children: [
@@ -229,14 +149,8 @@ class _NcListScreenState extends State<NcListScreen>
           child: TabBarView(
             controller: _tabController,
             children: [
-              _RaisedByMeList(
-                onRefresh: refreshRaised,
-                initialStatusFilter: widget.initialStatusFilter,
-              ),
-              _AgainstMeList(
-                onRefresh: () => context.read<NcProvider>().fetchAgainstMe(),
-                initialStatusFilter: widget.initialStatusFilter,
-              ),
+              _NcListBody(raised: true, initialStatusFilter: widget.initialStatusFilter),
+              _NcListBody(raised: false, initialStatusFilter: widget.initialStatusFilter),
             ],
           ),
         ),
@@ -331,38 +245,49 @@ Widget _filteredEmpty(BuildContext context) => EmptyState(
   ),
 );
 
-/// Free-text narrowing over what is already loaded (like the Audits tab's
-/// search): the NC's title/id, its audit's title and both people's names.
-bool _ncMatchesSearch(NcModel n, String query) {
-  bool has(String? v) => v != null && v.toLowerCase().contains(query);
-  return has(n.title) ||
-      has(n.ncId) ||
-      has(n.auditTitle) ||
-      has(n.auditee.name) ||
-      has(n.raisedBy.name);
-}
-
-class _RaisedByMeList extends StatefulWidget {
-  final Future<void> Function() onRefresh;
+/// One side's NC list — "Raised by me" (auditor, [raised]) or "Against me"
+/// (auditee) — one page at a time.
+///
+/// The first page loads when the screen opens, on a filter / chip / search change
+/// and on pull-to-refresh; the next pages follow by themselves as the user scrolls
+/// within [ncLoadMoreExtent] of the end (a small spinner at the foot; "Try again"
+/// when a page failed) until the server's total is on screen. The status chip and
+/// the search text are the SERVER's (NcPagedList sends them), so the list is a
+/// list of what is being looked at, however long.
+class _NcListBody extends StatefulWidget {
+  final bool raised;
   final String? initialStatusFilter;
 
-  const _RaisedByMeList({required this.onRefresh, this.initialStatusFilter});
+  const _NcListBody({required this.raised, this.initialStatusFilter});
 
   @override
-  State<_RaisedByMeList> createState() => _RaisedByMeListState();
+  State<_NcListBody> createState() => _NcListBodyState();
 }
 
-class _RaisedByMeListState extends State<_RaisedByMeList> {
-  static const _memoryId = 'nc-raised';
+class _NcListBodyState extends State<_NcListBody> {
+  /// Search text goes to the server this long after the last keystroke.
+  static const _searchDelay = Duration(milliseconds: 400);
+
+  late final NcProvider _provider;
+  late final String _memoryId;
   late final ListScreenMemory _saved;
   late String _statusFilter;
   late final TextEditingController _search;
   late final ScrollController _scroll;
+  Timer? _debounce;
+  bool _afterBuildQueued = false;
+  // How many first pages had landed when this screen last looked: one more means
+  // the list was replaced (a filter moved) and the scroll goes back to the top.
+  late int _seenFirstPages;
   String _query = '';
+
+  NcPagedList get _list => widget.raised ? _provider.raisedList : _provider.mineList;
 
   @override
   void initState() {
     super.initState();
+    _provider = context.read<NcProvider>();
+    _memoryId = widget.raised ? 'nc-raised' : 'nc-against';
     final memory = context.read<ListViewMemory>();
     // A dashboard tile jump re-keys this screen with the tile's own filter:
     // start fresh for it. A plain remount keeps what was remembered.
@@ -374,67 +299,139 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
     _statusFilter = _saved.chip;
     _query = _saved.search;
     _search = TextEditingController(text: _saved.search);
-    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
-      ..addListener(() {
-        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
-      });
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)..addListener(_onScroll);
+    // What the list holds must be the chip and search this screen shows, from its
+    // first build (a list left narrowed otherwise is dropped here, and read again
+    // below).
+    _list.setNarrowing(chip: _statusFilter, search: _query);
+    _seenFirstPages = _list.firstPageCount;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _open();
+    });
   }
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _search.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
+  void _open() {
+    // Must be set before the fetch below — see DashboardProvider/
+    // AuditsProvider's identical _scopeParams pattern: "Me" resolves to an
+    // explicit employeeIds=<selfId>, which needs this known first. The auditee
+    // side needs it just the same (it too is "Me" by default).
+    final selfId = context.read<AuthProvider>().user?.id;
+    if (selfId != null) _provider.setSelfEmployeeId(selfId);
+    if (widget.raised) {
+      // A list that still holds what this screen was left showing is refreshed
+      // in place (its scroll position is still good), else page 1 is read.
+      _provider.openRaised();
+      _provider.fetchRaisedStats();
+    } else {
+      _provider.openAgainstMe();
+    }
+  }
+
+  /// Page 1 again (and, for NC Monitoring, its tiles) — pull-to-refresh and the
+  /// error state's Retry.
+  Future<void> _refresh() => widget.raised
+      ? Future.wait([_provider.fetchRaisedByMe(), _provider.fetchRaisedStats()])
+      : _provider.fetchAgainstMe();
+
+  // A chip, tile or search change: the server answers it, so page 1 is read again
+  // (the tile ids it needs are already held — only a filter change asks for them
+  // afresh).
+  void _reload() => widget.raised
+      ? _provider.fetchRaisedByMe(fresh: false)
+      : _provider.fetchAgainstMe(fresh: false);
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    _saved.scroll = _scroll.offset;
+    _maybeLoadMore();
+  }
+
+  void _maybeLoadMore() {
+    final list = _list;
+    if (!list.hasMore || list.isLoading || list.isLoadingMore) return;
+    if (nearListEnd(_scroll)) list.loadMore();
+  }
+
+  // After each build: scroll back to the top when the list was replaced, and keep
+  // loading while the end is still near (a tall screen — or a short page — would
+  // otherwise never scroll, so never ask for more).
+  void _afterBuild(NcPagedList list) {
+    if (_afterBuildQueued) return;
+    final replaced = list.firstPageCount != _seenFirstPages;
+    final canLoad = list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
+    if (!replaced && !canLoad) return;
+    _afterBuildQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _afterBuildQueued = false;
+      if (!mounted) return;
+      if (_list.firstPageCount != _seenFirstPages) {
+        _seenFirstPages = _list.firstPageCount;
+        _saved.scroll = 0;
+        if (_scroll.hasClients && _scroll.offset > 0) _scroll.jumpTo(0);
+      }
+      _maybeLoadMore();
+    });
+  }
+
   void _onSearch(String v) {
     _saved.search = v;
     setState(() => _query = v);
+    _debounce?.cancel();
+    void apply() {
+      if (mounted && _list.setNarrowing(search: v)) _reload();
+    }
+
+    if (v.trim().isEmpty) {
+      apply();
+    } else {
+      _debounce = Timer(_searchDelay, apply);
+    }
   }
 
   void _onStatus(String v) {
     _saved.chip = v;
     setState(() => _statusFilter = v);
+    if (_list.setNarrowing(chip: v)) _reload();
   }
 
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<NcProvider>();
-    final showLoading = provider.isLoadingRaised && provider.raisedByMe.isEmpty;
-    final showError =
-        provider.raisedError != null && provider.raisedByMe.isEmpty;
-    final showEmpty = !showLoading && !showError && provider.raisedByMe.isEmpty;
-    final query = _query.trim().toLowerCase();
+    final list = _list;
+    final items = list.items;
+    final showError = list.error != null && items.isEmpty;
+    final showLoading = !showError && items.isEmpty && (list.isLoading || !list.hasLoaded);
+    final showEmpty = !showLoading && !showError && items.isEmpty;
+    // Narrowed by the chip or the search (the server answered with none), as
+    // against nothing at all under the shared filters.
+    final narrowed = list.chip != 'All' || list.search.isNotEmpty;
     // A tile's own filter narrows by the NC ids the server counted under it, so
-    // the list under a tile always has exactly the tile's number of rows; with
-    // no tiles loaded (or a filter that is no tile — All / Open / Closed) the
-    // long-standing _matchesFilter rules apply.
-    final stats = provider.raisedStats;
-    final bucket = _bucketOfFilter(_statusFilter);
-    final bucketIds = bucket != null && stats != null && stats.hasBuckets
-        ? stats.idsFor(bucket).toSet()
-        : null;
-    final filtered = provider.raisedByMe
-        .where(
-          (n) =>
-              (bucketIds != null
-                  ? bucketIds.contains(n.id)
-                  : _matchesFilter(n, _statusFilter)) &&
-              (query.isEmpty || _ncMatchesSearch(n, query)),
-        )
-        .toList();
+    // the list under a tile always has exactly the tile's number of rows.
+    final stats = widget.raised ? provider.raisedStats : null;
+    final bucket = ncBucketOfChip(_statusFilter);
+    _afterBuild(list);
     return Column(
       children: [
         // Kept visible through loading/error/empty too — an empty "Me"
         // list (nobody raised against your own scope) is exactly when
-        // switching to "Team" to check your reports' NCs matters most.
+        // switching to "Team" to check your reports' NCs matters most. The
+        // auditee side has the same Me/Team scope as the web app's
+        // Auditee.jsx TeamFilterPanel.
         _NcListHeader(
           searchController: _search,
           onSearchChanged: _onSearch,
           statusFilter: _statusFilter,
           onStatusChanged: _onStatus,
-          filters: _auditorStatusFilters,
-          labels: _auditorStatusFilterLabels,
+          filters: widget.raised ? _auditorStatusFilters : _auditeeStatusFilters,
+          labels: widget.raised ? _auditorStatusFilterLabels : _auditeeStatusFilterLabels,
         ),
         // The same six tiles as the Final Report's NCs tab and the Auditee
         // dashboard — Total NC, In Progress, Overdue, Pending Approval,
@@ -454,6 +451,20 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
               ),
             ),
           ),
+        // The server's own count of what the list holds, however many pages
+        // are on screen so far.
+        if (items.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 2),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: NcCountLine(
+                loaded: items.length,
+                total: list.total,
+                hasMore: list.hasMore,
+              ),
+            ),
+          ),
         Expanded(
           // MaxWidthScroll wraps this whole branch (loading/error/empty
           // states included, not just the ListView) — a thin wrap around
@@ -464,20 +475,21 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
             child: showLoading
                 ? const AppLoading()
                 : showError
-                ? ErrorState(
-                    message: provider.raisedError!,
-                    onRetry: widget.onRefresh,
-                  )
-                : showEmpty
+                ? ErrorState(message: list.error!, onRetry: _refresh)
+                : showEmpty && !narrowed
                 ? (provider.hasActiveFilters
                       ? _filteredEmpty(context)
-                      : const EmptyState(
-                          icon: Icons.fact_check_outlined,
-                          title: 'No NCs raised yet',
+                      : EmptyState(
+                          icon: widget.raised
+                              ? Icons.fact_check_outlined
+                              : Icons.thumb_up_outlined,
+                          title: widget.raised
+                              ? 'No NCs raised yet'
+                              : 'No NCs against you — great work!',
                         ))
                 : RefreshIndicator(
-                    onRefresh: widget.onRefresh,
-                    child: filtered.isEmpty
+                    onRefresh: _refresh,
+                    child: showEmpty
                         ? ListView(
                             physics: const AlwaysScrollableScrollPhysics(),
                             children: [
@@ -485,8 +497,8 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
                                 height: MediaQuery.of(context).size.height * 0.5,
                                 child: EmptyState(
                                   icon: Icons.filter_alt_off_outlined,
-                                  title: query.isNotEmpty
-                                      ? 'No NCs match "${_query.trim()}"'
+                                  title: list.search.isNotEmpty
+                                      ? 'No NCs match "${list.search}"'
                                       : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
                                 ),
                               ),
@@ -494,26 +506,20 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
                           )
                         : ListView.separated(
                             controller: _scroll,
+                            physics: const AlwaysScrollableScrollPhysics(),
                             padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                            itemCount: filtered.length,
-                            separatorBuilder: (_, _) =>
-                                const SizedBox(height: 10),
+                            itemCount: items.length + 1,
+                            separatorBuilder: (_, _) => const SizedBox(height: 10),
                             itemBuilder: (_, i) {
-                              final nc = filtered[i];
-                              return _NcCard(
-                                nc: nc,
-                                subtitle: 'Against ${nc.auditee.name}',
-                                actionLabel:
-                                    (nc.status == 'Response Submitted' ||
-                                        nc.status == 'Verification')
-                                    ? 'Review'
-                                    : (nc.status == 'Closed' ? 'View' : null),
-                                onTap: () => Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) => NcReviewScreen(nc: nc),
-                                  ),
-                                ),
-                              );
+                              if (i == items.length) {
+                                return NcPageFooter(
+                                  hasMore: list.hasMore,
+                                  isLoadingMore: list.isLoadingMore,
+                                  error: list.moreError,
+                                  onRetry: () => list.loadMore(retry: true),
+                                );
+                              }
+                              return _card(context, items[i]);
                             },
                           ),
                   ),
@@ -522,161 +528,35 @@ class _RaisedByMeListState extends State<_RaisedByMeList> {
       ],
     );
   }
-}
 
-class _AgainstMeList extends StatefulWidget {
-  final Future<void> Function() onRefresh;
-  final String? initialStatusFilter;
-
-  const _AgainstMeList({required this.onRefresh, this.initialStatusFilter});
-
-  @override
-  State<_AgainstMeList> createState() => _AgainstMeListState();
-}
-
-class _AgainstMeListState extends State<_AgainstMeList> {
-  static const _memoryId = 'nc-against';
-  late final ListScreenMemory _saved;
-  late String _statusFilter;
-  late final TextEditingController _search;
-  late final ScrollController _scroll;
-  String _query = '';
-
-  @override
-  void initState() {
-    super.initState();
-    final memory = context.read<ListViewMemory>();
-    // A dashboard tile jump re-keys this screen with the tile's own filter:
-    // start fresh for it. A plain remount keeps what was remembered.
-    if (widget.initialStatusFilter != null) memory.forget(_memoryId);
-    _saved = memory.screen(_memoryId);
-    if (widget.initialStatusFilter != null) {
-      _saved.chip = widget.initialStatusFilter!;
+  Widget _card(BuildContext context, NcModel nc) {
+    if (widget.raised) {
+      return _NcCard(
+        nc: nc,
+        subtitle: 'Against ${nc.auditee.name}',
+        actionLabel: (nc.status == 'Response Submitted' || nc.status == 'Verification')
+            ? 'Review'
+            : (nc.status == 'Closed' ? 'View' : null),
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(builder: (_) => NcReviewScreen(nc: nc)),
+        ),
+      );
     }
-    _statusFilter = _saved.chip;
-    _query = _saved.search;
-    _search = TextEditingController(text: _saved.search);
-    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
-      ..addListener(() {
-        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
-      });
-  }
-
-  @override
-  void dispose() {
-    _search.dispose();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  void _onSearch(String v) {
-    _saved.search = v;
-    setState(() => _query = v);
-  }
-
-  void _onStatus(String v) {
-    _saved.chip = v;
-    setState(() => _statusFilter = v);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final provider = context.watch<NcProvider>();
-    final showLoading = provider.isLoadingMine && provider.raisedAgainstMe.isEmpty;
-    final showError = provider.mineError != null && provider.raisedAgainstMe.isEmpty;
-    final showEmpty = !showLoading && !showError && provider.raisedAgainstMe.isEmpty;
-    final query = _query.trim().toLowerCase();
-    final filtered = provider.raisedAgainstMe
-        .where(
-          (n) =>
-              _matchesFilter(n, _statusFilter) &&
-              (query.isEmpty || _ncMatchesSearch(n, query)),
-        )
-        .toList();
-    return Column(
-      children: [
-        // Kept visible through loading/error/empty too — same reasoning as
-        // _RaisedByMeList's identical row: an empty "Me" list (nobody's
-        // raised anything against your own scope) is exactly when switching
-        // to "Team" to check your downstream reports' NCs matters most. Same
-        // Me/Team scope as the web app's Auditee.jsx TeamFilterPanel.
-        _NcListHeader(
-          searchController: _search,
-          onSearchChanged: _onSearch,
-          statusFilter: _statusFilter,
-          onStatusChanged: _onStatus,
-          filters: _auditeeStatusFilters,
-          labels: _auditeeStatusFilterLabels,
-        ),
-        Expanded(
-          // See _RaisedByMeListState's identical wrap above: a thin
-          // MaxWidthScroll around whatever this Expanded shows, loading/
-          // error/empty states included.
-          child: MaxWidthScroll(
-            child: showLoading
-                ? const AppLoading()
-                : showError
-                ? ErrorState(
-                    message: provider.mineError!,
-                    onRetry: widget.onRefresh,
-                  )
-                : showEmpty
-                ? (provider.hasActiveFilters
-                      ? _filteredEmpty(context)
-                      : const EmptyState(
-                          icon: Icons.thumb_up_outlined,
-                          title: 'No NCs against you — great work!',
-                        ))
-                : RefreshIndicator(
-                    onRefresh: widget.onRefresh,
-                    child: filtered.isEmpty
-                        ? ListView(
-                            physics: const AlwaysScrollableScrollPhysics(),
-                            children: [
-                              SizedBox(
-                                height: MediaQuery.of(context).size.height * 0.5,
-                                child: EmptyState(
-                                  icon: Icons.filter_alt_off_outlined,
-                                  title: query.isNotEmpty
-                                      ? 'No NCs match "${_query.trim()}"'
-                                      : 'No ${_statusFilter == 'All' ? '' : '$_statusFilter '}NCs',
-                                ),
-                              ),
-                            ],
-                          )
-                        : ListView.separated(
-                            controller: _scroll,
-                            padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                            itemCount: filtered.length,
-                            separatorBuilder: (_, _) => const SizedBox(height: 10),
-                            itemBuilder: (_, i) {
-                              final nc = filtered[i];
-                              return _NcCard(
-                                nc: nc,
-                                subtitle: 'Raised by ${nc.raisedBy.name}',
-                                actionLabel: nc.status == 'Raised' ? 'Respond' : null,
-                                onTap: () {
-                                  if (nc.status == 'Raised') {
-                                    Navigator.of(context).push(
-                                      MaterialPageRoute(
-                                        builder: (_) => NcResponseScreen(nc: nc),
-                                      ),
-                                    );
-                                  } else {
-                                    Navigator.of(context).push(
-                                      MaterialPageRoute(
-                                        builder: (_) => NcReviewScreen(nc: nc),
-                                      ),
-                                    );
-                                  }
-                                },
-                              );
-                            },
-                          ),
-                  ),
-          ),
-        ),
-      ],
+    return _NcCard(
+      nc: nc,
+      subtitle: 'Raised by ${nc.raisedBy.name}',
+      actionLabel: nc.status == 'Raised' ? 'Respond' : null,
+      onTap: () {
+        if (nc.status == 'Raised') {
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => NcResponseScreen(nc: nc)),
+          );
+        } else {
+          Navigator.of(context).push(
+            MaterialPageRoute(builder: (_) => NcReviewScreen(nc: nc)),
+          );
+        }
+      },
     );
   }
 }

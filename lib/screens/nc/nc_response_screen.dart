@@ -112,9 +112,9 @@ class _NcResponseScreenState extends State<NcResponseScreen> {
     // auditor who raised this NC), never the auditee acting here, so
     // raisedAgainstMe and the dashboard's NC tallies need an explicit
     // refresh to show "Response Submitted" right away (same pattern as
-    // nc_review_screen.dart's _handle).
+    // nc_review_screen.dart's _handle; the loaded pages are re-read in place).
     try {
-      await Future.wait([ncProvider.fetchAgainstMe(), dashboardProvider.refreshAll()]);
+      await Future.wait([ncProvider.refreshAgainstMe(), dashboardProvider.refreshAll()]);
     } catch (_) {
       // The response itself is saved; a failed refresh must not leave the
       // button stuck on "submitting" — the lists refresh on their next load.

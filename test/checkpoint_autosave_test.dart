@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:internal_audit_app/models/upload_phase.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:internal_audit_app/models/audit_detail_model.dart';
@@ -93,7 +94,10 @@ void main() {
               maxScore: 10,
               draftKey: 'draft:p1',
               onSave: onSave,
-              onUploadPhotos: ({required photos, onProgress}) => onUpload(photos: photos),
+              onUploadPhotos: ({required photos, onProgress}) async {
+                final error = await onUpload(photos: photos);
+                return UploadPhotosResult(error: error);
+              },
               onSyncStateChanged: states.add,
             ),
           ),

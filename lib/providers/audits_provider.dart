@@ -27,7 +27,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // "what do I have to do", not "what does my whole reporting line have to
   // do"; Team is the opt-in widening from there, one tap away. This
   // deliberately no longer mirrors the web TeamFilterPanel's own "All"
-  // default: the two surfaces answer different questions.
+  // default: the two surfaces answer different questions. The exception is a
+  // Full Access account (plant head, QA head), for whom "just me" opens nearly
+  // empty: main.dart's _RootGate adopts its All Members default right after
+  // login (AuditFilterScope.setDefaultTeamScope), as the web's useSelfScope does.
   @override
   bool isTeamScope = false;
   String? _selfEmployeeId;
@@ -129,6 +132,14 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     calendarInUse = false;
     isLoadingCalendarAudits = false;
     reportAudits = [];
+    reportsTotal = 0;
+    reportsHasMore = false;
+    isLoadingMoreReports = false;
+    reportsMoreError = null;
+    _reportsPages = 0;
+    _reportsLoadedKey = null;
+    _placesGen++;
+    reportPlaces.clear();
     ledLocationIds = const [];
     ledDepartmentIds = const [];
     ledAudits = [];
@@ -182,7 +193,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           // web page refreshes on the same signal); a tab that is not showing
           // just notes it is out of date.
           if (reportsInUse) {
-            fetchReportAudits();
+            // Quiet: re-reads the pages already on screen, so the scroll
+            // position survives the live refresh.
+            fetchReportAudits(quiet: true);
             fetchReportStats();
           } else {
             reportsStale = true;
@@ -497,7 +510,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // it must not read [audits] — that list is fetched with the Audits tab's
   // Include skipped switch and would silently narrow (or widen) the calendar
   // with a pick it can neither show nor clear. Same shared filters otherwise
-  // ([filterParams], not [listFilterParams]).
+  // ([filterParams], not [listFilterParams]) — except the Me / All Members
+  // scope, which follows the Calendar's own rule ([calendarFilterParams]: Me
+  // for everybody unless All Members was picked on the Calendar itself).
   bool calendarInUse = false;
   bool isLoadingCalendarAudits = false;
   List<AuditModel> calendarAudits = [];
@@ -511,7 +526,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     try {
       final res = await _dio.get(
         ApiConstants.myAudits,
-        queryParameters: filterParams,
+        queryParameters: calendarFilterParams,
       );
       if (stale()) return;
       calendarAudits = (res.data['data'] as List? ?? [])
@@ -608,12 +623,47 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // `batchZoneCount` (the bundle's total) so a card can say "2 of 5 locations".
   // That replaces the old "My audits / My locations" switch: with All Members
   // the leader's places are in.
-  // ReportsScreen narrows the loaded list client-side via status chips, search
-  // and tile picks, the same "fetch once, filter locally" pattern
-  // MyAuditsScreen uses.
+  // The list is read ONE PAGE at a time ([reportPageSize] groups): the first page
+  // on open / a filter, chip, tile or search change / pull-to-refresh, the next
+  // ones appended as the screen scrolls near the end ([fetchMoreReportAudits]).
+  // The status chip, the search text and the tile picks are the SERVER's filters
+  // (`status` / `search`), so every page is a page of what is on screen and
+  // [reportsTotal] is the true count.
   bool isLoadingReports = false;
   String? reportsError;
+
+  /// The rows loaded so far, in the server's order (newest first), WITHOUT the
+  /// pages not read yet.
   List<AuditModel> reportAudits = [];
+
+  /// How many groups the server says match — a bundle or a recurring series is
+  /// ONE, so this is the "N reports" of the list, not [reportAudits].length.
+  int reportsTotal = 0;
+
+  /// There are pages left to read, the next page is on its way, and the next
+  /// page could not be read ([reportsMoreError], the footer's "Try again").
+  bool reportsHasMore = false;
+  bool isLoadingMoreReports = false;
+  String? reportsMoreError;
+
+  /// Groups per page — the web's table also asks for 20.
+  static const reportPageSize = 20;
+  // A live refresh re-reads the pages already on screen, at most this many (more
+  // are one scroll away again).
+  static const _reportRefreshPages = 5;
+  // Pages read so far, and the query they answered ('all params but the page') —
+  // a first page for another query empties the list; for the same one it keeps it
+  // until the answer lands.
+  int _reportsPages = 0;
+  String? _reportsLoadedKey;
+
+  /// The location-wise view's rows, per place header ([ReportLocationStats.key]):
+  /// loaded lazily, [reportPlacePageSize] of the place's audit ids at a time.
+  /// Emptied whenever the stats are asked again (the ids they carry may have
+  /// moved) and on logout.
+  final Map<String, ReportPlaceRows> reportPlaces = {};
+  static const reportPlacePageSize = 20;
+  int _placesGen = 0;
 
   /// What this employee leads, from GET /audits/led-places: location ids and
   /// department ids. Empty = not a leader, which is how the Audits tab decides
@@ -632,17 +682,19 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// What the Reports tab currently asks for, kept here so a FILTER change
   /// (which reaches this provider through refetchForFilters) reloads the report
   /// list and tiles too: the tab registers itself while it is the one showing
-  /// ([reportsInUse]), and says which status chip / search text the tiles are
-  /// for. [reportsStale] says a filter moved while it was not showing.
+  /// ([reportsInUse]), and says which status chip / search text the list and the
+  /// tiles are for. [reportsStale] says a filter moved while it was not showing.
   bool reportsInUse = false;
   bool reportsStale = false;
   String? reportsStatus;
   String reportsSearch = '';
 
-  /// The tile picks (ReportStats.idsFor keys) and whether the location-wise view
-  /// is on: with both, the place headers are asked for over just the picked
-  /// tiles' audits (the server's `onlyIds`), so a header never counts reports the
-  /// list under it is not showing. The tiles themselves keep the whole set.
+  /// The tile picks (ReportStats.tileStatusLabels keys) — sent with the list as a
+  /// `status`, ORed with [reportsStatus] — and whether the location-wise view is
+  /// on: with both, the place headers are asked for over just the picked tiles'
+  /// audits (the server's `onlyIds`, from ReportStats.idsFor), so a header never
+  /// counts reports the list under it is not showing. The tiles themselves keep
+  /// the whole set.
   Set<String> reportsTileKeys = const {};
   bool reportsByLocation = false;
 
@@ -789,30 +841,124 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
-  static int _byRecency(AuditModel a, AuditModel b) {
-    final ad = a.completedDate ?? a.scheduledDate;
-    final bd = b.completedDate ?? b.scheduledDate;
-    if (ad == null && bd == null) return 0;
-    if (ad == null) return 1;
-    if (bd == null) return -1;
-    return bd.compareTo(ad);
+  // The params every Reports-list request shares: the shared filters, the search
+  // text and the status chip. A tile pick and the paging are added on top of it.
+  Map<String, dynamic> _reportBaseParams() {
+    final params = <String, dynamic>{...?filterParams};
+    final search = reportsSearch.trim();
+    if (search.isNotEmpty) params['search'] = search;
+    if (reportsStatus != null) params['status'] = reportsStatus;
+    return params;
   }
 
-  /// Loads the Reports tab's list — every audit GET /audits/report returns under
-  /// the current shared filters. The stat tiles are a separate request,
-  /// [fetchReportStats].
-  Future<void> fetchReportAudits() async {
+  // What the first page (and every later one) asks for: the base params plus the
+  // tile picks, which are a `status` the server reads as an OR-list — the chip's
+  // label and each tile's label together (a tile's label is the one the list
+  // endpoint filters by, so a Skipped tile really returns the Skipped audits).
+  // The 'other' tile has no label (a bundle that fits no bucket): it is asked by
+  // the ids the stats counted under the picked tiles, a small set by nature that
+  // the server answers in one page.
+  Map<String, dynamic> _reportListParams() {
+    final params = _reportBaseParams();
+    if (reportsTileKeys.isEmpty) return params;
+    if (reportsTileKeys.contains('other')) {
+      final stats = reportStats;
+      params['ids'] = {
+        for (final k in reportsTileKeys) ...?stats?.idsFor(k),
+      }.join(',');
+      return params;
+    }
+    final status = ReportStats.statusCsv(chip: reportsStatus, tiles: reportsTileKeys);
+    if (status != null) params['status'] = status;
+    return params;
+  }
+
+  // 'The query a loaded page answered' — every param but the page number.
+  static String _queryKey(Map<String, dynamic> params) =>
+      params.entries.map((e) => '${e.key}=${e.value}').join('&');
+
+  // Reads pages [firstPage]..[lastPage] of GET /audits/report, [reportPageSize]
+  // groups at a time, appended to [from]; null when the answer went stale on the
+  // way. The server pages over GROUPS (a bundle, or a recurring series, is one
+  // group whose rows all come back with it), so `total` counts groups and a page
+  // can hold more rows than `limit`: the end is worked out from `total` (and the
+  // `limit` the server echoes — an `ids` request answers everything in one page),
+  // never from how many rows have arrived. An empty page ends the list however
+  // large `total` claims to be.
+  Future<({List<AuditModel> rows, int total, bool hasMore, int pages})?> _readReportPages(
+    Map<String, dynamic> params, {
+    required int firstPage,
+    required int lastPage,
+    List<AuditModel> from = const [],
+    required bool Function() isStale,
+  }) async {
+    final rows = [...from];
+    final seen = {for (final a in rows) a.id};
+    var total = rows.length;
+    var more = true;
+    var page = firstPage - 1;
+    while (page < lastPage && more) {
+      final next = page + 1;
+      final res = await _dio.get(
+        ApiConstants.auditsReport,
+        queryParameters: {...params, 'page': next, 'limit': reportPageSize},
+      );
+      if (isStale()) return null;
+      final data = res.data['data'];
+      final raw = data is Map ? (data['audits'] as List? ?? const []) : const [];
+      for (final e in raw.whereType<Map>()) {
+        final audit = AuditModel.fromJson(Map<String, dynamic>.from(e));
+        if (seen.add(audit.id)) rows.add(audit);
+      }
+      page = next;
+      total = data is Map ? (data['total'] as num?)?.toInt() ?? rows.length : rows.length;
+      final size = data is Map ? (data['limit'] as num?)?.toInt() ?? reportPageSize : reportPageSize;
+      more = raw.isNotEmpty && page * size < total;
+    }
+    return (rows: rows, total: total, hasMore: more, pages: page);
+  }
+
+  /// Loads the Reports tab's list — PAGE 1 of GET /audits/report under the shared
+  /// filters, the status chip, the search text and the tile picks ([reportsStatus]
+  /// / [reportsSearch] / [reportsTileKeys], all sent to the server). The stat tiles
+  /// are a separate request, [fetchReportStats].
+  ///
+  /// A call for another query than the one on screen empties the list at once (the
+  /// screen shows its spinner); for the same one (pull-to-refresh, a live update)
+  /// what is shown stays until the answer lands, and a failure then keeps it.
+  /// [quiet] — a live update — re-reads the pages already on screen (at most
+  /// [_reportRefreshPages]) instead of starting over from the first one. Only the
+  /// newest call writes anything; an answer for a query that was left meanwhile, or
+  /// for an account that has signed out, is dropped.
+  Future<void> fetchReportAudits({bool quiet = false}) async {
     final epoch = _epoch;
     final seq = ++_reportAuditsSeq;
     bool stale() => epoch != _epoch || seq != _reportAuditsSeq;
+    final params = _reportListParams();
+    final key = _queryKey(params);
+    final sameQuery = key == _reportsLoadedKey;
+    final pages = quiet && sameQuery ? _reportsPages.clamp(1, _reportRefreshPages) : 1;
+    if (!sameQuery) {
+      reportAudits = [];
+      reportsTotal = 0;
+      reportsHasMore = false;
+      _reportsPages = 0;
+      _reportsLoadedKey = null;
+    }
     isLoadingReports = true;
     reportsError = null;
+    // A next page that was on its way belonged to what is being replaced.
+    isLoadingMoreReports = false;
+    reportsMoreError = null;
     notifyListeners();
     try {
-      final list = await _fetchReportPages(stale);
-      if (stale()) return;
-      list.sort(_byRecency);
-      reportAudits = list;
+      final read = await _readReportPages(params, firstPage: 1, lastPage: pages, isStale: stale);
+      if (read == null || stale()) return;
+      reportAudits = read.rows;
+      reportsTotal = read.total;
+      reportsHasMore = read.hasMore;
+      _reportsPages = read.pages;
+      _reportsLoadedKey = key;
       reportsStale = false;
     } on DioException catch (e) {
       if (!stale()) {
@@ -830,53 +976,130 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
-  // Every page of GET /audits/report, 100 groups at a time (the endpoint's
-  // maximum) — the Reports list is one scroll, not a paginated table. The
-  // server pages over GROUPS (a bundle, or a recurring series, is one group
-  // whose rows all come back with it), so `total` counts groups and a page can
-  // hold more than `limit` rows: the last page is worked out from `total`, never
-  // from how many rows have arrived. [isStale] lets a superseded load stop
-  // paging.
-  Future<List<AuditModel>> _fetchReportPages(bool Function() isStale) async {
-    const limit = 100;
-    final params = <String, dynamic>{...?filterParams, 'limit': limit};
-    final seen = <String>{};
-    final all = <AuditModel>[];
-    var page = 1;
-    while (page <= 20) {
-      final res = await _dio.get(
-        ApiConstants.auditsReport,
-        queryParameters: {...params, 'page': page},
+  /// The next page of the Reports list, appended — the screen calls it as the
+  /// user scrolls near the end. Does nothing while a page is already loading,
+  /// when everything is loaded, and — unless [retry] — after a failure (so a
+  /// scroll listener cannot hammer a server that is down; the footer's "Try
+  /// again" passes [retry]). A failed page leaves everything loaded as it was.
+  Future<void> fetchMoreReportAudits({bool retry = false}) async {
+    if (isLoadingReports || isLoadingMoreReports || !reportsHasMore) return;
+    if (reportsMoreError != null && !retry) return;
+    final params = _reportListParams();
+    // Only ever a continuation of what is on screen.
+    if (_queryKey(params) != _reportsLoadedKey) return;
+    final epoch = _epoch;
+    // Not bumped: a first page started meanwhile supersedes this one.
+    final seq = _reportAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _reportAuditsSeq;
+    isLoadingMoreReports = true;
+    reportsMoreError = null;
+    notifyListeners();
+    try {
+      final next = _reportsPages + 1;
+      final read = await _readReportPages(
+        params,
+        firstPage: next,
+        lastPage: next,
+        from: reportAudits,
+        isStale: stale,
       );
-      if (isStale()) return all;
-      final data = res.data['data'];
-      final rows = data is Map ? (data['audits'] as List? ?? []) : const [];
-      for (final e in rows.whereType<Map>()) {
-        final audit = AuditModel.fromJson(Map<String, dynamic>.from(e));
-        if (seen.add(audit.id)) all.add(audit);
+      if (read == null || stale()) return;
+      reportAudits = read.rows;
+      reportsTotal = read.total;
+      reportsHasMore = read.hasMore;
+      _reportsPages = read.pages;
+    } on DioException catch (e) {
+      if (!stale()) {
+        reportsMoreError = extractErrorMessage(e, fallback: 'Could not load more reports.');
       }
-      final total = data is Map ? (data['total'] as num?)?.toInt() ?? 0 : 0;
-      if (rows.isEmpty || page * limit >= total) break;
-      page++;
+    } catch (e, st) {
+      debugPrint('AuditsProvider.fetchMoreReportAudits: unreadable answer: $e\n$st');
+      if (!stale()) reportsMoreError = 'Could not load more reports.';
+    } finally {
+      if (!stale()) {
+        isLoadingMoreReports = false;
+        notifyListeners();
+      }
     }
-    return all;
+  }
+
+  /// Location-wise view: the next [reportPlacePageSize] audits of one place — read
+  /// by exactly the audit ids the place's header counted ([ReportLocationStats
+  /// .auditIds], the way the web's page loads them), so a place's rows are the
+  /// ones its number is about. The first call loads the first slice, each later
+  /// one the next ("Show more", or "Try again" after a failure); nothing happens
+  /// while a slice is loading or once every id has been read. The chip and the
+  /// search narrow it like the list (never the tile picks: the ids already are
+  /// the tiles' audits).
+  Future<void> loadReportPlaceRows(ReportLocationStats place) async {
+    final before = reportPlaces[place.key];
+    if (before != null && before.loading) return;
+    final ids = place.auditIds;
+    final from = before?.consumed ?? 0;
+    if (before != null && before.error == null && from >= ids.length) return;
+    final slice = ids.skip(from).take(reportPlacePageSize).toList();
+    final epoch = _epoch;
+    final gen = _placesGen;
+    bool stale() => epoch != _epoch || gen != _placesGen;
+    final shown = before?.audits ?? const <AuditModel>[];
+    reportPlaces[place.key] = ReportPlaceRows(audits: shown, consumed: from, loading: true);
+    notifyListeners();
+    ReportPlaceRows next;
+    try {
+      final rows = [...shown];
+      if (slice.isNotEmpty) {
+        final res = await _dio.get(
+          ApiConstants.auditsReport,
+          queryParameters: {..._reportBaseParams(), 'ids': slice.join(',')},
+        );
+        if (stale()) return;
+        final data = res.data['data'];
+        final raw = data is Map ? (data['audits'] as List? ?? const []) : const [];
+        final asked = slice.toSet();
+        final seen = {for (final a in rows) a.id};
+        for (final e in raw.whereType<Map>()) {
+          final audit = AuditModel.fromJson(Map<String, dynamic>.from(e));
+          // Only what was asked for: a place's rows are the audits its header counted.
+          if (asked.contains(audit.id) && seen.add(audit.id)) rows.add(audit);
+        }
+      }
+      next = ReportPlaceRows(audits: rows, consumed: from + slice.length);
+    } on DioException catch (e) {
+      if (stale()) return;
+      next = ReportPlaceRows(
+        audits: shown,
+        consumed: from,
+        error: extractErrorMessage(e, fallback: 'Could not load these reports.'),
+      );
+    } catch (e, st) {
+      debugPrint('AuditsProvider.loadReportPlaceRows: unreadable answer: $e\n$st');
+      if (stale()) return;
+      next = ReportPlaceRows(audits: shown, consumed: from, error: 'Could not load these reports.');
+    }
+    reportPlaces[place.key] = next;
+    notifyListeners();
   }
 
   /// The Reports tiles from GET /audits/report/stats under the same filters as
   /// the list, so the numbers equal the web's. The status chip and the search
   /// text narrow them too ([reportsStatus] / [reportsSearch]), so they describe
-  /// the rows on screen. If the request fails [reportStats] stays null and the
-  /// screen works the tiles out from the loaded list.
+  /// the rows on screen; a tile pick does NOT (the tiles stay the whole set's
+  /// numbers, so another one can still be picked). If the request fails
+  /// [reportStats] stays null and the screen works the tiles out from the rows
+  /// loaded so far.
+  ///
+  /// Asking again also throws away the location-wise view's loaded rows
+  /// ([reportPlaces]): the audit ids they were read by come from these stats.
   Future<void> fetchReportStats() async {
     final epoch = _epoch;
     final seq = ++_reportStatsSeq;
+    _placesGen++;
+    reportPlaces.clear();
     isLoadingReportStats = true;
     notifyListeners();
     ReportStats? stats;
     try {
-      final params = <String, dynamic>{...?filterParams};
-      if (reportsStatus != null) params['status'] = reportsStatus;
-      if (reportsSearch.trim().isNotEmpty) params['search'] = reportsSearch.trim();
+      final params = _reportBaseParams();
       final res = await _dio.get(
         ApiConstants.auditsReportStats,
         queryParameters: params,
@@ -908,6 +1131,11 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     reportStats = stats;
     isLoadingReportStats = false;
     notifyListeners();
+    // The 'other' tile is asked by the ids these stats count: a list read before
+    // they landed (a remembered pick, a live update) is read again under them.
+    if (reportsTileKeys.contains('other') && _queryKey(_reportListParams()) != _reportsLoadedKey) {
+      unawaited(fetchReportAudits());
+    }
   }
 
   // Every audit at a place I lead that is in one of [status]'s stages, paged 100

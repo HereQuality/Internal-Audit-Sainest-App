@@ -7,19 +7,26 @@ import 'package:flutter/material.dart';
 /// Location picked, All Members shows every audit at that location whoever the
 /// auditor is, while Me shows only my own there.
 ///
-/// "ME" IS THE DEFAULT everywhere this is used — every provider's own
+/// "ME" IS THE DEFAULT for every ordinary employee — every provider's own
 /// isTeamScope starts false. Someone opening this app on a phone, usually
 /// standing on the floor about to run an audit, is asking "what do I have
 /// to do", not "what does my whole reporting line have to do"; Team is the
 /// deliberate widening from there, one tap away.
 ///
-/// This deliberately does NOT match the web app's TeamFilterPanel, whose
-/// own default is "All". An earlier revision of this file changed mobile
-/// TO Team specifically so the two platforms would agree, on the theory
-/// that a same-account ATS/OTC score reading differently between web and
-/// mobile was a bug. It isn't: the two surfaces answer different
-/// questions, and the number differing is explained by a toggle sitting
-/// right above it. Don't flip it back without saying why here.
+/// The exception is an account whose Role has FULL ACCESS (and a SuperAdmin):
+/// an oversight role for whom "just me" opens nearly empty. It opens on All
+/// Members (AuditFilterScope.defaultTeamScope, set from the signed-in user by
+/// main.dart's _RootGate), exactly as the web does (useSelfScope.js); Me is
+/// still one tap away and is a real narrowing for them. The Calendar alone
+/// keeps Me for everybody (it loads unpaginated data).
+///
+/// For everybody else this deliberately does NOT match the web app's
+/// TeamFilterPanel, whose own default was once "All". An earlier revision of
+/// this file changed mobile TO Team specifically so the two platforms would
+/// agree, on the theory that a same-account ATS/OTC score reading differently
+/// between web and mobile was a bug. It isn't: the two surfaces answer
+/// different questions, and the number differing is explained by a toggle
+/// sitting right above it. Don't flip it back without saying why here.
 ///
 /// This is the coarse control. The filter sheet (widgets/filter_sheet.dart)
 /// is where a specific set of PEOPLE can be picked, and a non-empty pick

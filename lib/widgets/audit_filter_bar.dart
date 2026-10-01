@@ -224,13 +224,16 @@ class AuditFilterBar extends StatelessWidget {
             onRemove: () =>
                 change(current.copyWith(flags: [...current.flags]..remove(f))),
           ),
-      // All Members with nothing more specific is a widening worth showing;
-      // plain Me is the resting state and shows nothing.
-      if (!specificPeople && current.isTeam)
+      // The Me / All Members scope shows a pill only when it differs from the
+      // account's own default (plain Me for an employee, All Members for a Full
+      // Access account): the default is the resting state and shows nothing,
+      // moving off it — to All Members, or, for Full Access, to Me — is worth
+      // showing, and removing the pill goes back to the default.
+      if (!specificPeople && current.isTeam != current.defaultIsTeam)
         _FilterPill(
-          icon: Icons.groups_outlined,
-          label: 'All Members',
-          onRemove: () => change(current.copyWith(isTeam: false)),
+          icon: current.isTeam ? Icons.groups_outlined : Icons.person_outline,
+          label: current.isTeam ? 'All Members' : 'Me',
+          onRemove: () => change(current.copyWith(isTeam: current.defaultIsTeam)),
         ),
     ];
 
@@ -330,6 +333,9 @@ class AuditFilterBar extends StatelessWidget {
   /// elsewhere is not this bar's to wipe (and not on show here).
   AuditFilterSelection _clearedFor(AuditFilterSelection current) {
     return AuditFilterSelection(
+      // Back to the account's own default scope (Me, or All Members for Full
+      // Access), not to a hard-coded Me — each provider supplies its own.
+      resetScope: true,
       statuses: showStatus ? const [] : current.statuses,
       includeSkipped: showStatus ? false : current.includeSkipped,
       flags: showFlag ? const [] : current.flags,

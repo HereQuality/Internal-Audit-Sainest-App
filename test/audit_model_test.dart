@@ -371,6 +371,19 @@ void main() {
       expect(d.batchTimeliness, 'Delayed Completed');
     });
 
+    test('a Not Attempted audit is told by windowClosed / displayStatus — its raw status stays In Progress', () {
+      final closed = AuditDetailModel.fromJson(detailJson(extra: {'status': 'In Progress', 'windowClosed': true, 'displayStatus': 'Not Attempted'}));
+      expect(closed.status, 'In Progress');
+      expect(closed.windowClosed, isTrue);
+      expect(closed.isNotAttempted, isTrue);
+      // either signal alone is enough (an older build of the server sends only one of them)
+      expect(AuditDetailModel.fromJson(detailJson(extra: {'status': 'In Progress', 'windowClosed': true})).isNotAttempted, isTrue);
+      expect(AuditDetailModel.fromJson(detailJson(extra: {'status': 'In Progress', 'displayStatus': 'Not Attempted'})).isNotAttempted, isTrue);
+      // an open audit — even a late one — is not
+      expect(AuditDetailModel.fromJson(detailJson(extra: {'status': 'In Progress', 'displayStatus': 'Overdue'})).isNotAttempted, isFalse);
+      expect(AuditDetailModel.fromJson(detailJson()).isNotAttempted, isFalse);
+    });
+
     test('an older server falls back to status', () {
       final d = AuditDetailModel.fromJson(detailJson());
       expect(d.displayStatus, isNull);

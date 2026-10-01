@@ -141,12 +141,21 @@ class _CalendarScreenState extends State<CalendarScreen> {
 
   Future<void> _openFilters() async {
     final audits = context.read<AuditsProvider>();
-    final result = await showAuditFilterSheet(
-      context,
+    // The Calendar's OWN scope: Me for everybody, a Full Access user included
+    // (it loads unpaginated data — web's `fullAccessDefault: false`), until
+    // All Members is picked here. The sheet therefore opens on what the
+    // calendar really shows, not on the app-wide All Members default.
+    final initial = AuditFilterSelection.fromScope(
+      audits,
       // A non-null month is what makes the sheet show its Month section at
       // all — this is the only screen that passes it, because it is the only
       // one whose content is laid out by month.
-      initial: AuditFilterSelection.fromScope(audits, month: _visibleMonth),
+      month: _visibleMonth,
+      calendar: true,
+    );
+    final result = await showAuditFilterSheet(
+      context,
+      initial: initial,
       // Status/flag don't apply to the month grid; a date range does.
     );
     // Dismissed without applying — leave every dimension exactly as it was.
@@ -164,10 +173,26 @@ class _CalendarScreenState extends State<CalendarScreen> {
     // Pushed to every filter-holding provider (Audits, Dashboard, NC): the
     // filters are one shared state across the app, so the calendar and the
     // lists never describe different populations.
-    await applyAuditFilterSelection(context, result);
+    //
+    // The one thing that is NOT simply copied over is Me / All Members, which
+    // here is measured against the Calendar's own resting state (Me): leaving
+    // it untouched must not hand the other screens a Me that the user never
+    // picked (a Full Access user's app-wide default is All Members), and a Me
+    // picked on the Calendar after All Members only ends the calendar's own
+    // widening — it does not narrow a Full Access user's other screens.
+    final scopeChanged = result.isTeam != initial.isTeam;
+    final keepShared =
+        !scopeChanged || (!result.isTeam && audits.defaultTeamScope);
+    await applyAuditFilterSelection(
+      context,
+      keepShared ? result.copyWith(isTeam: audits.isTeamScope) : result,
+      // Only an explicit scope pick made here moves the calendar's flag.
+      calendarAllMembers: scopeChanged ? result.isTeam : null,
+    );
   }
 
-  /// Back to the resting "just me, everywhere, every type" state — on both
+  /// Back to the resting state — the account's default scope everywhere else
+  /// (the Calendar itself returns to Me), every location and type — on both
   /// providers, for the same reason _openFilters applies to both. The
   /// visible month deliberately survives a Clear: it is a view position,
   /// not a filter, and yanking the user back to the current month while
@@ -179,6 +204,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
     return applyAuditFilterSelection(
       context,
       AuditFilterSelection(
+        // The account's default scope (and the calendar's All Members flag off).
+        resetScope: true,
         statuses: audits.statusFilter,
         includeSkipped: audits.includeSkipped,
         flags: audits.flagFilter,
@@ -239,6 +266,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
               activeCount: auditsProvider.activeFilterCountFor(
                 status: false,
                 flag: false,
+                calendar: true,
               ),
               onTap: _openFilters,
             ),
@@ -249,7 +277,12 @@ class _CalendarScreenState extends State<CalendarScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (auditsProvider.activeFilterCountFor(status: false, flag: false) > 0)
+          if (auditsProvider.activeFilterCountFor(
+                status: false,
+                flag: false,
+                calendar: true,
+              ) >
+              0)
             _ActiveFilterBar(
               labels: _activeFilterLabels(auditsProvider, filterOptions),
               onClear: _clearFilters,
@@ -414,7 +447,7 @@ List<String> _activeFilterLabels(
         'people',
       ),
     );
-  } else if (audits.isTeamScope && audits.teamFilter.isEmpty) {
+  } else if (audits.calendarTeamScope && audits.teamFilter.isEmpty) {
     labels.add('All Members');
   }
   if (audits.locationFilter.isNotEmpty) {

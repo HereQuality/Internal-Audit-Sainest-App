@@ -26,7 +26,9 @@ class DashboardProvider extends ChangeNotifier with AuditFilterScope {
   // reasoning and for the _selfEmployeeId-must-be-set-first caveat. This
   // now MATCHES the web app's own default (client/src/hooks/useSelfScope.js
   // — TeamFilterPanel opens on "just you" too), so a not-yet-toggled ATS/
-  // OTC score reads the same on both platforms for the same account.
+  // OTC score reads the same on both platforms for the same account — a Full
+  // Access account included, whose All Members default (AuditFilterScope.
+  // defaultTeamScope, adopted by main.dart's _RootGate) the web has too.
   @override
   bool isTeamScope = false;
   String? _selfEmployeeId;

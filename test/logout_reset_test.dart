@@ -307,7 +307,8 @@ void main() {
       adapter.requests.clear();
 
       await provider.fetchRaisedByMe();
-      expect(adapter.requests.single.queryParameters, isEmpty);
+      // Only the page (the list is read one page at a time now); no person filter.
+      expect(adapter.requests.single.queryParameters, {'page': 1, 'limit': 20});
     });
 
     test('an answer that was on the wire at logout is dropped', () async {

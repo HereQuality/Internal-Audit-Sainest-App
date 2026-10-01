@@ -17,6 +17,7 @@ import 'package:internal_audit_app/screens/profile/reports_screen.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'support/report_list_fake.dart';
 import 'support/session_fakes.dart';
 
 /// The Final Report tiles must add up (owner, 2026-09-30, "total 9 kaise
@@ -283,10 +284,8 @@ void main() {
         ..handler = (o) async {
           switch (o.path) {
             case ApiConstants.auditsReport:
-              return json(200, {
-                'isOk': true,
-                'data': {'audits': rows, 'total': rows.length, 'page': 1, 'limit': 100},
-              });
+              // The server filters by `status` and pages over groups.
+              return json(200, {'isOk': true, 'data': reportListData(rows, o.queryParameters)});
             case ApiConstants.auditsReportStats:
               return stats == null ? json(403, {'isOk': false}) : json(200, {'isOk': true, 'data': stats});
           }
@@ -368,16 +367,21 @@ void main() {
       expect(find.text('Not Attempted (not in Total)'), findsNothing);
     });
 
-    testWidgets('each new tile is a tap-filter by the ids it counted; they OR together and Total Audits clears them', (tester) async {
+    testWidgets('each new tile is a tap-filter by the `status` it counts; they OR together and Total Audits clears them', (tester) async {
       rows = sixRows();
       stats = serverStatsForSix();
       await pump(tester);
       for (final title in ['Running audit', 'Overdue audit', 'Fresh audit', 'Done audit', 'Skipped audit', 'Never done']) {
         expect(find.text(title), findsOneWidget, reason: title);
       }
+      // Was: the screen narrowed the loaded list by each tile's ids. Now the server does, by `status`.
+      String? status() => adapter.requests
+          .lastWhere((r) => r.path == ApiConstants.auditsReport)
+          .queryParameters['status'] as String?;
 
       await tester.tap(tileKey('overdue'));
       await tester.pumpAndSettle();
+      expect(status(), 'Overdue');
       expect(find.text('Overdue audit'), findsOneWidget);
       expect(find.text('Running audit'), findsNothing);
       expect(find.text('Fresh audit'), findsNothing);
@@ -387,6 +391,7 @@ void main() {
 
       await tester.tap(tileKey('notStarted'));
       await tester.pumpAndSettle();
+      expect(status(), 'Overdue,Not Started');
       expect(find.text('Overdue audit'), findsOneWidget, reason: 'picked tiles OR together');
       expect(find.text('Fresh audit'), findsOneWidget);
       expect(find.text('Skipped audit'), findsNothing);
@@ -397,6 +402,8 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(tileKey('skipped'));
       await tester.pumpAndSettle();
+      // The Skipped tile asks for the Skipped audits themselves (the server lifts its default exclusion for it).
+      expect(status(), 'Skipped');
       expect(find.text('Skipped audit'), findsOneWidget);
       expect(find.text('Overdue audit'), findsNothing);
       expect(find.text('Never done'), findsNothing);
@@ -405,12 +412,14 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(tileKey('notAttempted'));
       await tester.pumpAndSettle();
+      expect(status(), 'Not Attempted');
       expect(find.text('Never done'), findsOneWidget);
       expect(find.text('Skipped audit'), findsNothing);
       expect(find.text('Running audit'), findsNothing);
 
       await tester.tap(tileKey('total'));
       await tester.pumpAndSettle();
+      expect(status(), isNull);
       for (final title in ['Running audit', 'Overdue audit', 'Fresh audit', 'Done audit', 'Skipped audit', 'Never done']) {
         expect(find.text(title), findsOneWidget, reason: title);
       }

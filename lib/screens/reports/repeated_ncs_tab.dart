@@ -10,6 +10,7 @@ import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/max_width_scroll.dart';
+import '../../widgets/nc_page_footer.dart';
 import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
 import 'nc_report_tab.dart' show openNcFromReport;
@@ -32,6 +33,10 @@ const repeatMinCounts = [2, 3, 4, 5, 10];
 /// A row is the group (×count, open count, place, first → last date); tapping it
 /// lists each NC behind it — its id, raised date, audit, who raised it and who
 /// it is against, flag and status — and tapping an NC opens its read-only thread.
+///
+/// The groups load ONE page (30) at a time: the next page is appended by itself as
+/// the tab scrolls near its end (a small spinner at the foot; "Try again" when a
+/// page failed) until the server's total is on screen.
 class RepeatedNcsTab extends StatefulWidget {
   const RepeatedNcsTab({super.key});
 
@@ -51,27 +56,66 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
   // request that failed.
   final Map<String, List<NcModel>?> _ncs = {};
   final Set<String> _loadingNcs = {};
+  bool _afterBuildQueued = false;
+  // How many first pages had landed when this tab last looked: one more means the
+  // list was replaced (a filter or the min. times moved) and the scroll goes back
+  // to the top.
+  late int _seenFirstPages;
 
   @override
   void initState() {
     super.initState();
     _saved = context.read<ListViewMemory>().screen(_memoryId);
     _openKey = _saved.extra['open'] as String?;
-    _scroll = ScrollController(initialScrollOffset: _saved.scroll)
-      ..addListener(() {
-        if (_scroll.hasClients) _saved.scroll = _scroll.offset;
-      });
+    _scroll = ScrollController(initialScrollOffset: _saved.scroll)..addListener(_onScroll);
     // Before the host's first load: the request must carry the remembered pick.
+    final p = context.read<NcProvider>();
     final min = _saved.extra['min'];
     if (min is int && repeatMinCounts.contains(min)) {
-      context.read<NcProvider>().repeatsMinCount = min;
+      p.repeatsMinCount = min;
     }
+    _seenFirstPages = p.repeatsFirstPageCount;
   }
 
   @override
   void dispose() {
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients) return;
+    _saved.scroll = _scroll.offset;
+    _maybeLoadMore();
+  }
+
+  void _maybeLoadMore() {
+    final p = context.read<NcProvider>();
+    if (!p.repeatsHasMore || p.isLoadingRepeats || p.isLoadingMoreRepeats) return;
+    if (nearListEnd(_scroll)) p.fetchRepeats(more: true);
+  }
+
+  // After each build: back to the top when the list was replaced, and keep loading
+  // while the end is still near (a tall screen — or a short page — would otherwise
+  // never scroll, so never ask for more).
+  void _afterBuild(NcProvider p) {
+    if (_afterBuildQueued) return;
+    final replaced = p.repeatsFirstPageCount != _seenFirstPages;
+    final canLoad =
+        p.repeatsHasMore && !p.isLoadingRepeats && !p.isLoadingMoreRepeats && p.repeatsMoreError == null;
+    if (!replaced && !canLoad) return;
+    _afterBuildQueued = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _afterBuildQueued = false;
+      if (!mounted) return;
+      final count = context.read<NcProvider>().repeatsFirstPageCount;
+      if (count != _seenFirstPages) {
+        _seenFirstPages = count;
+        _saved.scroll = 0;
+        if (_scroll.hasClients && _scroll.offset > 0) _scroll.jumpTo(0);
+      }
+      _maybeLoadMore();
+    });
   }
 
   String _cacheKey(RepeatGroup g) => '${g.key}|${g.ncIds.join(',')}';
@@ -110,6 +154,7 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
     final rows = p.repeatRows;
     final showError = p.repeatsError != null && rows.isEmpty;
     final showLoading = p.isLoadingRepeats && rows.isEmpty && !showError;
+    _afterBuild(p);
     final window = p.repeatsUseDefaultWindow
         ? 'Showing the last 6 months — pick a date range in Filters to change it.'
         : [
@@ -183,6 +228,18 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
+                    // The server's own count of the groups, however many pages are
+                    // on screen so far.
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: NcCountLine(
+                        loaded: rows.length,
+                        total: p.repeatsTotal,
+                        hasMore: p.repeatsHasMore,
+                        noun: 'repeated checkpoints',
+                        nounOne: 'repeated checkpoint',
+                      ),
+                    ),
                     for (final g in rows) ...[
                       _RepeatCard(
                         group: g,
@@ -193,18 +250,12 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
                       ),
                       const SizedBox(height: 10),
                     ],
-                    if (rows.length < p.repeatsTotal)
-                      Center(
-                        child: p.isLoadingMoreRepeats
-                            ? const Padding(
-                                padding: EdgeInsets.all(12),
-                                child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
-                              )
-                            : OutlinedButton(
-                                onPressed: () => p.fetchRepeats(more: true),
-                                child: Text('Show more (${p.repeatsTotal - rows.length} more)'),
-                              ),
-                      ),
+                    NcPageFooter(
+                      hasMore: p.repeatsHasMore,
+                      isLoadingMore: p.isLoadingMoreRepeats,
+                      error: p.repeatsMoreError,
+                      onRetry: () => p.fetchRepeats(more: true, retry: true),
+                    ),
                   ],
                 ),
               ),

@@ -134,6 +134,19 @@ class UserModel {
   final String? remark;
   final UserPreferences preferences;
 
+  /// Whether this account sees the whole organisation: a SuperAdmin, or an
+  /// Employee whose Role has the Full Access box ticked (the server sends it
+  /// as `hasFullAccess` on login, GET /auth/me and PUT /auth/me — the same
+  /// flag the web portal's hooks/useFullAccess.js reads). It decides what the
+  /// filtered screens open on: All Members for Full Access, Me for everyone
+  /// else (AuditFilterScope.defaultTeamScope). It is VISIBILITY only — never a
+  /// permission to edit anything.
+  ///
+  /// Strictly `== true`, so a server that predates the flag (or a payload that
+  /// leaves it out) reads as "no", never as "yes"; a SuperAdmin always has it
+  /// (it has no Role record to tick the box on).
+  final bool hasFullAccess;
+
   const UserModel({
     required this.id,
     required this.roleType,
@@ -153,7 +166,8 @@ class UserModel {
     this.country,
     this.remark,
     this.preferences = const UserPreferences(),
-  });
+    bool hasFullAccess = false,
+  }) : hasFullAccess = hasFullAccess || roleType == 'SuperAdmin';
 
   bool get isEmployee => roleType == 'Employee';
 
@@ -194,6 +208,8 @@ class UserModel {
       preferences: UserPreferences.fromJson(
         json['preferences'] is Map ? Map<String, dynamic>.from(json['preferences'] as Map) : null,
       ),
+      // `== true` on purpose: "true" (a string), 1 or a missing key is not a grant.
+      hasFullAccess: json['hasFullAccess'] == true,
     );
   }
 
@@ -208,6 +224,7 @@ class UserModel {
     String? state,
     String? country,
     UserPreferences? preferences,
+    bool? hasFullAccess,
   }) {
     return UserModel(
       id: id,
@@ -228,6 +245,7 @@ class UserModel {
       country: country ?? this.country,
       remark: remark,
       preferences: preferences ?? this.preferences,
+      hasFullAccess: hasFullAccess ?? this.hasFullAccess,
     );
   }
 }
