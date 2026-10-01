@@ -349,27 +349,27 @@ void main() {
       expect(p.reportAudits, hasLength(5));
     });
 
-    test('pull-to-refresh reads page 1 only; a live update re-reads the pages that are on screen', () async {
+    test('pull-to-refresh reads page 1 only; a live update re-reads just the page that is on screen', () async {
       server.rows = [for (var i = 0; i < 100; i++) _row(i)];
       final p = AuditsProvider();
       await p.fetchReportAudits();
-      await p.fetchMoreReportAudits();
-      await p.fetchMoreReportAudits();
-      expect(p.reportAudits, hasLength(60));
+      expect(p.reportsTotalPages, 5);
+      await p.goToReportPage(3);
+      expect(p.reportsPage, 3);
+      expect(p.reportAudits, hasLength(20), reason: 'the page replaces the one before');
+      expect(p.reportAudits.first.id, _row(40)['_id']);
 
       adapter.requests.clear();
       await p.fetchReportAudits(quiet: true);
-      expect(reads().map((r) => r.queryParameters['page']), [1, 2, 3], reason: 'the three pages that were on screen');
-      expect(reads().every((r) => r.queryParameters['limit'] == 20), isTrue);
-      expect(p.reportAudits, hasLength(60));
-      expect(p.reportsHasMore, isTrue);
-      await p.fetchMoreReportAudits();
-      expect(lastRead()['page'], 4, reason: 'paging carries on where it was');
+      expect(reads().map((r) => r.queryParameters['page']), [3], reason: 'only the page on screen');
+      expect(p.reportAudits, hasLength(20));
+      expect(p.reportsPage, 3);
 
       adapter.requests.clear();
       await p.fetchReportAudits();
       expect(reads().map((r) => r.queryParameters['page']), [1], reason: 'pull-to-refresh starts over');
       expect(p.reportAudits, hasLength(20));
+      expect(p.reportsPage, 1);
     });
 
     test('a changed filter empties the list at once; the same query keeps it until the answer lands', () async {
@@ -529,7 +529,7 @@ void main() {
       }
     }
 
-    testWidgets('page 1 on open; the next pages as the end comes near, until the server\'s total is reached', (tester) async {
+    testWidgets('page 1 on open; Prev/Next turn the pages (a small pair on top, a bar at the foot), up to the server\'s total', (tester) async {
       server
         ..rows = [for (var i = 0; i < 45; i++) _row(i)]
         ..stats = _stats(totalAudits: 45);
@@ -538,22 +538,30 @@ void main() {
       expect(reads(), hasLength(1));
       expect(lastRead()['page'], 1);
       expect(lastRead()['limit'], 20);
-      expect(find.text('45 reports'), findsOneWidget, reason: 'the server\'s total, not the 20 loaded');
+      expect(find.text('45 reports'), findsOneWidget, reason: 'the server\'s total, not the 20 shown');
+      expect(find.text('1/3'), findsOneWidget);
       expect(find.text('Audit 0'), findsOneWidget);
-      expect(find.text('Audit 25'), findsNothing, reason: 'page 2 is not read until the user gets near it');
+      expect(find.text('Audit 25'), findsNothing);
+      expect(tester.widget<IconButton>(find.byKey(const ValueKey('nc-page-prev-top'))).onPressed, isNull);
 
-      await scrollUntil(tester, find.text('Audit 44'));
-      expect(find.text('Audit 44'), findsOneWidget);
-      expect(reads().map((r) => r.queryParameters['page']), [1, 2, 3]);
-      // (The count line sits at the top of the list and has scrolled out of view by now.)
-
-      // Everything is loaded: scrolling further asks for nothing more.
-      await tester.drag(list(), const Offset(0, -700));
+      await tester.tap(find.byKey(const ValueKey('nc-page-next-top')));
       await tester.pumpAndSettle();
-      expect(reads(), hasLength(3));
+      expect(lastRead()['page'], 2);
+      expect(find.text('2/3'), findsOneWidget);
+      expect(find.text('Audit 0'), findsNothing, reason: 'page 2 replaces page 1');
+      expect(find.text('Audit 20'), findsOneWidget);
+
+      await scrollUntil(tester, find.byKey(const ValueKey('nc-page-next')));
+      expect(find.text('Page 2 of 3'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await tester.pumpAndSettle();
+      expect(reads().map((r) => r.queryParameters['page']), [1, 2, 3]);
+      expect(find.text('Audit 40'), findsOneWidget);
+      expect(find.text('3/3'), findsOneWidget);
+      expect(tester.widget<IconButton>(find.byKey(const ValueKey('nc-page-next-top'))).onPressed, isNull, reason: 'nothing after the last page');
     });
 
-    testWidgets('a failed page leaves what is loaded, shows "Try again" under it, and the button reads that page', (tester) async {
+    testWidgets('a page that fails keeps the rows and says so; Next tries it again', (tester) async {
       server
         ..rows = [for (var i = 0; i < 45; i++) _row(i)]
         ..stats = _stats(totalAudits: 45);
@@ -566,22 +574,19 @@ void main() {
       };
       await _pump(tester);
 
-      final retry = find.byKey(const ValueKey('reports-more-retry'));
-      await scrollUntil(tester, retry, max: 10);
-      expect(retry, findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next-top')));
+      await tester.pumpAndSettle();
+      expect(find.text('Server is busy'), findsNothing, reason: 'the message sits at the foot');
+      await scrollUntil(tester, find.byKey(const ValueKey('reports-more-error')));
       expect(find.text('Server is busy'), findsOneWidget);
-      expect(find.text('Try again'), findsOneWidget);
-      expect(find.text('Audit 19'), findsOneWidget, reason: 'the 20 that were loaded are still there');
-      // The failed page was asked for once: the scroll position near the end does not loop on it.
+      expect(find.text('Audit 19'), findsOneWidget, reason: 'the 20 that were showing are still there');
       expect(reads().where((r) => r.queryParameters['page'] == 2), hasLength(1));
 
-      await tester.ensureVisible(retry);
-      await tester.tap(retry);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
       await tester.pumpAndSettle();
       expect(reads().where((r) => r.queryParameters['page'] == 2), hasLength(2));
-      expect(find.byKey(const ValueKey('reports-more-retry')), findsNothing);
-      await scrollUntil(tester, find.text('Audit 30'));
-      expect(find.text('Audit 30'), findsOneWidget);
+      expect(find.byKey(const ValueKey('reports-more-error')), findsNothing);
+      expect(find.text('Audit 20'), findsOneWidget);
     });
 
     testWidgets('the chip, a tile and the search each reset to page 1 and send the right status / search', (tester) async {

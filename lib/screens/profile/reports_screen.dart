@@ -19,6 +19,7 @@ import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
 import '../../utils/report_pdf_builder.dart';
 import '../../utils/report_sections.dart';
+import '../../widgets/nc_page_footer.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/audit_agenda.dart' show AgendaEntry;
 import '../../widgets/audit_filter_bar.dart';
@@ -296,8 +297,6 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
   // The search goes to the server once typing pauses (it changes on every key).
   Timer? _searchDebounce;
   static const _searchDelay = Duration(milliseconds: 400);
-  // The next page is read when the end of what is loaded is this close.
-  static const _loadMoreExtent = 300.0;
 
   @override
   void initState() {
@@ -319,7 +318,6 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
       ..addListener(() {
         if (!_scroll.hasClients) return;
         _saved.scroll = _scroll.offset;
-        _maybeLoadMore();
       });
     // Before the host's first load: the tiles must describe these rows.
     _syncQuery(context.read<AuditsProvider>());
@@ -455,19 +453,11 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
       stats.byLocation.isNotEmpty &&
       !stats.byLocation.every((p) => p.auditIds.isEmpty);
 
-  // The next page of the list when the user is within [_loadMoreExtent] of the end
-  // of what is loaded (also called after a build, for a first page too short to
-  // scroll at all). The provider guards a second request while one is on its way,
-  // and a failed page waits for its "Try again". Not in the server-numbered
-  // location-wise view, where it is the open places that page.
-  void _maybeLoadMore() {
-    if (!mounted || !_scroll.hasClients) return;
-    final p = context.read<AuditsProvider>();
-    if (!p.reportsHasMore) return;
-    if (_byLocation && _serverPlaces(p.reportStats)) return;
-    final position = _scroll.position;
-    if (!position.hasContentDimensions || position.extentAfter > _loadMoreExtent) return;
-    p.fetchMoreReportAudits();
+  // Turns the flat list to page [page] and starts it from the top. Not in the
+  // server-numbered location-wise view, where it is the open places that page.
+  Future<void> _goToPage(int page) async {
+    await context.read<AuditsProvider>().goToReportPage(page);
+    if (mounted && _scroll.hasClients) _scroll.jumpTo(0);
   }
 
   String _sanitizedFileName(String title) {
@@ -609,10 +599,7 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
     const gutter = EdgeInsets.symmetric(horizontal: 16);
     final serverPlaces = _byLocation && _serverPlaces(provider.reportStats);
     final reportCount = provider.reportsTotal > 0 ? provider.reportsTotal : items.length;
-    // A first page too short to scroll must not leave the next one unread.
-    if (provider.reportsHasMore && !serverPlaces) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _maybeLoadMore());
-    }
+    final pageable = !serverPlaces && provider.reportsTotalPages > 1;
 
     return RefreshIndicator(
       onRefresh: _reload,
@@ -673,6 +660,23 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                   : AppColors.readable(context, AppColors.forAuditStatus(o)),
               onSelected: _selectChip,
             ),
+            // The same Prev/Next as the foot of the list, small, on its own line so it
+            // never squeezes the count and the "Group by location" chip on a narrow phone.
+            if (items.isNotEmpty && pageable)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    NcPagerCompact(
+                      page: provider.reportsPage,
+                      totalPages: provider.reportsTotalPages,
+                      busy: provider.isLoadingMoreReports,
+                      onPage: _goToPage,
+                    ),
+                  ],
+                ),
+              ),
             if (items.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
@@ -737,9 +741,8 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
                         ],
                 ),
               ),
-            // The next page: a spinner while it loads, "Try again" when it failed
-            // (what is loaded stays). Not under the server-numbered location-wise
-            // view, whose places page their own rows.
+            // Prev / Next (and why a page failed — what is shown stays). Not under the
+            // server-numbered location-wise view, whose places page their own rows.
             if (!serverPlaces && !showLoading && !showError && source.isNotEmpty)
               _loadMoreFooter(provider),
           ],
@@ -789,29 +792,33 @@ class _AuditsReportTabState extends State<_AuditsReportTab> {
           );
   }
 
-  // The end of the flat list: the next page loading, or why it did not.
+  // The end of the flat list: Prev / Next, and why a page did not load.
   Widget _loadMoreFooter(AuditsProvider p) {
-    if (p.isLoadingMoreReports) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            key: ValueKey('reports-more-spinner'),
-            width: 24,
-            height: 24,
-            child: CircularProgressIndicator(strokeWidth: 2),
+    if (p.reportsTotalPages <= 1 && p.reportsMoreError == null) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (p.reportsMoreError != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                p.reportsMoreError!,
+                key: const ValueKey('reports-more-error'),
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.error),
+              ),
+            ),
+          NcPagerBar(
+            page: p.reportsPage,
+            totalPages: p.reportsTotalPages,
+            busy: p.isLoadingMoreReports,
+            onPage: _goToPage,
           ),
-        ),
-      );
-    }
-    if (p.reportsMoreError != null) {
-      return _RetryRow(
-        message: p.reportsMoreError!,
-        buttonKey: const ValueKey('reports-more-retry'),
-        onRetry: () => p.fetchMoreReportAudits(retry: true),
-      );
-    }
-    return const SizedBox.shrink();
+        ],
+      ),
+    );
   }
 
   // What the tiles are "of": the picked places.

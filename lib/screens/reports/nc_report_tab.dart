@@ -195,6 +195,12 @@ class _NcReportTabState extends State<NcReportTab> {
     return last;
   }
 
+  // Turns the NC list to page [page] and starts it from the top.
+  Future<void> _goToPage(int page) async {
+    await context.read<NcProvider>().reportList.goToPage(page);
+    if (mounted && _scroll.hasClients) _scroll.jumpTo(0);
+  }
+
   void _onScroll() {
     if (!_scroll.hasClients) return;
     _saved.scroll = _scroll.offset;
@@ -203,7 +209,8 @@ class _NcReportTabState extends State<NcReportTab> {
 
   void _maybeLoadMore() {
     final list = _loadMoreList(context.read<NcProvider>());
-    if (list == null || !list.hasMore || list.isLoading || list.isLoadingMore) return;
+    if (list == null || list.pagerMode) return; // Prev/Next, not the scroll, turns the pages
+    if (!list.hasMore || list.isLoading || list.isLoadingMore) return;
     if (nearListEnd(_scroll)) list.loadMore();
   }
 
@@ -215,7 +222,7 @@ class _NcReportTabState extends State<NcReportTab> {
     final replaced = p.reportList.firstPageCount != _seenFirstPages;
     final list = _loadMoreList(p);
     final canLoad =
-        list != null && list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
+        list != null && !list.pagerMode && list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
     if (!replaced && !canLoad) return;
     _afterBuildQueued = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -301,6 +308,23 @@ class _NcReportTabState extends State<NcReportTab> {
                 ),
               ),
             ),
+            // The same Prev/Next as the foot of the list, small, on its own line so it
+            // never squeezes the count and the "Group by location" chip on a narrow phone.
+            if (rows.isNotEmpty && !placeMode && list.pagerMode)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 8, 0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    NcPagerCompact(
+                      page: list.windowPage ?? 1,
+                      totalPages: list.totalPages,
+                      busy: list.isLoading,
+                      onPage: _goToPage,
+                    ),
+                  ],
+                ),
+              ),
             if (rows.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
@@ -375,7 +399,28 @@ class _NcReportTabState extends State<NcReportTab> {
                       ..._auditItems(rows, scope: ''),
                     // The place view reads each opened place's own pages (their
                     // footers sit under their rows); everything else is the one list.
-                    if (!placeMode)
+                    if (!placeMode && list.pagerMode)
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (list.moreError != null)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 4),
+                              child: Text(
+                                list.moreError!,
+                                textAlign: TextAlign.center,
+                                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.error),
+                              ),
+                            ),
+                          NcPagerBar(
+                            page: list.windowPage ?? 1,
+                            totalPages: list.totalPages,
+                            busy: list.isLoading,
+                            onPage: _goToPage,
+                          ),
+                        ],
+                      )
+                    else if (!placeMode)
                       NcPageFooter(
                         hasMore: list.hasMore,
                         isLoadingMore: list.isLoadingMore,

@@ -86,13 +86,6 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
   void _onScroll() {
     if (!_scroll.hasClients) return;
     _saved.scroll = _scroll.offset;
-    _maybeLoadMore();
-  }
-
-  void _maybeLoadMore() {
-    final p = context.read<NcProvider>();
-    if (!p.repeatsHasMore || p.isLoadingRepeats || p.isLoadingMoreRepeats) return;
-    if (nearListEnd(_scroll)) p.fetchRepeats(more: true);
   }
 
   // After each build: back to the top when the list was replaced, and keep loading
@@ -101,9 +94,7 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
   void _afterBuild(NcProvider p) {
     if (_afterBuildQueued) return;
     final replaced = p.repeatsFirstPageCount != _seenFirstPages;
-    final canLoad =
-        p.repeatsHasMore && !p.isLoadingRepeats && !p.isLoadingMoreRepeats && p.repeatsMoreError == null;
-    if (!replaced && !canLoad) return;
+    if (!replaced) return;
     _afterBuildQueued = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _afterBuildQueued = false;
@@ -114,11 +105,14 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
         _saved.scroll = 0;
         if (_scroll.hasClients && _scroll.offset > 0) _scroll.jumpTo(0);
       }
-      _maybeLoadMore();
     });
   }
 
   String _cacheKey(RepeatGroup g) => '${g.key}|${g.ncIds.join(',')}';
+
+  // Turns the list to page [page]; a new page starts from the top (the screen sees
+  // repeatsFirstPageCount move).
+  Future<void> _goToPage(int page) => context.read<NcProvider>().goToRepeatsPage(page);
 
   Future<void> _reload() => context.read<NcProvider>().fetchRepeats();
 
@@ -232,12 +226,26 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
                     // on screen so far.
                     Padding(
                       padding: const EdgeInsets.only(bottom: 8),
-                      child: NcCountLine(
-                        loaded: rows.length,
-                        total: p.repeatsTotal,
-                        hasMore: p.repeatsHasMore,
-                        noun: 'repeated checkpoints',
-                        nounOne: 'repeated checkpoint',
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: NcCountLine(
+                              loaded: rows.length,
+                              total: p.repeatsTotal,
+                              hasMore: p.repeatsHasMore,
+                              noun: 'repeated checkpoints',
+                              nounOne: 'repeated checkpoint',
+                              offset: (p.repeatsPage - 1) * NcProvider.repeatsPageSize,
+                            ),
+                          ),
+                          // The same Prev/Next as the foot of the list, small.
+                          NcPagerCompact(
+                            page: p.repeatsPage,
+                            totalPages: p.repeatsTotalPages,
+                            busy: p.isLoadingMoreRepeats,
+                            onPage: _goToPage,
+                          ),
+                        ],
                       ),
                     ),
                     for (final g in rows) ...[
@@ -250,11 +258,22 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
                       ),
                       const SizedBox(height: 10),
                     ],
-                    NcPageFooter(
-                      hasMore: p.repeatsHasMore,
-                      isLoadingMore: p.isLoadingMoreRepeats,
-                      error: p.repeatsMoreError,
-                      onRetry: () => p.fetchRepeats(more: true, retry: true),
+                    if (p.repeatsMoreError != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          p.repeatsMoreError!,
+                          textAlign: TextAlign.center,
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ),
+                    NcPagerBar(
+                      page: p.repeatsPage,
+                      totalPages: p.repeatsTotalPages,
+                      busy: p.isLoadingMoreRepeats,
+                      onPage: _goToPage,
                     ),
                   ],
                 ),

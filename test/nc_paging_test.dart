@@ -319,21 +319,25 @@ void main() {
       expect(p.raisedByMe, hasLength(20));
     });
 
-    test('a live update re-reads the pages that are on screen in place — not cut back to page 1, no new first page', () async {
+    test('a live update re-reads the page that is on screen in place — not cut back to page 1, no new first page', () async {
       server.ncs = _ncs(45);
       SocketService.instance.connect('jwt');
       final p = provider()..startListening();
       addTearDown(p.stopListening);
       await p.fetchRaisedByMe();
-      await p.raisedList.loadMore();
-      expect(p.raisedByMe, hasLength(40));
+      await p.raisedList.goToPage(2);
+      expect(p.raisedByMe, hasLength(20));
+      expect(p.raisedList.windowPage, 2);
+      final shiftedIn = server.ncs[19]['_id']; // what page 2 starts with once one NC is added on top
       final firstPages = p.raisedList.firstPageCount;
 
       server.ncs = [_nc(-1), ...server.ncs]; // a new NC at the top
       sockets.sockets.single.receive('new_notification', {'type': 'nc_raised'});
-      await waitFor(() => p.raisedByMe.isNotEmpty && p.raisedByMe.first.id == 'nc901');
+      await waitFor(() => p.raisedByMe.isNotEmpty && p.raisedByMe.first.id == shiftedIn);
 
-      expect(p.raisedByMe, hasLength(40), reason: 'both loaded pages were re-read');
+      expect(p.raisedByMe, hasLength(20), reason: 'only the page on screen was re-read');
+      expect(p.raisedList.windowPage, 2);
+      expect(p.raisedList.total, 46);
       expect(p.raisedList.firstPageCount, firstPages, reason: 'not a new first page: the screen keeps its scroll position');
       expect(p.raisedList.isLoading, isFalse);
     });
@@ -592,7 +596,7 @@ void main() {
   });
 
   group('screens', () {
-    testWidgets('NC Monitoring: page 1 on open, the next pages as the list is scrolled to its end, the server total shown, and it stops at the total', (tester) async {
+    testWidgets('NC Monitoring: page 1 on open, Prev/Next move between pages, the server total and page shown', (tester) async {
       server
         ..ncs = _ncs(45)
         ..statsDown = true; // no tiles: just the list
@@ -605,19 +609,33 @@ void main() {
       expect(find.text('Showing 20 of 45 NCs'), findsOneWidget);
 
       await _scrollToEnd(tester, find.byType(ListView).last);
+      expect(reads(ApiConstants.ncsRaised), hasLength(1), reason: 'scrolling no longer loads anything');
+      expect(find.text('Page 1 of 3'), findsOneWidget);
+      expect(tester.widget<OutlinedButton>(find.byKey(const ValueKey('nc-page-prev'))).onPressed, isNull);
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
       expect(reads(ApiConstants.ncsRaised), hasLength(2));
       expect(reads(ApiConstants.ncsRaised).last.queryParameters['page'], 2);
-      expect(find.text('Showing 40 of 45 NCs'), findsOneWidget);
+      expect(find.text('Showing 21–40 of 45 NCs'), findsOneWidget);
+      expect(find.text('Finding 0'), findsNothing, reason: 'page 2 replaces page 1');
+      expect(find.text('Finding 20'), findsOneWidget);
 
       await _scrollToEnd(tester, find.byType(ListView).last);
-      expect(reads(ApiConstants.ncsRaised), hasLength(3));
-      expect(find.text('45 NCs'), findsOneWidget, reason: 'everything is loaded: just the total');
-
+      expect(find.text('Page 2 of 3'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
+      expect(find.text('Showing 41–45 of 45 NCs'), findsOneWidget);
       await _scrollToEnd(tester, find.byType(ListView).last);
-      expect(reads(ApiConstants.ncsRaised), hasLength(3), reason: 'nothing left to ask for');
+      expect(find.text('Page 3 of 3'), findsOneWidget);
+      expect(tester.widget<OutlinedButton>(find.byKey(const ValueKey('nc-page-next'))).onPressed, isNull, reason: 'nothing after the last page');
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-prev')));
+      await _settle(tester);
+      expect(find.text('Showing 21–40 of 45 NCs'), findsOneWidget);
     });
 
-    testWidgets('a next page that fails shows "Try again" under the rows; the rows stay and the retry loads the page', (tester) async {
+    testWidgets('a page that fails keeps the rows and says so; Next tries it again', (tester) async {
       server
         ..ncs = _ncs(45)
         ..statsDown = true;
@@ -627,18 +645,19 @@ void main() {
       await _pumpNcMonitoring(tester, ncs);
 
       await _scrollToEnd(tester, find.byType(ListView).last);
-      expect(find.byKey(const ValueKey('nc-page-retry')), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
+      expect(ncs.raisedList.moreError, isNotNull);
+      expect(find.text(ncs.raisedList.moreError!), findsOneWidget, reason: 'the failure is shown under the rows');
       expect(ncs.raisedByMe, hasLength(20));
-      final asked = reads(ApiConstants.ncsRaised).length;
-      await _scrollToEnd(tester, find.byType(ListView).last);
-      expect(reads(ApiConstants.ncsRaised), hasLength(asked), reason: 'the scroll does not hammer a failing server');
+      expect(find.text('Page 1 of 3'), findsOneWidget, reason: 'still on the page that is showing');
 
       down = false;
-      await tester.tap(find.byKey(const ValueKey('nc-page-retry')));
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
       await _settle(tester);
-      expect(find.byKey(const ValueKey('nc-page-retry')), findsNothing);
-      expect(find.text('Showing 40 of 45 NCs'), findsOneWidget);
-      expect(ncs.raisedByMe, hasLength(40));
+      expect(ncs.raisedList.moreError, isNull);
+      expect(find.text('Showing 21–40 of 45 NCs'), findsOneWidget);
+      expect(ncs.raisedByMe, hasLength(20));
     });
 
     testWidgets('typing sends ONE search to the server after the pause and restarts at page 1; clearing it restarts at once', (tester) async {
@@ -691,26 +710,37 @@ void main() {
       expect(find.text('Showing 20 of 30 NCs'), findsOneWidget);
 
       await _scrollToEnd(tester, find.byType(ListView).last);
-      expect(find.text('30 NCs'), findsOneWidget);
+      expect(find.text('Page 1 of 2'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
+      expect('${reads(ApiConstants.ncsRaised).last.queryParameters['ids']}'.split(','), hasLength(10), reason: 'the next slice of the tile\'s ids');
+      expect(find.text('Showing 21–30 of 30 NCs'), findsOneWidget);
     });
 
-    testWidgets('the Final Report NCs tab: page 1 of audits, the server\'s totals in the count line, the next pages on scroll', (tester) async {
+    testWidgets('the Final Report NCs tab: page 1 of audits, the server\'s totals in the count line, Prev/Next turn the pages', (tester) async {
       server.ncs = [for (var i = 0; i < 100; i++) _nc(i, auditOf: 'A${i ~/ 2}')]; // 50 audits
       await _pumpNcReportTab(tester, provider());
 
       expect(reads(ApiConstants.ncsReport), hasLength(1));
       expect(reads(ApiConstants.ncsReport).single.queryParameters['limit'], 20);
       expect(reads(ApiConstants.ncsReport).single.queryParameters['groupBy'], 'audit');
-      expect(find.text('100 NCs · 50 audits'), findsOneWidget, reason: 'the server\'s totals, not what is loaded');
+      expect(find.text('100 NCs · 50 audits'), findsOneWidget, reason: 'the server\'s totals, not what is shown');
+      expect(find.text('1/3'), findsOneWidget, reason: '50 audits, 20 a page');
+      expect(tester.widget<IconButton>(find.byKey(const ValueKey('nc-page-prev-top'))).onPressed, isNull);
 
       await _scrollToEnd(tester, find.byType(ListView).first);
+      expect(reads(ApiConstants.ncsReport), hasLength(1), reason: 'scrolling no longer loads anything');
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
       expect(reads(ApiConstants.ncsReport), hasLength(2));
       expect(reads(ApiConstants.ncsReport).last.queryParameters['page'], 2);
-      await _scrollToEnd(tester, find.byType(ListView).first);
-      expect(reads(ApiConstants.ncsReport), hasLength(3));
-      await _scrollToEnd(tester, find.byType(ListView).first);
-      expect(reads(ApiConstants.ncsReport), hasLength(3), reason: 'the 50th audit is on screen: nothing left');
-      // (The count line sits at the top of the list and has scrolled out of view by now.)
+      expect(find.text('2/3'), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-prev-top')));
+      await _settle(tester);
+      expect(reads(ApiConstants.ncsReport).last.queryParameters['page'], 1);
+      expect(find.text('1/3'), findsOneWidget);
     });
 
     testWidgets('a tile on the NCs tab reads just its NCs by id; the count line says how many', (tester) async {
@@ -725,9 +755,12 @@ void main() {
       expect(q.containsKey('groupBy'), isFalse);
       expect(find.text('30 NCs'), findsOneWidget, reason: 'the audits are counted once all of the pick has arrived');
 
-      await _scrollToEnd(tester, find.byType(ListView).first);
-      // Everything of the pick has arrived: the count line (scrolled away now) would read "30 NCs · 30 audits".
-      expect(reads(ApiConstants.ncsReport).length, greaterThanOrEqualTo(3));
+      expect(find.text('1/2'), findsOneWidget, reason: '30 NCs, 20 a page');
+      await tester.tap(find.byKey(const ValueKey('nc-page-next-top')));
+      await _settle(tester);
+      final next = reads(ApiConstants.ncsReport).last.queryParameters;
+      expect('${next['ids']}'.split(','), hasLength(10), reason: 'the next slice of the tile\'s ids');
+      expect(find.text('2/2'), findsOneWidget);
     });
 
     testWidgets('location-wise: an opened place loads its next page by itself as the tab scrolls to its end', (tester) async {
@@ -760,7 +793,7 @@ void main() {
       expect(ncs.ncReportPlaceList('Plant A').hasMore, isFalse);
     });
 
-    testWidgets('the Repeated NCs tab: page 1 of groups, the next pages on scroll, a footer to retry a failed page', (tester) async {
+    testWidgets('the Repeated NCs tab: page 1 of groups, Prev/Next turn the pages, a failed page keeps the rows and says so', (tester) async {
       server.repeats = [for (var i = 0; i < 70; i++) _repeat(i)];
       var down = false;
       server.failIf = (o) => down && o.path == ApiConstants.ncsRepeats && o.queryParameters['page'] == 3;
@@ -770,25 +803,35 @@ void main() {
       expect(reads(ApiConstants.ncsRepeats), hasLength(1));
       expect(reads(ApiConstants.ncsRepeats).single.queryParameters['limit'], 30);
       expect(find.text('Showing 30 of 70 repeated checkpoints'), findsOneWidget);
+      expect(find.text('1/3'), findsOneWidget);
 
       await _scrollToEnd(tester, find.byType(ListView).first);
-      expect(reads(ApiConstants.ncsRepeats), hasLength(2));
-      expect(find.text('Showing 60 of 70 repeated checkpoints'), findsOneWidget);
+      expect(reads(ApiConstants.ncsRepeats), hasLength(1), reason: 'scrolling no longer loads anything');
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-next')));
+      await _settle(tester);
+      expect(reads(ApiConstants.ncsRepeats).last.queryParameters['page'], 2);
+      expect(ncs.repeatRows, hasLength(30), reason: 'page 2 replaces page 1');
+      expect(find.text('Showing 31–60 of 70 repeated checkpoints'), findsOneWidget);
 
       down = true;
-      await _scrollToEnd(tester, find.byType(ListView).first);
-      expect(find.byKey(const ValueKey('nc-page-retry')), findsOneWidget);
-      expect(ncs.repeatRows, hasLength(60), reason: 'the groups loaded stay');
+      await tester.tap(find.byKey(const ValueKey('nc-page-next-top')));
+      await _settle(tester);
+      expect(ncs.repeatsMoreError, isNotNull);
+      expect(ncs.repeatRows, hasLength(30), reason: 'the groups showing stay');
+      expect(find.text('2/3'), findsOneWidget);
 
       down = false;
-      await tester.ensureVisible(find.byKey(const ValueKey('nc-page-retry')));
-      await tester.pump();
-      await tester.tap(find.byKey(const ValueKey('nc-page-retry')));
+      await tester.tap(find.byKey(const ValueKey('nc-page-next-top')));
       await _settle(tester);
-      expect(ncs.repeatRows, hasLength(70));
-      final done = reads(ApiConstants.ncsRepeats).length;
-      await _scrollToEnd(tester, find.byType(ListView).first);
-      expect(reads(ApiConstants.ncsRepeats), hasLength(done));
+      expect(ncs.repeatsMoreError, isNull);
+      expect(ncs.repeatRows, hasLength(10));
+      expect(find.text('Showing 61–70 of 70 repeated checkpoints'), findsOneWidget);
+      expect(tester.widget<IconButton>(find.byKey(const ValueKey('nc-page-next-top'))).onPressed, isNull);
+
+      await tester.tap(find.byKey(const ValueKey('nc-page-prev-top')));
+      await _settle(tester);
+      expect(find.text('2/3'), findsOneWidget);
     });
   });
 }

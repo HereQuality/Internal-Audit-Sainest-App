@@ -132,6 +132,10 @@ class OverdueAuditsSection extends StatelessWidget {
       );
 }
 
+/// How many cards a dashboard list shows; the rest is one tap away on the Audits tab
+/// ("See more"), so the dashboard never renders (or holds) a long list.
+const _dashboardPreviewCount = 5;
+
 class _AuditListSection extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -157,6 +161,8 @@ class _AuditListSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (audits.isEmpty) return const SizedBox.shrink();
+    final visible = audits.take(_dashboardPreviewCount).toList();
+    final left = audits.length - visible.length;
 
     final scheme = Theme.of(context).colorScheme;
     final header = Row(
@@ -225,10 +231,18 @@ class _AuditListSection extends StatelessWidget {
           ),
         if (expanded) ...[
           const SizedBox(height: 10),
-          for (final audit in audits) ...[
+          for (final audit in visible) ...[
             RepaintBoundary(child: _AuditListCard(audit: audit)),
             const SizedBox(height: 10),
           ],
+          if (left > 0 && onSeeAll != null)
+            Center(
+              child: TextButton(
+                key: ValueKey('dashboard-see-more-$title'),
+                onPressed: onSeeAll,
+                child: Text('See more ($left)'),
+              ),
+            ),
         ],
       ],
     );
@@ -242,11 +256,16 @@ class _AuditListSection extends StatelessWidget {
 /// first non-empty list when nothing is scheduled today. The open list is held
 /// in this State, which lives as long as the (kept-alive) Dashboard tab, so
 /// coming Back from an audit finds the same list open.
+///
+/// "See all" / "See more" of each list opens the Audits tab (tab 1) already on that
+/// list's own status chip ([onNavigate] is AppShell's tab jump). Today's has no chip
+/// of its own — it mixes statuses — so it opens the tab on "All", whose agenda starts
+/// with today.
 class AuditAttentionPanel extends StatefulWidget {
   final List<AuditModel> audits;
-  final VoidCallback? onSeeAll;
+  final void Function(int tabIndex, {String? filter})? onNavigate;
 
-  const AuditAttentionPanel({super.key, required this.audits, this.onSeeAll});
+  const AuditAttentionPanel({super.key, required this.audits, this.onNavigate});
 
   @override
   State<AuditAttentionPanel> createState() => _AuditAttentionPanelState();
@@ -256,6 +275,11 @@ class _AuditAttentionPanelState extends State<AuditAttentionPanel> {
   // Null = "not chosen yet" (falls back to the first non-empty list); the
   // empty string = the user closed everything.
   String? _open;
+
+  VoidCallback? _seeAll(String filter) {
+    final go = widget.onNavigate;
+    return go == null ? null : () => go(1, filter: filter);
+  }
 
   void _toggle(String key) => setState(() => _open = _open == key ? '' : key);
 
@@ -273,7 +297,7 @@ class _AuditAttentionPanelState extends State<AuditAttentionPanel> {
           icon: Icons.today_rounded,
           title: "Today's Audits",
           audits: today,
-          onSeeAll: widget.onSeeAll,
+          onSeeAll: _seeAll('All'),
           expanded: open == 'today',
           onToggle: () => _toggle('today'),
         ),
@@ -282,7 +306,7 @@ class _AuditAttentionPanelState extends State<AuditAttentionPanel> {
           icon: Icons.autorenew_rounded,
           title: 'In Progress Audits',
           audits: inProgress,
-          onSeeAll: widget.onSeeAll,
+          onSeeAll: _seeAll('In Progress'),
           expanded: open == 'progress',
           onToggle: () => _toggle('progress'),
         ),
@@ -291,7 +315,7 @@ class _AuditAttentionPanelState extends State<AuditAttentionPanel> {
           icon: Icons.report_problem_outlined,
           title: 'Overdue Audits',
           audits: overdue,
-          onSeeAll: widget.onSeeAll,
+          onSeeAll: _seeAll('Overdue'),
           expanded: open == 'overdue',
           onToggle: () => _toggle('overdue'),
         ),

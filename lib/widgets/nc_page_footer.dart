@@ -22,6 +22,10 @@ class NcCountLine extends StatelessWidget {
   final String noun;
   final String nounOne;
 
+  /// Rows before the first loaded one (a paged list on page 3 of 20-row pages:
+  /// 40) — the line then reads "Showing 41–60 of 134 NCs".
+  final int offset;
+
   const NcCountLine({
     super.key,
     required this.loaded,
@@ -29,12 +33,15 @@ class NcCountLine extends StatelessWidget {
     required this.hasMore,
     this.noun = 'NCs',
     this.nounOne = 'NC',
+    this.offset = 0,
   });
 
   @override
   Widget build(BuildContext context) {
     final count = total ?? loaded;
-    final text = hasMore && total != null
+    final text = offset > 0 && total != null
+        ? 'Showing ${offset + 1}–${offset + loaded} of $total $noun'
+        : hasMore && total != null
         ? 'Showing $loaded of $total $noun'
         : '$count ${count == 1 ? nounOne : noun}';
     return Text(
@@ -120,5 +127,108 @@ class NcPageFooter extends StatelessWidget {
       );
     }
     return const SizedBox(height: 8);
+  }
+}
+
+/// Prev / "Page X of Y" / Next for a list that shows one page at a time. Hidden
+/// while everything fits one page. [busy] (a page on its way) greys both buttons
+/// so a double tap cannot skip a page.
+class NcPagerBar extends StatelessWidget {
+  final int page;
+  final int totalPages;
+  final bool busy;
+  final ValueChanged<int> onPage;
+
+  const NcPagerBar({
+    super.key,
+    required this.page,
+    required this.totalPages,
+    required this.onPage,
+    this.busy = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (totalPages <= 1) return const SizedBox.shrink();
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          OutlinedButton.icon(
+            key: const ValueKey('nc-page-prev'),
+            onPressed: busy || page <= 1 ? null : () => onPage(page - 1),
+            icon: const Icon(Icons.chevron_left, size: 20),
+            label: const Text('Prev'),
+          ),
+          Flexible(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                busy ? 'Loading…' : 'Page $page of $totalPages',
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ),
+          OutlinedButton(
+            key: const ValueKey('nc-page-next'),
+            onPressed: busy || page >= totalPages ? null : () => onPage(page + 1),
+            child: const Row(mainAxisSize: MainAxisSize.min, children: [Text('Next'), Icon(Icons.chevron_right, size: 20)]),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The small twin of [NcPagerBar] for the top of a paged list, beside the count line:
+/// ‹ 2/14 ›. Same pages, same [busy] rule; hidden while everything fits one page.
+class NcPagerCompact extends StatelessWidget {
+  final int page;
+  final int totalPages;
+  final bool busy;
+  final ValueChanged<int> onPage;
+
+  const NcPagerCompact({
+    super.key,
+    required this.page,
+    required this.totalPages,
+    required this.onPage,
+    this.busy = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (totalPages <= 1) return const SizedBox.shrink();
+    final outline = Theme.of(context).colorScheme.outline;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          key: const ValueKey('nc-page-prev-top'),
+          tooltip: 'Previous page',
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+          onPressed: busy || page <= 1 ? null : () => onPage(page - 1),
+          icon: const Icon(Icons.chevron_left),
+        ),
+        Text(
+          '$page/$totalPages',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: outline, fontWeight: FontWeight.w700),
+        ),
+        IconButton(
+          key: const ValueKey('nc-page-next-top'),
+          tooltip: 'Next page',
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+          onPressed: busy || page >= totalPages ? null : () => onPage(page + 1),
+          icon: const Icon(Icons.chevron_right),
+        ),
+      ],
+    );
   }
 }

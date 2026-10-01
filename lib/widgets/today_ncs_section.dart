@@ -95,6 +95,9 @@ class OverdueNcsSection extends StatelessWidget {
       );
 }
 
+/// How many cards a dashboard list shows; the rest is one tap away on the NC tab ("See more").
+const _dashboardPreviewCount = 5;
+
 class _NcListSection extends StatelessWidget {
   final IconData icon;
   final String title;
@@ -106,6 +109,8 @@ class _NcListSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (ncs.isEmpty) return const SizedBox.shrink();
+    final visible = ncs.take(_dashboardPreviewCount).toList();
+    final left = ncs.length - visible.length;
 
     final scheme = Theme.of(context).colorScheme;
     return Column(
@@ -153,10 +158,18 @@ class _NcListSection extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 10),
-        for (final nc in ncs) ...[
+        for (final nc in visible) ...[
           RepaintBoundary(child: _NcListCard(nc: nc)),
           const SizedBox(height: 10),
         ],
+        if (left > 0 && onSeeAll != null)
+          Center(
+            child: TextButton(
+              key: ValueKey('dashboard-see-more-$title'),
+              onPressed: onSeeAll,
+              child: Text('See more ($left)'),
+            ),
+          ),
       ],
     );
   }

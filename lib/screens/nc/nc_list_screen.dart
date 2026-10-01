@@ -356,6 +356,7 @@ class _NcListBodyState extends State<_NcListBody> {
 
   void _maybeLoadMore() {
     final list = _list;
+    if (list.pagerMode) return; // Prev/Next, not scrolling, moves between pages
     if (!list.hasMore || list.isLoading || list.isLoadingMore) return;
     if (nearListEnd(_scroll)) list.loadMore();
   }
@@ -366,7 +367,7 @@ class _NcListBodyState extends State<_NcListBody> {
   void _afterBuild(NcPagedList list) {
     if (_afterBuildQueued) return;
     final replaced = list.firstPageCount != _seenFirstPages;
-    final canLoad = list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
+    final canLoad = !list.pagerMode && list.hasMore && !list.isLoading && !list.isLoadingMore && list.moreError == null;
     if (!replaced && !canLoad) return;
     _afterBuildQueued = true;
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -456,13 +457,25 @@ class _NcListBodyState extends State<_NcListBody> {
         if (items.isNotEmpty)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 2),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: NcCountLine(
-                loaded: items.length,
-                total: list.total,
-                hasMore: list.hasMore,
-              ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: NcCountLine(
+                    loaded: items.length,
+                    total: list.total,
+                    hasMore: list.hasMore,
+                    offset: list.pagerMode ? ((list.windowPage ?? 1) - 1) * NcPagedList.pageSize : 0,
+                  ),
+                ),
+                // The same Prev/Next as the foot of the list, small, so a long page needs no scroll to turn.
+                if (list.pagerMode)
+                  NcPagerCompact(
+                    page: list.windowPage ?? 1,
+                    totalPages: list.totalPages,
+                    busy: list.isLoading,
+                    onPage: list.goToPage,
+                  ),
+              ],
             ),
           ),
         Expanded(
@@ -512,6 +525,30 @@ class _NcListBodyState extends State<_NcListBody> {
                             separatorBuilder: (_, _) => const SizedBox(height: 10),
                             itemBuilder: (_, i) {
                               if (i == items.length) {
+                                if (list.pagerMode) {
+                                  return Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      if (list.moreError != null)
+                                        Padding(
+                                          padding: const EdgeInsets.only(top: 4),
+                                          child: Text(
+                                            list.moreError!,
+                                            textAlign: TextAlign.center,
+                                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                              color: Theme.of(context).colorScheme.error,
+                                            ),
+                                          ),
+                                        ),
+                                      NcPagerBar(
+                                        page: list.windowPage ?? 1,
+                                        totalPages: list.totalPages,
+                                        busy: list.isLoading,
+                                        onPage: list.goToPage,
+                                      ),
+                                    ],
+                                  );
+                                }
                                 return NcPageFooter(
                                   hasMore: list.hasMore,
                                   isLoadingMore: list.isLoadingMore,

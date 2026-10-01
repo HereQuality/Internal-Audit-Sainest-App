@@ -137,6 +137,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     isLoadingMoreReports = false;
     reportsMoreError = null;
     _reportsPages = 0;
+    _reportsSinglePage = false;
     _reportsLoadedKey = null;
     _placesGen++;
     reportPlaces.clear();
@@ -648,14 +649,22 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
 
   /// Groups per page — the web's table also asks for 20.
   static const reportPageSize = 20;
-  // A live refresh re-reads the pages already on screen, at most this many (more
-  // are one scroll away again).
-  static const _reportRefreshPages = 5;
-  // Pages read so far, and the query they answered ('all params but the page') —
+  // The screen shows ONE page at a time (Prev/Next, [goToReportPage]): the list
+  // holds just that page, and [_reportsPages] is its number. A live refresh
+  // re-reads only that page.
+  // The page on screen, and the query they answered ('all params but the page') —
   // a first page for another query empties the list; for the same one it keeps it
   // until the answer lands.
   int _reportsPages = 0;
   String? _reportsLoadedKey;
+
+  // An `ids` request (a tile of "other" statuses) answers everything in one page,
+  // however many groups: there is nothing to turn to.
+  bool _reportsSinglePage = false;
+
+  /// The page on screen (1-based) and how many pages the total makes.
+  int get reportsPage => _reportsPages < 1 ? 1 : _reportsPages;
+  int get reportsTotalPages => _reportsSinglePage || reportsTotal <= 0 ? 1 : (reportsTotal / reportPageSize).ceil();
 
   /// The location-wise view's rows, per place header ([ReportLocationStats.key]):
   /// loaded lazily, [reportPlacePageSize] of the place's audit ids at a time.
@@ -926,8 +935,8 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// A call for another query than the one on screen empties the list at once (the
   /// screen shows its spinner); for the same one (pull-to-refresh, a live update)
   /// what is shown stays until the answer lands, and a failure then keeps it.
-  /// [quiet] — a live update — re-reads the pages already on screen (at most
-  /// [_reportRefreshPages]) instead of starting over from the first one. Only the
+  /// [quiet] — a live update — re-reads the pages already on screen (the page shown)
+  /// the page shown) instead of starting over from the first one. Only the
   /// newest call writes anything; an answer for a query that was left meanwhile, or
   /// for an account that has signed out, is dropped.
   Future<void> fetchReportAudits({bool quiet = false}) async {
@@ -937,7 +946,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     final params = _reportListParams();
     final key = _queryKey(params);
     final sameQuery = key == _reportsLoadedKey;
-    final pages = quiet && sameQuery ? _reportsPages.clamp(1, _reportRefreshPages) : 1;
+    final window = quiet && sameQuery ? reportsPage : 1;
     if (!sameQuery) {
       reportAudits = [];
       reportsTotal = 0;
@@ -952,8 +961,14 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     reportsMoreError = null;
     notifyListeners();
     try {
-      final read = await _readReportPages(params, firstPage: 1, lastPage: pages, isStale: stale);
+      var read = await _readReportPages(params, firstPage: window, lastPage: window, isStale: stale);
+      // The page on screen is past the end now (reports deleted since): land on the last real one.
+      if (read != null && read.rows.isEmpty && window > 1 && read.total > 0 && !params.containsKey('ids')) {
+        final last = (read.total / reportPageSize).ceil();
+        read = await _readReportPages(params, firstPage: last, lastPage: last, isStale: stale);
+      }
       if (read == null || stale()) return;
+      _reportsSinglePage = params.containsKey('ids');
       reportAudits = read.rows;
       reportsTotal = read.total;
       reportsHasMore = read.hasMore;
@@ -1015,6 +1030,41 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     } catch (e, st) {
       debugPrint('AuditsProvider.fetchMoreReportAudits: unreadable answer: $e\n$st');
       if (!stale()) reportsMoreError = 'Could not load more reports.';
+    } finally {
+      if (!stale()) {
+        isLoadingMoreReports = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// Shows page [page] (clamped) of the Reports list in place of the one on screen
+  /// — Prev/Next. The rows shown stay until the page lands; a failure keeps them and
+  /// sets [reportsMoreError]. [isLoadingMoreReports] is "a page is on its way".
+  Future<void> goToReportPage(int page) async {
+    if (isLoadingReports || isLoadingMoreReports) return;
+    final target = page.clamp(1, reportsTotalPages);
+    if (target == reportsPage) return;
+    final params = _reportListParams();
+    if (_queryKey(params) != _reportsLoadedKey) return;
+    final epoch = _epoch;
+    final seq = _reportAuditsSeq;
+    bool stale() => epoch != _epoch || seq != _reportAuditsSeq;
+    isLoadingMoreReports = true;
+    reportsMoreError = null;
+    notifyListeners();
+    try {
+      final read = await _readReportPages(params, firstPage: target, lastPage: target, isStale: stale);
+      if (read == null || stale()) return;
+      reportAudits = read.rows;
+      reportsTotal = read.total;
+      reportsHasMore = read.hasMore;
+      _reportsPages = read.pages;
+    } on DioException catch (e) {
+      if (!stale()) reportsMoreError = extractErrorMessage(e, fallback: 'Could not load that page.');
+    } catch (e, st) {
+      debugPrint('AuditsProvider.goToReportPage: unreadable answer: $e\n$st');
+      if (!stale()) reportsMoreError = 'Could not load that page.';
     } finally {
       if (!stale()) {
         isLoadingMoreReports = false;

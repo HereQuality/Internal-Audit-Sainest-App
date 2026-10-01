@@ -54,6 +54,9 @@ void main() {
   });
 
   group('CheckpointCard autosave', () {
+    // Longer than CheckpointCardState._debounceDelay (2.5s since the photo-upload rework) — a
+    // typed edit has been sent by the time this has passed.
+    const pastDebounce = Duration(seconds: 3);
     final calls = <_Call>[];
     Completer<String?>? gate;
     String? nextError;
@@ -122,9 +125,9 @@ void main() {
       expect(states.last, CheckpointSyncState.incomplete);
 
       await tester.enterText(find.byType(TextField).first, '7');
-      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(seconds: 1));
       expect(calls, isEmpty); // still inside the debounce
-      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pump(const Duration(seconds: 2));
       expect(calls.single.score, 7);
     });
 
@@ -136,12 +139,12 @@ void main() {
       expect(states.last, CheckpointSyncState.incomplete);
 
       await tester.enterText(find.byType(TextField).first, '10'); // max-1 is 9
-      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(pastDebounce);
       expect(calls, isEmpty);
       expect(find.text('Must be 0–9'), findsOneWidget);
 
       await tester.enterText(find.byType(TextField).first, '9');
-      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(pastDebounce);
       expect(calls.single.findingType, 'OFI');
       expect(calls.single.score, 9);
     });
@@ -149,7 +152,7 @@ void main() {
     testWidgets('NC always sends a numeric score (0) — the server rejects an NC save without one', (tester) async {
       await pump(tester, node: const ParameterNode(id: 'p1', name: 'Guarding', findingType: 'NC', ncId: 'nc1', score: 1));
       await tester.enterText(find.byType(TextField).first, 'checked the guard');
-      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(pastDebounce);
       expect(calls.single.findingType, 'NC');
       expect(calls.single.score, 0);
       expect(calls.single.remark, 'checked the guard');
@@ -160,11 +163,11 @@ void main() {
       await pump(tester, node: const ParameterNode(id: 'p1', name: 'Guarding', findingType: 'Strong Compliance', score: 10));
       gate = Completer<String?>();
       await tester.enterText(find.byType(TextField).first, 'first');
-      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(pastDebounce);
       expect(calls.length, 1);
 
       await tester.enterText(find.byType(TextField).first, 'first and second');
-      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(pastDebounce);
       expect(calls.length, 1); // serialized: the second waits its turn
 
       final g = gate!;
@@ -180,7 +183,7 @@ void main() {
       await pump(tester, node: const ParameterNode(id: 'p1', name: 'Guarding', findingType: 'Strong Compliance', score: 10));
       nextError = 'Could not reach the server.';
       await tester.enterText(find.byType(TextField).first, 'note');
-      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(pastDebounce);
       expect(calls.length, 1);
       expect(states.last, CheckpointSyncState.failed);
 
@@ -214,7 +217,7 @@ void main() {
     testWidgets('a remark typed with no finding saves on its own, the same way a photo does', (tester) async {
       await pump(tester);
       await tester.enterText(find.byType(TextField).first, 'only a remark');
-      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(pastDebounce);
       await tester.pump();
       expect(calls.single.findingType, isNull);
       expect(calls.single.score, isNull);
@@ -229,7 +232,7 @@ void main() {
       await pump(tester);
       nextError = 'Could not reach the server.';
       await tester.enterText(find.byType(TextField).first, 'offline remark');
-      await tester.pump(const Duration(seconds: 2));
+      await tester.pump(pastDebounce);
       await tester.pump();
       expect(calls.single.remark, 'offline remark');
       expect(states.last, CheckpointSyncState.failed);

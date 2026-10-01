@@ -152,6 +152,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     loadStats: _raisedStatsFor,
     // /ncs/raised/stats takes `search`: a bucket chip + search narrows the ids.
     statsHaveSearch: true,
+    pager: true,
   );
 
   late final NcPagedList mineList = NcPagedList(
@@ -163,6 +164,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     epoch: () => _epoch,
     onChanged: notifyListeners,
     loadStats: _mineStatsFor,
+    pager: true,
   );
 
   late final NcPagedList reportList = NcPagedList(
@@ -177,6 +179,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     // A page is `limit` whole AUDITS (every matching NC of each), so the NCs of
     // one audit always arrive together and the tab can show them as one bundle.
     pageParams: const {'groupBy': 'audit'},
+    pager: true,
   );
 
   /// What the screens (and the old tests) read: the loaded rows of each list.
@@ -327,6 +330,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   /// the list was replaced (a filter or the min. times moved) and scrolls to the top.
   int repeatsFirstPageCount = 0;
   static const _repeatsPageSize = 30;
+  static const repeatsPageSize = _repeatsPageSize;
   // Server pages read so far — counted, not worked out from how many rows are
   // loaded (a row that cannot be read would throw the next page's number off).
   int _repeatsPagesRead = 0;
@@ -695,8 +699,52 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     }
   }
 
-  /// The pages already loaded, re-read and swapped in at once (a live update: no
-  /// spinner, the scroll position stays); a failure keeps what is shown.
+  /// The page on screen (1-based) and how many pages [repeatsTotal] makes — the Repeated
+  /// NCs tab shows ONE page at a time (Prev/Next, [goToRepeatsPage]).
+  int get repeatsPage => _repeatsPagesRead < 1 ? 1 : _repeatsPagesRead;
+  int get repeatsTotalPages => repeatsTotal <= 0 ? 1 : (repeatsTotal / _repeatsPageSize).ceil();
+
+  /// Shows page [page] (clamped) in place of the one on screen. The rows shown stay until
+  /// the page lands; a failure keeps them and sets [repeatsMoreError]. [isLoadingMoreRepeats]
+  /// is "a page is on its way". A new page counts as a new first page for the screen
+  /// ([repeatsFirstPageCount]): it starts from the top.
+  Future<void> goToRepeatsPage(int page) async {
+    if (isLoadingRepeats || isLoadingMoreRepeats || _repeatsRefreshing || _repeatsPagesRead == 0) return;
+    final target = page.clamp(1, repeatsTotalPages);
+    if (target == repeatsPage) return;
+    final epoch = _epoch;
+    final seq = ++_repeatsSeq;
+    bool stale() => epoch != _epoch || seq != _repeatsSeq;
+    isLoadingMoreRepeats = true;
+    repeatsMoreError = null;
+    notifyListeners();
+    try {
+      final r = await _requestRepeats(target);
+      if (stale()) return;
+      final seen = <String>{};
+      repeatRows = [
+        for (final g in r.rows)
+          if (seen.add(g.key)) g,
+      ];
+      repeatsTotal = r.total ?? repeatsTotal;
+      _repeatsPagesRead = target;
+      repeatsFirstPageCount++;
+      repeatsHasMore = r.read > 0 && target * _repeatsPageSize < repeatsTotal;
+    } on DioException catch (e) {
+      if (!stale()) repeatsMoreError = extractErrorMessage(e, fallback: 'Could not load that page.');
+    } catch (e, st) {
+      debugPrint('NcProvider.goToRepeatsPage: unreadable answer: $e\n$st');
+      if (!stale()) repeatsMoreError = 'Could not load that page.';
+    } finally {
+      if (!stale()) {
+        isLoadingMoreRepeats = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// The page on screen, re-read and swapped in at once (a live update: no spinner, the
+  /// scroll position stays); a failure keeps what is shown.
   Future<void> refreshRepeats() async {
     if (isLoadingRepeats) return; // a first page is on its way and is the freshest
     if (_repeatsPagesRead == 0) return fetchRepeats();
@@ -708,26 +756,23 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     _repeatsRefreshing = true;
     if (hadMore) notifyListeners();
     try {
-      final rows = <RepeatGroup>[];
-      final seen = <String>{};
-      int? total;
-      var read = 0;
-      var page = 0;
-      while (page < _repeatsPagesRead) {
-        final r = await _requestRepeats(page + 1);
+      var page = _repeatsPagesRead;
+      var r = await _requestRepeats(page);
+      if (stale()) return;
+      // The page on screen is past the end now (rows gone since): land on the last real one.
+      if (r.rows.isEmpty && page > 1 && (r.total ?? 0) > 0) {
+        page = (r.total! / _repeatsPageSize).ceil();
+        r = await _requestRepeats(page);
         if (stale()) return;
-        for (final g in r.rows) {
-          if (seen.add(g.key)) rows.add(g);
-        }
-        total = r.total ?? total;
-        read = r.read;
-        page++;
-        if (read == 0) break;
       }
-      repeatRows = rows;
-      repeatsTotal = total ?? rows.length;
+      final seen = <String>{};
+      repeatRows = [
+        for (final g in r.rows)
+          if (seen.add(g.key)) g,
+      ];
+      repeatsTotal = r.total ?? repeatRows.length;
       _repeatsPagesRead = page;
-      repeatsHasMore = read > 0 && page * _repeatsPageSize < repeatsTotal;
+      repeatsHasMore = r.read > 0 && page * _repeatsPageSize < repeatsTotal;
     } catch (e, st) {
       debugPrint('NcProvider.refreshRepeats: kept what is shown: $e\n$st');
     } finally {

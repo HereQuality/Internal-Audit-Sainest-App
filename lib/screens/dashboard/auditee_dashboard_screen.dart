@@ -164,6 +164,9 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
             // from any server-sent total, so a narrowed list simply
             // describes itself — there is no "N of M" to go stale. What it
             // is narrowed by the same shared filters (NcProvider.ncFilterParams).
+            // "See all"/"See more" opens the NC tab on the list's own chip: Overdue → Overdue.
+            // Today's and Ongoing mix several chips (a due-today or upcoming NC may be waiting
+            // on the auditee or on approval), so they open it on "All".
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
               sliver: SliverToBoxAdapter(
@@ -178,21 +181,21 @@ class _AuditeeDashboardScreenState extends State<AuditeeDashboardScreen> {
                         ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
-                            : () => widget.onNavigateToTab!(1),
+                            : () => widget.onNavigateToTab!(1, filter: 'All'),
                       ),
                       const SizedBox(height: 14),
                       OngoingNcsSection(
                         ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
-                            : () => widget.onNavigateToTab!(1),
+                            : () => widget.onNavigateToTab!(1, filter: 'All'),
                       ),
                       const SizedBox(height: 14),
                       OverdueNcsSection(
                         ncs: ncProvider.againstMeAll,
                         onSeeAll: widget.onNavigateToTab == null
                             ? null
-                            : () => widget.onNavigateToTab!(1),
+                            : () => widget.onNavigateToTab!(1, filter: 'Overdue'),
                       ),
                     ],
                   ),

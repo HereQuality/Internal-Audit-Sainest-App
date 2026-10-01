@@ -170,6 +170,7 @@ class NcPagedList {
     this.statsHaveSearch = false,
     this.pageParams = const {},
     this.fixedIds,
+    this.pager = false,
   });
 
   static const pageSize = 20;
@@ -208,6 +209,12 @@ class NcPagedList {
   /// A list of exactly these NCs (a place's), read by id; null for a normal list.
   final List<String>? Function()? fixedIds;
 
+  /// Opt-in page mode: the list shows ONE page at a time ([goToPage], Prev/Next on
+  /// the screen) instead of appending as the user scrolls. The first page is
+  /// page 1; [refreshLoaded] re-reads only the page on screen. Off for a list
+  /// that scrolls (the Final Report's NCs tab, a place's NCs).
+  final bool pager;
+
   List<NcModel> items = [];
 
   /// How many the server says match, in the unit it pages by (null while unknown:
@@ -218,6 +225,17 @@ class NcPagedList {
   /// How many NCs match — [total] unless the answer counted something else.
   int? totalNcs;
   bool hasMore = false;
+
+  /// The page on screen (1-based) while a [pager] list can be paged; null when it
+  /// scrolls instead — also for a bucket chip with a search its stats cannot
+  /// narrow, whose total (so page count) is unknown until every id was read.
+  int? windowPage;
+
+  /// Whether the screen should show Prev/Next for this list.
+  bool get pagerMode => pager && windowPage != null && total != null && _loaded;
+
+  /// How many pages [total] makes (1 while unknown).
+  int get totalPages => total == null ? 1 : math.max(1, (total! / pageSize).ceil());
 
   /// A first page (or a reload) is on its way / the next page is.
   bool isLoading = false;
@@ -291,6 +309,7 @@ class NcPagedList {
     _pages = 0;
     _ids = null;
     _cursor = 0;
+    windowPage = null;
   }
 
   /// Back to empty and to the "All", no-search default — on logout.
@@ -476,6 +495,7 @@ class NcPagedList {
       }
       if (snap == null) return;
       _apply(snap);
+      windowPage = pager && !_scanBySearch ? 1 : null;
       firstPageCount++;
     } on DioException catch (e) {
       if (!stale()) error = extractErrorMessage(e, fallback: failure);
@@ -524,6 +544,79 @@ class NcPagedList {
     }
   }
 
+  /// ONE page of the list — page [page] of the server's pages, or the same slice
+  /// of [ids] — as a snapshot of just those rows. A page past the end (rows
+  /// deleted since) lands on the last real one. Null when the answer went stale.
+  Future<_Snap?> _readWindow(int page, bool Function() stale, {List<String>? ids}) async {
+    if (ids != null) {
+      final last = math.max(1, (ids.length / pageSize).ceil());
+      final p = page.clamp(1, last);
+      final start = (p - 1) * pageSize;
+      final part = ids.sublist(math.min(start, ids.length), math.min(start + pageSize, ids.length));
+      final rows = <NcModel>[];
+      if (part.isNotEmpty) {
+        final r = await _get({..._params(withSearch: false), 'ids': part.join(',')});
+        if (stale()) return null;
+        final asked = part.toSet();
+        final seen = <String>{};
+        for (final n in r.rows) {
+          if (asked.contains(n.id) && seen.add(n.id)) rows.add(n);
+        }
+      }
+      final end = start + part.length;
+      return _Snap(items: rows, total: ids.length, totalNcs: ids.length, ids: ids, cursor: end, pages: p, hasMore: end < ids.length);
+    }
+    var p = page;
+    var r = await _get({..._params(), ...pageParams, 'page': p, 'limit': pageSize});
+    if (stale()) return null;
+    if (!r.plain && r.rows.isEmpty && p > 1 && (r.total ?? 0) > 0) {
+      p = (r.total! / pageSize).ceil();
+      r = await _get({..._params(), ...pageParams, 'page': p, 'limit': pageSize});
+      if (stale()) return null;
+    }
+    final total = r.plain ? r.rows.length : (r.total ?? r.rows.length);
+    return _Snap(
+      items: r.rows,
+      total: total,
+      totalNcs: r.plain ? total : (r.totalNcs ?? total),
+      pages: p,
+      hasMore: !r.plain && r.rows.isNotEmpty && p * pageSize < total,
+    );
+  }
+
+  /// Shows page [page] (clamped) in place of the one on screen — what Prev/Next
+  /// call. The rows already on screen stay until the page lands; a failure keeps
+  /// them and sets [moreError]. Only for a [pagerMode] list.
+  Future<void> goToPage(int page) async {
+    if (!pagerMode || isLoading || _refreshing) return;
+    final target = page.clamp(1, totalPages);
+    if (target == windowPage) return;
+    final owner = epoch();
+    final seq = ++_seq;
+    bool stale() => owner != epoch() || seq != _seq;
+    isLoading = true;
+    isLoadingMore = false;
+    moreError = null;
+    onChanged();
+    try {
+      final snap = await _readWindow(target, stale, ids: _ids);
+      if (snap == null) return;
+      _apply(snap);
+      windowPage = snap.pages;
+      firstPageCount++;
+    } on DioException catch (e) {
+      if (!stale()) moreError = extractErrorMessage(e, fallback: 'Could not load that page.');
+    } catch (e, st) {
+      debugPrint('NcPagedList($path).goToPage: unreadable answer: $e\n$st');
+      if (!stale()) moreError = 'Could not load that page.';
+    } finally {
+      if (!stale()) {
+        isLoading = false;
+        onChanged();
+      }
+    }
+  }
+
   /// Re-reads the pages that are on screen (page 1..N, or the same number of the
   /// ids) and swaps them in at once. Quiet: no loading flag, and a failure keeps
   /// what is shown. With nothing loaded yet it is a first page.
@@ -539,7 +632,16 @@ class NcPagedList {
     if (hadMore) onChanged();
     try {
       final _Snap? snap;
-      if (_usesIds && _ids != null) {
+      if (windowPage != null) {
+        // Page mode: only the page being looked at is re-read.
+        List<String>? ids;
+        if (_usesIds && _ids != null) {
+          ids = await _resolveIds(true);
+          if (stale()) return;
+        }
+        snap = await _readWindow(windowPage!, stale, ids: ids);
+        if (snap != null) windowPage = snap.pages;
+      } else if (_usesIds && _ids != null) {
         final ids = await _resolveIds(true);
         if (stale()) return;
         snap = await _nextSlices(

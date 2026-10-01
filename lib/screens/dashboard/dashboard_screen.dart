@@ -189,9 +189,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   // Overdue folds the others (see AuditAttentionPanel).
                   child: AuditAttentionPanel(
                     audits: auditsProvider.audits,
-                    onSeeAll: widget.onNavigateToTab == null
-                        ? null
-                        : () => widget.onNavigateToTab!(1),
+                    onNavigate: widget.onNavigateToTab,
                   ),
                 ),
               ),
