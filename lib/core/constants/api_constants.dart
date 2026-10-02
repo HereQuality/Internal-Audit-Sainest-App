@@ -1,4 +1,4 @@
-/// API base URL — points at the dev backend by default. Every real build
+/// API base URL — points at the production backend (audit.hqepl.com) by default. Every real build
 /// (debug or release, on a device or in the store) still gets exactly this
 /// same server with zero extra flags, so nothing changes for the normal
 /// workflow. The one override below exists ONLY for pointing a local
@@ -11,10 +11,10 @@
 class ApiConstants {
   ApiConstants._();
 
-//   static const String prodUrl = 'https://audit.hqepl.com/api/v1';
+//   static const String prodUrl = 'https://devaudit.hqepl.com/api/v1';
   static const String baseUrl = String.fromEnvironment(
     'API_BASE_URL',
-    defaultValue: 'https://devaudit.hqepl.com/api/v1',
+    defaultValue: 'https://audit.hqepl.com/api/v1',
   );
 
   /// Socket.io connects to the server root, not the /api/v1 REST prefix.
