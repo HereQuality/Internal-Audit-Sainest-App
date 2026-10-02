@@ -1054,7 +1054,12 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     reportsMoreError = null;
     notifyListeners();
     try {
-      final read = await _readReportPages(params, firstPage: target, lastPage: target, isStale: stale);
+      var read = await _readReportPages(params, firstPage: target, lastPage: target, isStale: stale);
+      // The total shrank since (reports deleted): land on the last real page rather than an empty one.
+      if (read != null && read.rows.isEmpty && target > 1 && read.total > 0) {
+        final last = (read.total / reportPageSize).ceil();
+        read = await _readReportPages(params, firstPage: last, lastPage: last, isStale: stale);
+      }
       if (read == null || stale()) return;
       reportAudits = read.rows;
       reportsTotal = read.total;

@@ -444,7 +444,9 @@ class _NcReportTabState extends State<NcReportTab> {
     final rows = p.reportNcs;
     final ncs = p.ncReportTotalNcs ?? rows.length;
     final audits =
-        p.ncReportTotalAudits ?? (p.reportList.hasMore ? null : groupNcsByAudit(rows).length);
+        p.ncReportTotalAudits ??
+        // Counted from the rows only when they are ALL the rows: not on a page of a longer list.
+        ((p.reportList.pagerMode ? p.reportList.totalPages > 1 : p.reportList.hasMore) ? null : groupNcsByAudit(rows).length);
     final nc = '$ncs ${ncs == 1 ? 'NC' : 'NCs'}';
     return audits == null ? nc : '$nc · $audits ${audits == 1 ? 'audit' : 'audits'}';
   }

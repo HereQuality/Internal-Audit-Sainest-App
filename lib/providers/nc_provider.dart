@@ -719,17 +719,24 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     repeatsMoreError = null;
     notifyListeners();
     try {
-      final r = await _requestRepeats(target);
+      var page = target;
+      var r = await _requestRepeats(page);
       if (stale()) return;
+      // The total shrank since: land on the last real page rather than an empty one.
+      if (r.rows.isEmpty && page > 1 && (r.total ?? 0) > 0) {
+        page = (r.total! / _repeatsPageSize).ceil();
+        r = await _requestRepeats(page);
+        if (stale()) return;
+      }
       final seen = <String>{};
       repeatRows = [
         for (final g in r.rows)
           if (seen.add(g.key)) g,
       ];
       repeatsTotal = r.total ?? repeatsTotal;
-      _repeatsPagesRead = target;
+      _repeatsPagesRead = page;
       repeatsFirstPageCount++;
-      repeatsHasMore = r.read > 0 && target * _repeatsPageSize < repeatsTotal;
+      repeatsHasMore = r.read > 0 && page * _repeatsPageSize < repeatsTotal;
     } on DioException catch (e) {
       if (!stale()) repeatsMoreError = extractErrorMessage(e, fallback: 'Could not load that page.');
     } catch (e, st) {

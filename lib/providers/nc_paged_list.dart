@@ -329,7 +329,7 @@ class NcPagedList {
     if (withSearch && search.isNotEmpty) 'search': search,
   };
 
-  Future<({List<NcModel> rows, int? total, int? totalNcs, bool plain})> _get(
+  Future<({List<NcModel> rows, int? total, int? totalNcs, bool plain, int? page})> _get(
     Map<String, dynamic> params,
   ) async {
     final res = await dio.get(path, queryParameters: params);
@@ -337,6 +337,7 @@ class NcPagedList {
     final Iterable<dynamic> raw;
     int? total;
     int? totalNcs;
+    int? page;
     var plain = false;
     if (data == null) {
       raw = const [];
@@ -350,6 +351,7 @@ class NcPagedList {
       raw = (data['ncs'] as List?) ?? const [];
       total = (data['total'] as num?)?.toInt();
       totalNcs = (data['totalNcs'] as num?)?.toInt();
+      page = (data['page'] as num?)?.toInt();
     } else {
       throw const FormatException('Unexpected NC list answer');
     }
@@ -357,7 +359,7 @@ class NcPagedList {
       for (final e in raw)
         if (e is Map) NcModel.fromJson(Map<String, dynamic>.from(e)),
     ];
-    return (rows: rows, total: total, totalNcs: totalNcs, plain: plain);
+    return (rows: rows, total: total, totalNcs: totalNcs, plain: plain, page: page);
   }
 
   /// Pages `from.pages + 1 .. untilPage` of the plain (server-paged) list,
@@ -495,7 +497,8 @@ class NcPagedList {
       }
       if (snap == null) return;
       _apply(snap);
-      windowPage = pager && !_scanBySearch ? 1 : null;
+      // A bucket chip + a search its stats cannot narrow has no known total: that one scrolls.
+      windowPage = pager && !(_usesIds && _scanBySearch) ? 1 : null;
       firstPageCount++;
     } on DioException catch (e) {
       if (!stale()) error = extractErrorMessage(e, fallback: failure);
@@ -579,8 +582,9 @@ class NcPagedList {
       items: r.rows,
       total: total,
       totalNcs: r.plain ? total : (r.totalNcs ?? total),
-      pages: p,
-      hasMore: !r.plain && r.rows.isNotEmpty && p * pageSize < total,
+      // The NC lists answer a page past the end with the LAST page and say which one they served.
+      pages: r.page ?? p,
+      hasMore: !r.plain && r.rows.isNotEmpty && (r.page ?? p) * pageSize < total,
     );
   }
 
