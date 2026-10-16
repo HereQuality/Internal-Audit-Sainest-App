@@ -13,6 +13,7 @@ import '../../providers/dashboard_provider.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/empty_state.dart';
 import '../../widgets/max_width_scroll.dart';
+import '../../utils/bold_marks.dart';
 import 'audit_header_card.dart';
 import 'checkpoint_card.dart';
 import 'select_representative_sheet.dart';
@@ -362,7 +363,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
       builder: (ctx) => AlertDialog(
         title: const Text('Remove checkpoint?'),
         content: Text(
-          '"${node.name}" will be removed from this audit\'s checklist.',
+          '"${stripBold(node.name)}" will be removed from this audit\'s checklist.',
         ),
         actions: [
           TextButton(
@@ -570,7 +571,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
         // instead of claiming (via the generic message below) that we
         // found and pointed to it.
         final sectionName = ancestorGroups.isNotEmpty
-            ? ancestorGroups.last.name
+            ? stripBold(ancestorGroups.last.name)
             : null;
         showErrorSnackBar(
           context,
@@ -738,7 +739,11 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
               const SizedBox(height: 12),
               TextField(
                 controller: remarkController,
-                maxLines: 3,
+                minLines: 3,
+                maxLines: 8,
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                textCapitalization: TextCapitalization.sentences,
                 decoration: const InputDecoration(
                   labelText: 'Final remark (optional)',
                   alignLabelWithHint: true,
@@ -1506,7 +1511,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
               return Padding(
                 padding: EdgeInsets.only(left: depth * 12, bottom: 8),
                 child: _GroupHeader(
-                  title: '$serial. ${node.name}',
+                  title: '$serial. ${stripBold(node.name)}',
                   collapsed: _groupCollapsed[node.id] ?? false,
                   onToggle: () => setState(
                     () => _groupCollapsed[node.id] =

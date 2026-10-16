@@ -305,7 +305,11 @@ class _NcReviewScreenState extends State<NcReviewScreen> {
         children: [
           TextField(
             controller: _noteController,
-            maxLines: 2,
+            minLines: 2,
+            maxLines: 8,
+            keyboardType: TextInputType.multiline,
+            textInputAction: TextInputAction.newline,
+            textCapitalization: TextCapitalization.sentences,
             decoration: const InputDecoration(
               labelText: 'Remark (required to reject)',
             ),

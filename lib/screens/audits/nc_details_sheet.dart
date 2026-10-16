@@ -360,7 +360,11 @@ class _NcDetailsSheetState extends State<_NcDetailsSheet> {
                   const SizedBox(height: 12),
                   TextFormField(
                     controller: _remarkController,
-                    maxLines: 3,
+                    minLines: 3,
+                    maxLines: 8,
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.newline,
+                    textCapitalization: TextCapitalization.sentences,
                     decoration: const InputDecoration(
                       labelText: 'Remark',
                       // Carried over from the checkpoint's own remark box behind this

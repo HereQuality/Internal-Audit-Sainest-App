@@ -14,6 +14,7 @@ import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../models/audit_detail_model.dart';
 import '../models/nc_model.dart';
+import 'bold_marks.dart';
 import 'report_pdf_fonts.dart';
 import 'report_photo_utils.dart';
 import 'report_sections.dart';
@@ -888,14 +889,14 @@ pw.Widget _logoBadge(pw.MemoryImage? logo, String? companyName) {
     );
   }
   return pw.Container(
-    width: _logoBadgeSize,
-    height: _logoBadgeSize,
-    alignment: pw.Alignment.center,
-    decoration: pw.BoxDecoration(color: _C.logoBadgeBg, borderRadius: pw.BorderRadius.circular(10)),
-    child: pw.Text(
-      _companyInitials(companyName),
-      style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold, color: _C.white),
-    ),
+      width: _logoBadgeSize,
+      height: _logoBadgeSize,
+      alignment: pw.Alignment.center,
+      decoration: pw.BoxDecoration(color: _C.logoBadgeBg, borderRadius: pw.BorderRadius.circular(10)),
+      child: pw.Text(
+        _companyInitials(companyName),
+        style: pw.TextStyle(fontSize: 15, fontWeight: pw.FontWeight.bold, color: _C.white),
+      ),
   );
 }
 
@@ -1171,7 +1172,7 @@ List<(String, int)> _parameterChartData(List<_SectionSpec> sections) {
     }
     if (perLocationAverages.isEmpty) continue;
     final avg = perLocationAverages.reduce((a, b) => a + b) / perLocationAverages.length;
-    out.add((axisName, (avg * 100).round()));
+    out.add((stripBold(axisName), (avg * 100).round()));
   }
   return out;
 }
@@ -1415,23 +1416,48 @@ const _normalCols = [
 // Cell content only — no Expanded/SizedBox width wrapper, since a
 // pw.TableRow's cells get their width from the owning pw.Table's own
 // columnWidths (see [_indexTableRows]), not from a Row-style flex parent.
-pw.Widget _cellContent(_Col col, String? value, PdfColor fg, bool bold, double size) => pw.Container(
-  height: 20,
-  alignment: col.center ? pw.Alignment.center : pw.Alignment.centerLeft,
-  // Centered cells only need enough padding to keep neighbours apart; the
-  // web's flat 8pt each side leaves too little room for "Weightage" and a
-  // deep "1.1.1" serial once Noto Sans replaces Helvetica's narrower
-  // metrics, and they clipped mid-word.
-  padding: pw.EdgeInsets.symmetric(horizontal: col.center ? 4 : 8),
-  child: value == null
-      ? pw.SizedBox()
-      : pw.Text(
-          value,
-          maxLines: 1,
-          overflow: pw.TextOverflow.clip,
-          style: pw.TextStyle(fontSize: size, fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal, color: fg),
-        ),
-);
+pw.Widget _cellContent(_Col col, String? rawValue, PdfColor fg, bool bold, double size) {
+  // A cell is one line (clipped), so a typed line break in a name reads as a space here instead of cutting the
+  // name off after its first line.
+  final value = rawValue?.replaceAll(RegExp(r'\s*\n+\s*'), ' ');
+  return pw.Container(
+    height: 20,
+    alignment: col.center ? pw.Alignment.center : pw.Alignment.centerLeft,
+    // Centered cells only need enough padding to keep neighbours apart; the
+    // web's flat 8pt each side leaves too little room for "Weightage" and a
+    // deep "1.1.1" serial once Noto Sans replaces Helvetica's narrower
+    // metrics, and they clipped mid-word.
+    padding: pw.EdgeInsets.symmetric(horizontal: col.center ? 4 : 8),
+    child: value == null
+        ? pw.SizedBox()
+        : (!bold && hasBold(value))
+        // A checkpoint name with **bold** in it: its bold stretches in a bold weight, the rest regular.
+        ? pw.RichText(
+            maxLines: 1,
+            overflow: pw.TextOverflow.clip,
+            text: pw.TextSpan(
+              style: pw.TextStyle(fontSize: size, fontWeight: pw.FontWeight.normal, color: fg),
+              children: [
+                for (final s in boldSegments(value))
+                  pw.TextSpan(
+                    text: s.text,
+                    style: s.bold ? pw.TextStyle(fontWeight: pw.FontWeight.bold) : null,
+                  ),
+              ],
+            ),
+          )
+        : pw.Text(
+            bold ? stripBold(value) : value,
+            maxLines: 1,
+            overflow: pw.TextOverflow.clip,
+            style: pw.TextStyle(
+              fontSize: size,
+              fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+              color: fg,
+            ),
+          ),
+  );
+}
 
 pw.TableRow _tableRow(
   List<_Col> cols,
@@ -1710,7 +1736,7 @@ List<pw.Widget> _findingNode(
         pw.SizedBox(width: 8),
         pw.Expanded(
           child: pw.Text(
-            node.name,
+            stripBold(node.name),
             style: pw.TextStyle(
               fontSize: isTop ? 10.5 : 9,
               fontWeight: pw.FontWeight.bold,
@@ -1854,10 +1880,13 @@ double _estimateLeafHeight(ParameterNode node, double availW) {
     // mixed-case prose; 0.55 deliberately over-counts so the guard errs
     // toward the safe (flat) rendering.
     final perLine = math.max(1.0, width / (fontSize * 0.55));
-    return (text.length / perLine).ceil().toDouble();
+    // Each typed line break (a remark can hold them) starts a fresh line, however short the line before it was.
+    return text
+        .split('\n')
+        .fold<double>(0, (sum, line) => sum + math.max(1, (line.length / perLine).ceil()));
   }
 
-  var h = math.max(42.0, 20 + lines(node.name, 9.5, availW * 0.55) * 13); // header band
+  var h = math.max(42.0, 20 + lines(stripBold(node.name), 9.5, availW * 0.55) * 13); // header band
   if (node.findingType != null) {
     h += 18 + lines(node.remark ?? '—', 9, availW - 20) * 12 + 20; // remark label + box
     h += 18; // evidence label
@@ -1914,7 +1943,7 @@ List<pw.Widget> _leafCardWidgets(
         pw.SizedBox(width: 8),
         pw.Expanded(
           child: pw.Text(
-            node.name,
+            stripBold(node.name),
             style: pw.TextStyle(fontSize: 9.5, fontWeight: pw.FontWeight.bold, color: _C.ink),
           ),
         ),

@@ -17,6 +17,7 @@ import '../../models/upload_phase.dart';
 import '../../widgets/nc_timeliness_badge.dart';
 import '../../widgets/photo_picker_sheet.dart';
 import '../../widgets/photo_viewer.dart';
+import '../../widgets/bold_text.dart';
 import '../../widgets/status_badge.dart';
 import 'nc_details_sheet.dart';
 
@@ -1101,7 +1102,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                   child: Text(widget.serial, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700)),
                 ),
                 const SizedBox(width: 8),
-                Expanded(child: Text(widget.node.name, style: const TextStyle(fontWeight: FontWeight.w600))),
+                Expanded(child: BoldText(widget.node.name, style: const TextStyle(fontWeight: FontWeight.w600))),
                 if (widget.readOnly && widget.node.findingType != null)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -1409,7 +1410,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
         const SizedBox(height: 10),
         TextField(
           controller: _remarkController,
-          maxLines: 3,
+          minLines: 3,
+          maxLines: 8,
+          keyboardType: TextInputType.multiline,
+          textInputAction: TextInputAction.newline,
+          textCapitalization: TextCapitalization.sentences,
           decoration: const InputDecoration(labelText: 'Add remark or observations...', prefixIcon: Icon(Icons.chat_bubble_outline)),
         ),
         const SizedBox(height: 10),
