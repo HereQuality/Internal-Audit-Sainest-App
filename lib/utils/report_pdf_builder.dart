@@ -219,6 +219,10 @@ class _ReportSpec {
   final String? finalAuditorRemark;
   final List<(String, String)>? zoneRemarks;
 
+  /// What the Location-wise Score chart calls the one bar of an audit whose places all share ONE checklist (its
+  /// single section has no name of its own) — the places the audit covers, instead of the placeholder "Location 1".
+  final String? unnamedSectionLabel;
+
   /// The server's own stored/rolled-up overall % (audit.scoreResult.percentage,
   /// or the sum-then-divide of every zone's achieved/maxPossible for a
   /// combined report). Wins over the locally recomputed % for the header ring
@@ -235,6 +239,7 @@ class _ReportSpec {
     required this.isFinalReport,
     this.finalAuditorRemark,
     this.zoneRemarks,
+    this.unnamedSectionLabel,
     this.serverPercentage,
   });
 
@@ -539,6 +544,11 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit, {ReportPdfStats? stats}
       scoringSystem: audit.scoringSystem,
       isFinalReport: audit.status == 'Completed',
       finalAuditorRemark: (audit.finalAuditorRemark ?? '').isNotEmpty ? audit.finalAuditorRemark : null,
+      unnamedSectionLabel: audit.locationLabels.isNotEmpty
+          ? audit.locationLabels.map((l) => l.display).join(', ')
+          : audit.departmentLabels.isNotEmpty
+          ? audit.departmentLabels.map((d) => d.display).join(', ')
+          : audit.title,
       serverPercentage: audit.scoreResult.percentage?.round(),
     ),
     stats: stats,
@@ -778,7 +788,7 @@ Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
 
   final hasRemark = spec.finalAuditorRemark != null || (spec.zoneRemarks?.isNotEmpty ?? false);
   final paramChartData = _parameterChartData(spec.sections);
-  final locationChartData = _locationChartData(spec.sections, spec.scoringSystem);
+  final locationChartData = _locationChartData(spec.sections, spec.scoringSystem, unnamedLabel: spec.unnamedSectionLabel);
 
   doc.addPage(
     pw.MultiPage(
@@ -1177,14 +1187,19 @@ List<(String, int)> _parameterChartData(List<_SectionSpec> sections) {
   return out;
 }
 
-List<(String, int)> _locationChartData(List<_SectionSpec> sections, String scoringSystem) {
+List<(String, int)> _locationChartData(List<_SectionSpec> sections, String scoringSystem, {String? unnamedLabel}) {
   final out = <(String, int)>[];
   for (var i = 0; i < sections.length; i++) {
     final section = sections[i];
     final leaves = collectScoredLeaves(section.tree);
     if (leaves.isEmpty) continue;
     final pct = percentageOf(sumAchievedMax(leaves, scoringSystem, section.maxScore));
-    if (pct != null) out.add((section.label.isNotEmpty ? section.label : 'Location ${i + 1}', pct));
+    if (pct != null) {
+      final label = section.label.isNotEmpty
+          ? section.label
+          : (sections.length == 1 && (unnamedLabel ?? '').isNotEmpty ? unnamedLabel! : 'Location ${i + 1}');
+      out.add((label, pct));
+    }
   }
   return out;
 }
