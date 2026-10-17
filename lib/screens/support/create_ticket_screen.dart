@@ -35,7 +35,7 @@ class _CreateTicketScreenState extends State<CreateTicketScreen> {
       showErrorSnackBar(context, 'You can attach up to 5 images.');
       return;
     }
-    final picked = await ImagePicker().pickMultiImage(imageQuality: 80);
+    final picked = await ImagePicker().pickMultiImage(imageQuality: 80, maxWidth: 1600, maxHeight: 1600);
     if (picked.isEmpty || !mounted) return;
     setState(() {
       _attachments.addAll(picked.map((x) => File(x.path)).take(5 - _attachments.length));

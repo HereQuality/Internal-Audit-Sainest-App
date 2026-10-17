@@ -9,6 +9,7 @@ import 'package:intl/intl.dart';
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
+import '../core/utils/evidence_photo.dart';
 import '../models/nc_model.dart';
 import '../models/nc_report_model.dart';
 import 'audit_filter_scope.dart';
@@ -908,15 +909,8 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
         'preventiveAction': preventiveAction,
       });
       for (final file in photos) {
-        form.files.add(
-          MapEntry(
-            'photos',
-            await MultipartFile.fromFile(
-              file.path,
-              filename: file.path.split('/').last,
-            ),
-          ),
-        );
+        // Labelled by what the file really is (see evidencePhotoPart): the server refuses a mislabelled photo.
+        form.files.add(MapEntry('photos', await evidencePhotoPart(file)));
       }
       // Evidence photos carried over from a previous (rejected) attempt
       // that the auditee kept as-is rather than re-uploading — server only
@@ -929,6 +923,8 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
       notifyListeners();
       _refreshReports();
       return null;
+    } on UnsupportedPhotoException catch (e) {
+      return e.message;
     } on DioException catch (e) {
       return extractErrorMessage(
         e,

@@ -279,6 +279,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   String _seenRemark = '';
   String _seenScore = '';
   List<String> _existingPhotos = [];
+  // Hosted URLs the server confirmed for photos uploaded from THIS card (see
+  // _uploadPhotos), kept until the audit data this card is built from lists
+  // them itself. The card used to show a confirmed photo only once the audit
+  // had been fetched again — and when that fetch failed (a weak mobile
+  // connection) the local thumbnail was already gone and the photo, though
+  // safely saved, looked like it had vanished.
+  final Set<String> _confirmedUrls = {};
   // Picked photos still uploading (or whose last upload attempt failed) —
   // NOT a "staged, not yet saved" queue the way it used to be. A pick
   // fires _uploadPhotos immediately (see _pickPhotos); an entry only
@@ -286,6 +293,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // via didUpdateWidget's node.photoUrls resync, dropping it from here in
   // the same setState — see _uploadPhotos below).
   final List<File> _newPhotos = [];
+  // Picked photos whose last failure a retry cannot fix (see UploadPhotosResult.permanentPaths): shown with the
+  // reason, never re-sent on their own — not by the timer, not when the app goes to the background — only by the
+  // person tapping Retry.
+  final Set<String> _permanentPaths = {};
   final Set<String> _deletingPhotoUrls = {};
 
   // ── Save machinery ────────────────────────────────────────────────────
@@ -359,6 +370,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       // out any photo whose upload hadn't confirmed yet. Recover it here
       // the same way _restoreDraft recovers an unsaved remark.
       _restorePendingPhotos();
+      _recoverLostPick();
     }
     debugPrint('[photo-trace] $_logTag initState — existingPhotos=${_existingPhotos.length} readOnly=${widget.readOnly}');
   }
@@ -383,7 +395,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // either way.
     if (widget.node.photoUrls != oldWidget.node.photoUrls) {
       debugPrint('[photo-trace] $_logTag didUpdateWidget photoUrls ${oldWidget.node.photoUrls.length} -> ${widget.node.photoUrls.length}; newPhotos still pending=${_newPhotos.length}');
-      setState(() => _existingPhotos = List.of(widget.node.photoUrls));
+      // A confirmed photo the data has not caught up with yet stays on show:
+      // only one the data lists itself stops being tracked here.
+      _confirmedUrls.removeWhere(widget.node.photoUrls.contains);
+      setState(() => _existingPhotos = [...widget.node.photoUrls, ..._confirmedUrls]);
     }
   }
 
@@ -675,9 +690,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // false for it, but writing a draft in that case serves no purpose.
     if (_findingType == null && _dirty) await _writeDraft();
     _retryAttempt = 0;
-    if (_photoUploadError != null && _newPhotos.isNotEmpty && !_uploadingPhotos) {
+    final resendable = _newPhotos.where((f) => !_permanentPaths.contains(f.path)).toList();
+    if (_photoUploadError != null && resendable.isNotEmpty && !_uploadingPhotos) {
       _photoRetryAttempt = 0;
-      unawaited(_uploadPhotos(List.of(_newPhotos)));
+      unawaited(_uploadPhotos(resendable));
     }
     await _drain();
     await _tail;
@@ -790,6 +806,22 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     } catch (_) {
       // Best effort.
     }
+  }
+
+  // A photo Android took away from the app while the camera was open (the app
+  // was killed for memory) — handed back by image_picker only to whoever asks,
+  // and only THIS checkpoint if it is the one that was waiting (see
+  // recoverLostEvidencePhotos). Goes through the same path as a fresh pick.
+  Future<void> _recoverLostPick() async {
+    final key = widget.draftKey;
+    if (key == null) return;
+    final lost = await recoverLostEvidencePhotos(key);
+    debugPrint('[photo-trace] $_logTag _recoverLostPick found ${lost.length} file(s), mounted=$mounted');
+    if (lost.isEmpty || !mounted) return;
+    setState(() => _newPhotos.addAll(lost));
+    await _persistPendingPhotos();
+    _photoRetryAttempt = 0;
+    await _uploadPhotos(lost);
   }
 
   Future<void> _restorePendingPhotos() async {
@@ -977,7 +1009,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // remove never leaves the file orphaned in storage.
   Future<void> _removeExistingPhoto(String url) async {
     if (widget.onDeletePhoto == null) {
-      setState(() => _existingPhotos.remove(url));
+      setState(() {
+        _existingPhotos.remove(url);
+        _confirmedUrls.remove(url);
+      });
       return;
     }
     setState(() => _deletingPhotoUrls.add(url));
@@ -987,13 +1022,16 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     if (!mounted) return;
     setState(() {
       _deletingPhotoUrls.remove(url);
-      if (error == null) _existingPhotos.remove(url);
+      if (error == null) {
+        _existingPhotos.remove(url);
+        _confirmedUrls.remove(url);
+      }
     });
     if (error != null) showErrorSnackBar(context, error);
   }
 
   Future<void> _pickPhotos() async {
-    final picked = await pickEvidencePhotos(context);
+    final picked = await pickEvidencePhotos(context, recoveryKey: widget.draftKey);
     debugPrint('[photo-trace] $_logTag _pickPhotos returned ${picked.length} file(s), mounted=$mounted');
     if (picked.isEmpty || !mounted) return;
     setState(() => _newPhotos.addAll(picked));
@@ -1053,21 +1091,45 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
         _uploadPhase = null;
         _uploadFraction = null;
         _photoUploadError = result.error;
-        // On success the server already attached these to photoUrls and
-        // refetched the audit — didUpdateWidget's node.photoUrls resync
-        // picks them up as _existingPhotos, so drop them here rather than
-        // showing every photo twice. Left in _newPhotos on failure so
-        // Retry has exactly what to resend — but only the ones that
-        // actually failed; a partially-successful batch's confirmed photos
-        // drop out here too, not just the fully-successful case.
+        // On success the server already attached these to photoUrls — each
+        // confirmed photo is shown from the URL the server answered with
+        // RIGHT HERE (and tracked in _confirmedUrls), not only once the
+        // refetched audit reaches didUpdateWidget: that refetch can fail on
+        // a weak connection, and a thumbnail dropped here with nothing put
+        // in its place looked exactly like a vanished photo. When the data
+        // does arrive, didUpdateWidget's node.photoUrls resync lists the
+        // same URL, which drops it from _confirmedUrls — never shown twice.
+        // Left in _newPhotos on failure so Retry has exactly what to resend
+        // — but only the ones that actually failed; a partially-successful
+        // batch's confirmed photos drop out here too.
+        for (final f in succeeded) {
+          final url = result.uploadedUrls[f.path];
+          if (url != null && !_existingPhotos.contains(url)) {
+            _existingPhotos.add(url);
+            _confirmedUrls.add(url);
+          }
+        }
         succeeded.forEach(_newPhotos.remove);
+        for (final f in succeeded) {
+          _permanentPaths.remove(f.path);
+        }
+        for (final f in failed) {
+          if (result.permanentPaths.contains(f.path)) {
+            _permanentPaths.add(f.path);
+          } else {
+            _permanentPaths.remove(f.path);
+          }
+        }
       });
       _report();
-      if (failed.isNotEmpty && _photoRetryAttempt < 2) {
+      // Only a failure that could go differently next time is tried again by itself (a dropped connection, a server
+      // hiccup) — a refused file or a job the server gave up on would just fail the same way, again and again.
+      final retryable = failed.where((f) => !result.permanentPaths.contains(f.path)).toList();
+      if (retryable.isNotEmpty && _photoRetryAttempt < 2) {
         final delay = Duration(seconds: 4 << _photoRetryAttempt);
         _photoRetryAttempt++;
         _photoRetryTimer = Timer(delay, () {
-          if (!_disposed && failed.every(_newPhotos.contains) && !_uploadingPhotos) _uploadPhotos(failed);
+          if (!_disposed && retryable.every(_newPhotos.contains) && !_uploadingPhotos) _uploadPhotos(retryable);
         });
       } else if (failed.isEmpty) {
         _photoRetryAttempt = 0;
@@ -1454,7 +1516,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                   busy: _uploadingPaths.contains(e.value.path),
                   onRemove: () {
                     debugPrint('[photo-trace] $_logTag USER TAPPED X on ${e.value.path.split('/').last}');
-                    setState(() => _newPhotos.remove(e.value));
+                    setState(() {
+                      _newPhotos.remove(e.value);
+                      _permanentPaths.remove(e.value.path);
+                    });
                     _removePersistedPhotos([e.value]);
                   },
                 )),
@@ -1492,6 +1557,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
               TextButton.icon(
                 onPressed: () {
                   _photoRetryAttempt = 0;
+                  _permanentPaths.clear(); // the person asked
                   _uploadPhotos(List.of(_newPhotos));
                 },
                 icon: const Icon(Icons.refresh, size: 15),

@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
+import '../core/utils/evidence_photo.dart';
 import '../models/audit_detail_model.dart';
 import '../models/audit_model.dart';
 import '../models/employee_option.dart';
@@ -14,6 +15,7 @@ import '../models/location_option.dart';
 import '../models/upload_phase.dart';
 import '../core/utils/report_stats.dart';
 import 'audit_filter_scope.dart';
+import 'evidence_job_watch.dart';
 
 class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   final Dio _dio = DioClient.instance.dio;
@@ -553,9 +555,20 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // on a socket event): no loading flag, and one notify when the answer
   // lands instead of two.
   Future<void> fetchAuditDetail(String auditId, {bool quiet = false}) async {
+    await _loadAuditDetail(auditId, quiet: quiet);
+  }
+
+  /// [fetchAuditDetail]'s work, answering with the audit that was read — null
+  /// when it could not be (a failed request). A superseded fetch (a newer one
+  /// took over) still answers with what IT read, but leaves [activeAudit] to
+  /// the newer one. A quiet fetch that fails leaves [detailError] set but never
+  /// clears it on a later success, so a caller that wants to retry a failed
+  /// refresh (see [uploadCheckpointEvidence]) cannot tell from the field alone.
+  Future<AuditDetailModel?> _loadAuditDetail(String auditId, {required bool quiet}) async {
     final epoch = _epoch;
     final seq = ++_detailSeq;
     bool stale() => epoch != _epoch || seq != _detailSeq;
+    AuditDetailModel? read;
     if (!quiet) {
       isLoadingDetail = true;
       detailError = null;
@@ -563,10 +576,10 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
     try {
       final res = await _dio.get(ApiConstants.auditById(auditId));
-      if (stale()) return;
-      activeAudit = AuditDetailModel.fromJson(
+      read = AuditDetailModel.fromJson(
         Map<String, dynamic>.from(res.data['data']),
       );
+      if (!stale()) activeAudit = read;
     } on DioException catch (e) {
       if (!stale()) {
         detailError = extractErrorMessage(
@@ -580,6 +593,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         notifyListeners();
       }
     }
+    return read;
   }
 
   void clearActiveAudit() {
@@ -1338,9 +1352,22 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// remark later without losing the photo if they navigate away first.
   /// Returns which of `photos` (by path) didn't get confirmed and, if any
   /// didn't, a message about them — see UploadPhotosResult's own doc
-  /// comment for why this is per-file rather than all-or-nothing. Refreshes
-  /// activeAudit so the tree reflects whichever photos DID attach, even
-  /// when others in the same batch failed.
+  /// comment for why this is per-file rather than all-or-nothing — plus the
+  /// hosted URL of each one that did. Refreshes activeAudit so the tree
+  /// reflects whichever photos DID attach, even when others failed.
+  ///
+  /// ONE PHOTO PER REQUEST, not one request for the whole batch. On a real
+  /// phone over a real network a batch of several photos is a multi-megabyte
+  /// body: it can hit a proxy's size limit or the send timeout, and a single
+  /// refused file (the server turns a wrong type or an oversized photo away
+  /// with a 400) used to sink every other photo sent with it. Sent one by
+  /// one, each photo lives or dies alone, a retry resends only what failed,
+  /// and the progress is real per photo.
+  ///
+  /// Every photo must come back with a job: a request the server answered
+  /// "accepted" with no job in it is a FAILURE of that photo, never a
+  /// success — that was how a photo used to be "processed" and then
+  /// silently not exist.
   Future<UploadPhotosResult> uploadCheckpointEvidence({
     required String auditId,
     required String nodeId,
@@ -1349,86 +1376,146 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     void Function(UploadPhase phase, double? fraction)? onProgress,
   }) async {
     if (photos.isEmpty) return const UploadPhotosResult();
-    // fileName -> File, so a job's own result (identified by fileName, the
-    // one thing the server echoes back — see uploadParameterEvidence) maps
-    // back to exactly the local file it came from.
-    final byFileName = {for (final f in photos) f.path.split('/').last: f};
-    try {
-      // NOT FormData.fromMap({for (f in files) 'photos': ...}) — a Dart
-      // map literal silently collapses duplicate keys to the last one,
-      // so that would upload only the last photo no matter how many
-      // were picked. form.files is a List<MapEntry>, which correctly
-      // keeps every 'photos' entry as its own multipart part.
-      final form = FormData();
-      for (final file in photos) {
-        form.files.add(
-          MapEntry(
-            'photos',
-            await MultipartFile.fromFile(
-              file.path,
-              filename: file.path.split('/').last,
-            ),
-          ),
-        );
-      }
-      onProgress?.call(UploadPhase.uploading, 0);
-      // Server queues one background job per file and responds fast
-      // with jobIds instead of blocking on Cloudinary (see
-      // server/controllers/audit.controller.js#uploadParameterEvidence)
-      // — _waitForEvidenceJob below waits for each to actually finish
-      // uploading AND attaching to the checkpoint server-side.
-      final uploadRes = await _dio.post(
-        ApiConstants.uploadEvidence(auditId, nodeId),
-        data: form,
-        queryParameters: locationId != null ? {'locationId': locationId} : null,
-        onSendProgress: (sent, total) {
-          if (total > 0) onProgress?.call(UploadPhase.uploading, sent / total);
-        },
-      );
-      final jobs = (uploadRes.data['data']['jobs'] as List? ?? [])
-          .map((e) => Map<String, dynamic>.from(e as Map))
-          .toList();
-      onProgress?.call(UploadPhase.processing, null);
-      // Waited on PER JOB, not one Future.wait for the lot — a batch of
-      // several photos (picked together from the gallery) can genuinely
-      // partially succeed: a slower one timing out under server load must
-      // not drag the ones that already finished back into "failed", which
-      // used to mean the whole batch got resent on every retry, wasting
-      // bandwidth re-uploading photos that had already attached and never
-      // actually converging for a batch with one persistently slow file.
-      String? firstError;
-      final failedPaths = <String>{};
-      await Future.wait(jobs.map((j) async {
-        final fileName = j['fileName'] as String?;
-        final file = fileName != null ? byFileName[fileName] : null;
-        try {
-          await _waitForEvidenceJob(j['jobId'] as String);
-        } catch (e) {
-          if (file != null) failedPaths.add(file.path);
-          firstError ??= e is Exception && e is! DioException
-              ? e.toString().replaceFirst('Exception: ', '')
-              : null;
-        }
-      }));
-      // Refresh even on a partial failure — whichever photos DID attach
-      // must show up as confirmed right away, not wait for a fully clean
-      // batch that a single stubborn file may keep preventing.
-      try {
-        await fetchAuditDetail(auditId, quiet: true);
-      } catch (_) {}
-      if (failedPaths.isEmpty) return const UploadPhotosResult();
-      return UploadPhotosResult(
-        failedPaths: failedPaths,
-        error: (firstError?.isNotEmpty ?? false) ? firstError : 'Could not upload this photo.',
-      );
-    } catch (e) {
-      // The upload request itself failed (not a specific job) — every
-      // photo in this attempt is unconfirmed.
-      return UploadPhotosResult(
-        failedPaths: photos.map((f) => f.path).toSet(),
-        error: _saveErrorMessage(e, 'Could not upload this photo.'),
-      );
+    String? firstError;
+    final failedPaths = <String>{};
+    // Failures a retry cannot fix (see UploadPhotosResult.permanentPaths).
+    final permanentPaths = <String>{};
+    final uploadedUrls = <String, String>{};
+    void fail(File file, String message, {bool permanent = false}) {
+      failedPaths.add(file.path);
+      if (permanent) permanentPaths.add(file.path);
+      firstError ??= message;
     }
+    // One watcher for the whole pick: one status request for all its photos, not one each (see EvidenceJobWatch).
+    final watch = EvidenceJobWatch(_dio, timeout: evidenceWaitTimeout, pollSteps: evidencePollSteps);
+
+    // Each photo's wait starts the moment ITS job exists (so a quick one
+    // finishes while the next is still being sent) and never throws — a
+    // failure is recorded against its own file above.
+    final waits = <Future<void>>[];
+    onProgress?.call(UploadPhase.uploading, 0);
+    for (var i = 0; i < photos.length; i++) {
+      final file = photos[i];
+      try {
+        // NOT FormData.fromMap({'photos': ...}) for a batch — a Dart map
+        // literal silently collapses duplicate keys to the last one;
+        // form.files is a List<MapEntry>, which keeps every entry. Here it
+        // is one entry, but the form is built the same way everywhere.
+        final form = FormData()..files.add(MapEntry('photos', await evidencePhotoPart(file)));
+        final uploadRes = await _dio.post(
+          ApiConstants.uploadEvidence(auditId, nodeId),
+          data: form,
+          queryParameters: locationId != null ? {'locationId': locationId} : null,
+          onSendProgress: (sent, total) {
+            if (total > 0) onProgress?.call(UploadPhase.uploading, (i + sent / total) / photos.length);
+          },
+        );
+        // Server queues one background job per file and responds fast with
+        // its jobId instead of blocking on Cloudinary (see server/
+        // controllers/audit.controller.js#uploadParameterEvidence) —
+        // _waitForEvidenceJob waits for it to actually finish uploading AND
+        // attaching to the checkpoint server-side.
+        final jobs = uploadRes.data['data']['jobs'] as List? ?? const [];
+        final jobId = jobs.isEmpty ? null : (jobs.first as Map)['jobId']?.toString();
+        if (jobId == null) {
+          fail(file, 'The server did not accept this photo. Please try again.');
+          continue;
+        }
+        waits.add(() async {
+          try {
+            uploadedUrls[file.path] = await watch.watch(jobId);
+          } on EvidenceJobFailed catch (e) {
+            // The server already tried this photo several times itself.
+            fail(file, e.message, permanent: true);
+          } on EvidenceJobTimedOut catch (e) {
+            // Its job may still finish: sending it again would add it twice.
+            fail(file, e.toString(), permanent: true);
+          } catch (_) {
+            fail(file, 'Could not upload this photo.');
+          }
+        }());
+      } on UnsupportedPhotoException catch (e) {
+        fail(file, e.message, permanent: true);
+      } catch (e) {
+        // The upload request itself failed — this photo is unconfirmed, the
+        // rest carry on. The server saying NO (a 4xx: wrong type, too big…) will
+        // say no again; only a dropped connection or a server hiccup is worth retrying.
+        final status = e is DioException ? (e.response?.statusCode ?? 0) : 0;
+        fail(file, _saveErrorMessage(e, 'Could not upload this photo.'), permanent: status >= 400 && status < 500 && status != 408 && status != 429);
+      }
+    }
+    if (waits.isNotEmpty) onProgress?.call(UploadPhase.processing, null);
+    await Future.wait(waits);
+    watch.close();
+    // Refresh even on a partial failure — whichever photos DID attach must
+    // show up as confirmed right away, not wait for a fully clean batch
+    // that a single stubborn file may keep preventing. A mobile connection
+    // drops now and then, so a failed refresh is tried again; the card also
+    // shows each confirmed photo from [uploadedUrls] itself, so even a
+    // refresh that never lands cannot make a saved photo look gone.
+    final audit = uploadedUrls.isEmpty ? null : await _refreshAuditAfterUpload(auditId);
+    // CHECK that each photo the server called "done" really is on the checkpoint. A job can finish without the photo
+    // being attached (a worker that could not find the audit, a lost write) — the card used to show it anyway, and it
+    // was gone the next time the screen was opened. Only an audit that WAS read and does not hold the photo counts as
+    // missing; one that could not be read proves nothing either way, so the server's word stands.
+    final held = audit == null ? null : _photoUrlsOn(audit, nodeId);
+    if (held != null) {
+      for (final entry in uploadedUrls.entries.toList()) {
+        if (held.contains(entry.value)) continue;
+        uploadedUrls.remove(entry.key);
+        failedPaths.add(entry.key);
+        firstError ??= 'This photo was uploaded but could not be saved to the audit. Please try again.';
+      }
+    }
+    if (failedPaths.isEmpty) return UploadPhotosResult(uploadedUrls: uploadedUrls);
+    return UploadPhotosResult(
+      failedPaths: failedPaths,
+      permanentPaths: permanentPaths,
+      error: (firstError?.isNotEmpty ?? false) ? firstError : 'Could not upload this photo.',
+      uploadedUrls: uploadedUrls,
+    );
+  }
+
+  /// How long a photo's job may stay unanswered, and the pauses between status asks — fields so a test need not wait.
+  @visibleForTesting
+  static Duration evidenceWaitTimeout = const Duration(seconds: 150);
+  @visibleForTesting
+  static List<Duration> evidencePollSteps = EvidenceJobWatch.defaultPollSteps;
+
+  /// The pause before the first re-try of a failed refresh after an upload
+  /// (doubling each time) — a field so a test need not wait it out.
+  @visibleForTesting
+  static Duration refreshRetryDelay = const Duration(seconds: 1);
+
+  /// The audit as last read after an upload — null when every try failed.
+  Future<AuditDetailModel?> _refreshAuditAfterUpload(String auditId) async {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final read = await _loadAuditDetail(auditId, quiet: true);
+        if (read != null) return read;
+      } catch (_) {
+        // A non-network failure (a bad response shape) — same as unread.
+      }
+      await Future<void>.delayed(refreshRetryDelay * (1 << attempt));
+    }
+    return null;
+  }
+
+  /// The photo URLs stored on checkpoint [nodeId], wherever it sits (the shared list or any place's) — null when the
+  /// audit has no such checkpoint, which says nothing about its photos.
+  Set<String>? _photoUrlsOn(AuditDetailModel audit, String nodeId) {
+    Set<String>? find(List<ParameterNode> nodes) {
+      for (final n in nodes) {
+        if (n.id == nodeId) return n.photoUrls.toSet();
+        final inside = find(n.children);
+        if (inside != null) return inside;
+      }
+      return null;
+    }
+
+    return find(audit.parameters) ??
+        [for (final g in audit.locationParameters) find(g.parameters)].whereType<Set<String>>().firstOrNull ??
+        [for (final g in audit.departmentParameters) find(g.parameters)].whereType<Set<String>>().firstOrNull;
   }
 
   /// Turns whatever a checkpoint save/upload threw into a message an auditor
@@ -1445,6 +1532,12 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         return 'The server had a problem saving this. We\'ll keep trying.';
       }
       if (status == 401) return 'Your session expired. Please sign in again.';
+      // A proxy in front of the API turning a body away as too big answers with
+      // an HTML page, not the server's own JSON, so there is no message to pass on.
+      if (status == 413) return 'This photo is too large for the server. Please try a smaller one.';
+      if (e.type == DioExceptionType.sendTimeout) {
+        return 'The photo could not be sent on this connection. Please try again with a better signal.';
+      }
       return extractErrorMessage(e, fallback: fallback);
     }
     return fallback;
@@ -1530,91 +1623,6 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         fallback: 'Could not update this NC.',
       );
     }
-  }
-
-  /// Waits for one queued evidence-upload job (see uploadCheckpointEvidence
-  /// above) to finish. Socket event ("evidence_upload_result", pushed by
-  /// server/workers/evidenceUploadWorker.js) is the primary signal; the
-  /// periodic status poll is a belt-and-suspenders fallback for a missed
-  /// event (brief disconnect, app briefly backgrounded) — whichever
-  /// resolves the completer first wins, both paths are idempotent.
-  ///
-  /// The poller doesn't start immediately alongside the socket listener —
-  /// it waits _pollGrace first. Most uploads finish well under that window
-  /// (the socket event arrives in well under a second once the worker's
-  /// done), so in the common case this GET never fires at all instead of
-  /// racing the socket from second 0 on every single photo. When it does
-  /// kick in as a genuine fallback, it polls every 5s (was 3s) instead —
-  /// together this is what was behind "too many API calls while saving" on
-  /// a checkpoint with several photos, since each photo gets its own
-  /// _waitForEvidenceJob running concurrently (Future.wait in
-  /// uploadCheckpointEvidence above).
-  Future<String> _waitForEvidenceJob(
-    String jobId, {
-    Duration timeout = const Duration(seconds: 45),
-  }) {
-    const pollGrace = Duration(seconds: 5);
-    const pollInterval = Duration(seconds: 5);
-    final completer = Completer<String>();
-    Timer? pollStart;
-    Timer? poller;
-    Timer? timer;
-    late final void Function(dynamic data) handler;
-
-    void cleanup() {
-      SocketService.instance.off('evidence_upload_result', handler);
-      pollStart?.cancel();
-      poller?.cancel();
-      timer?.cancel();
-    }
-
-    Future<void> pollOnce() async {
-      if (completer.isCompleted) return;
-      try {
-        final res = await _dio.get(ApiConstants.evidenceUploadStatus(jobId));
-        final data = res.data['data'];
-        if (data['status'] == 'completed') {
-          completer.complete(data['url'] as String);
-          cleanup();
-        } else if (data['status'] == 'failed') {
-          completer.completeError(Exception(data['error'] ?? 'Upload failed'));
-          cleanup();
-        }
-      } catch (_) {
-        // transient — keep polling until timeout
-      }
-    }
-
-    handler = (data) {
-      if (completer.isCompleted || data is! Map || data['jobId'] != jobId)
-        return;
-      if (data['status'] == 'completed') {
-        completer.complete(data['url'] as String);
-      } else if (data['status'] == 'failed') {
-        completer.completeError(Exception(data['error'] ?? 'Upload failed'));
-      } else {
-        return;
-      }
-      cleanup();
-    };
-    SocketService.instance.on('evidence_upload_result', handler);
-
-    pollStart = Timer(pollGrace, () {
-      if (completer.isCompleted) return;
-      pollOnce();
-      poller = Timer.periodic(pollInterval, (_) => pollOnce());
-    });
-
-    timer = Timer(timeout, () {
-      if (!completer.isCompleted) {
-        completer.completeError(
-          Exception('Upload is taking longer than expected — please retry.'),
-        );
-        cleanup();
-      }
-    });
-
-    return completer.future;
   }
 
   /// Removes one already-uploaded evidence photo — actually deletes the

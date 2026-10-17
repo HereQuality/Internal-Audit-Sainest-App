@@ -63,9 +63,11 @@ class ApiConstants {
   static String uploadEvidence(String auditId, String nodeId) =>
       '/audits/$auditId/parameters/$nodeId/evidence';
   // Polling fallback for a queued evidence-upload job — see
-  // AuditsProvider#_waitForEvidenceJob.
+  // EvidenceJobWatch.
   static String evidenceUploadStatus(String jobId) =>
       '/audits/uploads/status/$jobId';
+  // The same for every job of one pick at once (?ids=1,2,3) — see EvidenceJobWatch.
+  static const evidenceUploadStatuses = '/audits/uploads/status';
   static String completeAudit(String id) => '/audits/$id/complete';
   // Every zone of a multi-document Schedule/Frequency batch, side by side —
   // unlike GET /audits/:id (auditById above), this is deliberately
