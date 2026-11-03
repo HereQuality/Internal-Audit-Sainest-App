@@ -158,6 +158,16 @@ const _findingMeta = <String, _Tone>{
     label: 'Raise NC',
     longLabel: 'NON-CONFORMANCE',
   ),
+  // Not Applicable: handled but outside the score — a neutral grey (slate), never a colour that reads as a verdict. Not in
+  // _findingSummaryOrder, so no tile or tally counts it.
+  'Not Applicable': _Tone(
+    fg: PdfColor.fromInt(0xFF64748B),
+    bg: PdfColor.fromInt(0xFFF1F5F9),
+    border: PdfColor.fromInt(0xFFCBD5E1),
+    dot: PdfColor.fromInt(0xFF94A3B8),
+    label: 'N/A',
+    longLabel: 'NOT APPLICABLE',
+  ),
 };
 
 const _findingSummaryOrder = ['Strong Compliance', 'Compliance', 'OFI', 'NC'];
@@ -769,8 +779,10 @@ Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
   var rawAchieved = 0.0;
   var rawMax = 0.0;
   var scoredCount = 0;
+  var notApplicableCount = 0;
   final counts = {for (final ft in _findingSummaryOrder) ft: 0};
   for (final section in spec.sections) {
+    notApplicableCount += collectNotApplicableLeaves(section.tree).length;
     final leaves = collectScoredLeaves(section.tree);
     final am = rawAchievedMax(leaves, spec.scoringSystem, section.maxScore);
     rawAchieved += am.achieved;
@@ -801,6 +813,15 @@ Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
           _statTiles(overallPct, scoreColor, counts, scoredCount)
         else
           _partialBanner(),
+        // Not Applicable checkpoints are listed below (grey) but are not calculated: the tiles, the score and the charts
+        // above leave them out, and this line says how many.
+        if (notApplicableCount > 0) ...[
+          pw.SizedBox(height: 6),
+          pw.Text(
+            notApplicableNote(notApplicableCount),
+            style: pw.TextStyle(fontSize: 7.5, fontStyle: pw.FontStyle.italic, color: _C.slate),
+          ),
+        ],
         pw.SizedBox(height: 14),
         if (hasRemark) ...[_finalRemark(spec), pw.SizedBox(height: 14)],
         if (paramChartData.isNotEmpty) ...[
@@ -1148,7 +1169,7 @@ const _chartBarColor = PdfColor.fromInt(0xFF2A78D6); // web's CHART_COLOR
 const _horizontalBarThreshold = 10;
 
 double? _leafRatio(ParameterNode leaf, double? auditMaxScore) {
-  if (leaf.findingType == null) return null;
+  if (leaf.findingType == null || leaf.isNotApplicable) return null;
   // The stored per-leaf score for EVERY finding type (Compliance is a typed
   // 0..max on the server, not always full marks) — see rawAchievedMax.
   final max = leafMax(leaf, auditMaxScore);
@@ -1611,8 +1632,13 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
       // this column used to print plain black text, the one place on the
       // page a finding's color went missing. Mirrors the identical fix in
       // the web export's own drawIndexTable.
+      //
+      // A Not Applicable checkpoint is listed (grey "N/A") but not calculated: no score, no weightage, no contribution
+      // to the totals — `leaves` above is already empty for it, so `am` is 0/0.
       final tone = node.findingType != null ? _findingMeta[node.findingType!] : null;
       final statusLabel = tone?.label ?? '—';
+      final notApplicable = node.isNotApplicable;
+      final scoreCell = !notApplicable && node.score != null ? '${node.score!.round()}' : '—';
       sectionRows.add(
         _tableRow(
           cols,
@@ -1621,13 +1647,14 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
                   serial,
                   name,
                   statusLabel,
-                  node.score != null ? '${node.score!.round()}' : '—',
-                  '${leafWeightage(node, section.maxScore).round()}',
+                  scoreCell,
+                  notApplicable ? '—' : '${leafWeightage(node, section.maxScore).round()}',
                   am.max > 0 ? '${am.achieved.round()}/${am.max.round()}' : '—',
                   '—',
                 ]
-              : [serial, name, statusLabel, node.score != null ? '${node.score!.round()}' : '—', '—'],
-          bg: _C.blueBg,
+              : [serial, name, statusLabel, scoreCell, '—'],
+          bg: notApplicable ? _C.neutralBand : _C.blueBg,
+          fg: notApplicable ? _C.slate : _C.ink,
           cellColors: tone != null ? {2: tone.fg} : null,
         ),
       );
@@ -1741,7 +1768,11 @@ List<pw.Widget> _findingNode(
     final scale = spec.scaleFor(section);
     final avg = leaves.isNotEmpty && am.max > 0 ? (am.achieved / am.max * scale).round() : null;
     final counts = [for (final ft in _findingSummaryOrder) leaves.where((l) => l.findingType == ft).length];
-    final hasCounts = depth == 0 && leaves.isNotEmpty;
+    // Not Applicable checkpoints are not calculated: they add to no tally and no average. A group of ONLY those has nothing
+    // to grade, so its score reads "—" (never 0) — see [allNotApplicable] below.
+    final notApplicableHere = collectNotApplicableLeaves([node]).length;
+    final allNotApplicable = leaves.isEmpty && notApplicableHere > 0;
+    final hasCounts = depth == 0 && (leaves.isNotEmpty || notApplicableHere > 0);
     final isTop = depth == 0;
 
     final nameRow = pw.Row(
@@ -1797,13 +1828,25 @@ List<pw.Widget> _findingNode(
                             ),
                             pw.SizedBox(width: 16),
                           ],
+                        if (notApplicableHere > 0) ...[
+                          pw.Container(
+                            width: 6,
+                            height: 6,
+                            decoration: pw.BoxDecoration(color: _C.slateLight, shape: pw.BoxShape.circle),
+                          ),
+                          pw.SizedBox(width: 4),
+                          pw.Text(
+                            '$notApplicableHere N/A',
+                            style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.white),
+                          ),
+                        ],
                       ],
                     ),
                   ],
                 ],
               ),
             ),
-            if (avg != null) ...[
+            if (avg != null || allNotApplicable) ...[
               pw.SizedBox(width: 8),
               if (isTop)
                 // AVG SCORE box — the banner's own right-hand block, a
@@ -1825,15 +1868,15 @@ List<pw.Widget> _findingNode(
                         crossAxisAlignment: pw.CrossAxisAlignment.end,
                         children: [
                           pw.Text(
-                            '$avg',
+                            avg != null ? '$avg' : '—',
                             style: pw.TextStyle(fontSize: 13, fontWeight: pw.FontWeight.bold, color: _C.white),
                           ),
-                          pw.Text('/${_num(scale)}', style: const pw.TextStyle(fontSize: 7, color: _C.blueBg)),
+                          if (avg != null) pw.Text('/${_num(scale)}', style: const pw.TextStyle(fontSize: 7, color: _C.blueBg)),
                         ],
                       ),
                       pw.SizedBox(height: 2),
                       pw.Text(
-                        'Total: ${am.achieved.round()}/${am.max.round()}',
+                        avg != null ? 'Total: ${am.achieved.round()}/${am.max.round()}' : 'Not calculated',
                         style: const pw.TextStyle(fontSize: 6, color: _C.blueBg),
                       ),
                     ],
@@ -1844,12 +1887,12 @@ List<pw.Widget> _findingNode(
                   crossAxisAlignment: pw.CrossAxisAlignment.end,
                   children: [
                     pw.Text(
-                      'Avg: $avg/${_num(scale)}',
+                      avg != null ? 'Avg: $avg/${_num(scale)}' : 'Avg: —',
                       style: pw.TextStyle(fontSize: 7.5, fontWeight: pw.FontWeight.bold, color: _C.blue),
                     ),
                     pw.SizedBox(height: 2),
                     pw.Text(
-                      'Total: ${am.achieved.round()}/${am.max.round()}',
+                      avg != null ? 'Total: ${am.achieved.round()}/${am.max.round()}' : 'Total: —',
                       style: pw.TextStyle(fontSize: 6.5, fontWeight: pw.FontWeight.bold, color: _C.teal),
                     ),
                   ],
@@ -1902,7 +1945,8 @@ double _estimateLeafHeight(ParameterNode node, double availW) {
   }
 
   var h = math.max(42.0, 20 + lines(stripBold(node.name), 9.5, availW * 0.55) * 13); // header band
-  if (node.findingType != null) {
+  // A Not Applicable checkpoint has no body — just the header band.
+  if (node.findingType != null && !node.isNotApplicable) {
     h += 18 + lines(node.remark ?? '—', 9, availW - 20) * 12 + 20; // remark label + box
     h += 18; // evidence label
     final photos = node.photoUrls.length;
@@ -1938,7 +1982,8 @@ List<pw.Widget> _leafCardWidgets(
   // An unscored checkpoint has no body at all, so the band IS the card and
   // needs all four corners rounded — otherwise its square bottom edge
   // paints straight over the card border's own rounded corners.
-  final hasBody = node.findingType != null;
+  // A Not Applicable one has no body either: no remark, no photos (the server holds none), just the grey band.
+  final hasBody = node.findingType != null && !node.isNotApplicable;
 
   final headerBand = pw.Container(
     decoration: pw.BoxDecoration(
@@ -1980,7 +2025,9 @@ List<pw.Widget> _leafCardWidgets(
             border: pw.Border.all(color: tone?.border ?? _C.border, width: 1.25),
             borderRadius: pw.BorderRadius.circular(6),
           ),
-          child: tone != null
+          child: node.isNotApplicable
+              ? pw.Text('N/A', style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: _C.slate))
+              : tone != null
               ? pw.Column(
                   mainAxisAlignment: pw.MainAxisAlignment.center,
                   children: [
@@ -1998,7 +2045,7 @@ List<pw.Widget> _leafCardWidgets(
   );
 
   final body = <pw.Widget>[
-    if (node.findingType != null) ...[
+    if (hasBody) ...[
       pw.Text(
         'AUDITOR REMARK',
         style: pw.TextStyle(fontSize: 7, fontWeight: pw.FontWeight.bold, color: _C.amber),

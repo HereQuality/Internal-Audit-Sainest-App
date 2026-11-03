@@ -88,6 +88,23 @@ dependencies:
   # try/catch and surfacing as a whole report failing to generate.
   image: ^4.3.0
 
+  # Final Report "Download Excel" (lib/utils/final_report_*.dart,
+  # xlsx_report_writer.dart, report_file_share.dart) — the phone twin of the web
+  # app's Excel downloads (client/src/utils/finalReportExcel.js).
+  #   excel         writes the .xlsx (pure Dart: cells, styles, merges, widths).
+  #   archive       was already pulled in by pdf/excel; declared directly because the
+  #                 writer opens the finished file to add what `excel` has no API for
+  #                 (frozen header, auto-filter, tab colour, print layout).
+  #   share_plus    opens the OS share sheet (Excel, Drive, WhatsApp, email...) —
+  #                 its own Android FileProvider (${applicationId}.flutter.share_provider,
+  #                 so also com.hqepl.audit360.debug) and iOS plugin need no manual setup.
+  #   path_provider the temporary folder the file is written to before sharing
+  #                 (was already a transitive dependency).
+  excel: ^4.0.6
+  archive: ^3.6.1
+  share_plus: ^12.0.2
+  path_provider: ^2.1.6
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

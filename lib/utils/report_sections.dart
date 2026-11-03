@@ -38,17 +38,39 @@ List<ReportSection> buildReportSections(AuditDetailModel audit) {
   return [ReportSection(label: audit.title, tree: audit.parameters)];
 }
 
+/// The checkpoints that were ASSESSED: a finding is recorded and it counts toward the score. A blank checkpoint is not
+/// one yet, and a Not Applicable one ([ParameterNode.isNotApplicable]) never is — it is HANDLED, but stands outside the
+/// score and every tally of findings: it adds nothing to the achieved total AND nothing to the maximum, so the percentage
+/// is what it would be if the checkpoint were not on the list (server: scoring.js#sumTree). The report still lists it
+/// (grey "N/A"); [collectNotApplicableLeaves] counts them.
 List<ParameterNode> collectScoredLeaves(List<ParameterNode> nodes) {
   final out = <ParameterNode>[];
   for (final n in nodes) {
     if (n.isLeaf) {
-      if (n.findingType != null) out.add(n);
+      if (n.findingType != null && !n.isNotApplicable) out.add(n);
     } else {
       out.addAll(collectScoredLeaves(n.children));
     }
   }
   return out;
 }
+
+/// The checkpoints marked Not Applicable, at any depth — what a report counts apart from the findings.
+List<ParameterNode> collectNotApplicableLeaves(List<ParameterNode> nodes) {
+  final out = <ParameterNode>[];
+  for (final n in nodes) {
+    if (n.isLeaf) {
+      if (n.isNotApplicable) out.add(n);
+    } else {
+      out.addAll(collectNotApplicableLeaves(n.children));
+    }
+  }
+  return out;
+}
+
+/// The calm line a report prints under its totals when some checkpoints are left out of the score.
+String notApplicableNote(int count) =>
+    '$count ${count == 1 ? 'checkpoint' : 'checkpoints'} not applicable — left out of the score';
 
 double leafMax(ParameterNode node, double? auditMaxScore) {
   if (auditMaxScore != null && auditMaxScore > 0) return auditMaxScore;
@@ -80,14 +102,15 @@ class AchievedMax {
 // over a combined leaf list rather than once per group.
 AchievedMax rawAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
   // Mirrors server/utils/scoring.js#sumTree exactly: only SCORED leaves
-  // (findingType != null) count, and every one of them contributes the
+  // (findingType != null, and not Not Applicable — that one adds nothing to
+  // achieved AND nothing to max) count, and every one of them contributes the
   // per-leaf `score` the server STORED at scoring time
-  // (audit.controller.js#scoreParameter: Strong Compliance = max,
-  // Compliance a typed 0..max, OFI a typed 0..max-1, NC = 0) — never a
-  // value re-derived here from the finding type.
+  // (audit.controller.js#scoreParameter: Strong Compliance and Compliance =
+  // max, OFI a picked 0..max-1, NC = 0) — never a value re-derived here from
+  // the finding type.
   double achieved = 0, max = 0;
   for (final l in leaves) {
-    if (l.findingType == null) continue;
+    if (l.findingType == null || l.isNotApplicable) continue;
     final m = leafMax(l, auditMaxScore);
     final rawAchieved = l.score ?? 0;
     if (scoringSystem == 'weightage') {

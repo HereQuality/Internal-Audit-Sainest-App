@@ -17,8 +17,10 @@ import '../../providers/audits_provider.dart';
 import '../../providers/filter_options_provider.dart';
 import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
+import '../../utils/final_report_excel.dart' show FinalReportTab;
 import '../../utils/report_pdf_builder.dart';
 import '../../utils/report_sections.dart';
+import '../../widgets/final_report_excel_bar.dart';
 import '../../widgets/nc_page_footer.dart';
 import '../../widgets/app_loading.dart';
 import '../../widgets/audit_agenda.dart' show AgendaEntry;
@@ -58,10 +60,8 @@ import '../reports/repeated_ncs_tab.dart';
 /// page as the user scrolls near the end), "N reports" is the server's total, and
 /// a place of the location-wise view loads its own rows when opened, 20 at a time
 /// ("Show more"). Each card is downloadable as a real
-/// PDF (utils/report_pdf_builder.dart — deliberately PDF-only on mobile,
-/// unlike the web per-report page's PDF+Excel dropdown (AuditFullReport.
-/// jsx#handleDownloadExcel) — a single format is enough on a phone, and
-/// PDF is what people actually reach for there) AND opens the same in-app
+/// PDF (utils/report_pdf_builder.dart — one report, one PDF: the web per-report
+/// page has no Excel any more either, it offers PDF and Word) AND opens the same in-app
 /// checkpoint-by-checkpoint detail
 /// (findings, remarks, photos, NC threads) as web's AuditFullReport.jsx —
 /// tapping a card pushes AuditDetailScreen, which already renders fully
@@ -69,6 +69,11 @@ import '../reports/repeated_ncs_tab.dart';
 /// `_isActiveForScoring`), so a Completed audit shows exactly as a
 /// "final report" without a second, parallel detail screen to keep in
 /// sync with the scoring workspace.
+///
+/// Above the lists a "Download Excel" bar (widgets/final_report_excel_bar.dart) exports
+/// the LIST of the tab showing — every report / NC / repeated checkpoint the shared
+/// filters match, all pages — as the web app's Final Report workbook (Summary, detail
+/// rows, By Location / By Auditor / By Auditee) through the phone's share sheet.
 ///
 /// A multi-zone Schedule/Frequency Audit (see AuditModel.scheduleBatchId)
 /// groups its zones into one expandable card — same "N locations"
@@ -194,6 +199,9 @@ class _ReportsScreenState extends State<ReportsScreen>
             Tab(text: 'Repeated NCs'),
           ],
         ),
+        // "Download Excel" for the tab showing: every row the shared filter bar matches
+        // (all pages, not the page on screen), as the same workbook the web app makes.
+        FinalReportExcelBar(tab: FinalReportTab.values[_tabs.index]),
         // Not a TabBarView: its horizontal swipe would swallow the drag that
         // moves the shell to the previous tab (Reports is the last one).
         Expanded(

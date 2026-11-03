@@ -59,6 +59,14 @@ android {
     }
 
     buildTypes {
+        // Debug builds install as com.hqepl.audit360.debug, side by side with the Play Store app. Without this a
+        // `flutter run` onto a device that already has the Play copy fails (INSTALL_FAILED_UPDATE_INCOMPATIBLE —
+        // Play signs with its own key) and cannot uninstall it on an MDM-managed device. Release builds keep the real id.
+        // This needs a client for ".debug" in android/app/google-services.json (a copy of the main client with the
+        // package_name changed) — the file is gitignored, so re-add it if the file is ever re-downloaded from Firebase.
+        debug {
+            applicationIdSuffix = ".debug"
+        }
         release {
             signingConfig = if (keystorePropertiesFile.exists()) {
                 signingConfigs.getByName("release")

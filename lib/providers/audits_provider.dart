@@ -896,6 +896,14 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     return params;
   }
 
+  /// Copies of the two queries the Reports tab is asking RIGHT NOW — the list's (shared
+  /// filters + chip + search + tile picks, no paging) and the tiles' (the same without the
+  /// tile picks). The Excel download (utils/final_report_download.dart) sends exactly these,
+  /// page after page, so the file holds what the filters match and the server alone decides
+  /// who may see what — the scope rules are not repeated anywhere else.
+  Map<String, dynamic> reportListQuery() => {..._reportListParams()};
+  Map<String, dynamic> reportStatsQuery() => {..._reportBaseParams()};
+
   // 'The query a loaded page answered' — every param but the page number.
   static String _queryKey(Map<String, dynamic> params) =>
       params.entries.map((e) => '${e.key}=${e.value}').join('&');
@@ -1547,13 +1555,13 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   /// fresh NC. Evidence photos are handled separately (see
   /// uploadCheckpointEvidence above), so this never touches photoUrls.
   ///
-  /// `score` must always be sent: the server (audit.controller.js#
-  /// scoreParameter) derives Strong Compliance/Compliance itself (full
-  /// marks, ignoring what's sent) but REQUIRES a numeric score for OFI and
-  /// for NC — an NC save with no score is rejected with "A numeric score is
-  /// required for an NC finding.", which is what made raising an NC from a
-  /// checkpoint fail. Returns the error message on failure, null on
-  /// success, then refreshes activeAudit so the tree reflects the save.
+  /// `score` follows the finding (server: audit.controller.js#
+  /// scoreParameter): Strong Compliance and Compliance send NONE — the
+  /// server stores the full max and ignores anything sent; NC sends 0; OFI
+  /// REQUIRES the whole number the auditor picked from 0..max-1 (a missing
+  /// one is answered "Pick a score from 0 to N"). Returns the error message
+  /// on failure, null on success, then refreshes activeAudit so the tree
+  /// reflects the save.
   Future<String?> scoreCheckpoint({
     required String auditId,
     required String nodeId,
@@ -1586,6 +1594,42 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     }
     // The PATCH already succeeded — a failed refresh must not read as a
     // failed save (the card would retry and resend a save that landed).
+    try {
+      await fetchAuditDetail(auditId, quiet: true);
+    } catch (_) {}
+    return null;
+  }
+
+  /// Marks a checkpoint Not Applicable (it stays out of the score; the server clears whatever was recorded on it — finding,
+  /// score, remark and photos — and withdraws an NC raised on it that nobody has answered yet, or refuses with a 409 and
+  /// its own message once the auditee has responded) or makes it applicable again, blank, so it has to be filled in
+  /// afresh (audit.controller.js#scoreParameter's notApplicable branch). Returns the error message on failure, null on
+  /// success, then refreshes activeAudit like a normal save. This is the person's own tap, never an autosave, so a
+  /// failure is said once and is not retried by itself.
+  Future<String?> setCheckpointNotApplicable({
+    required String auditId,
+    required String nodeId,
+    required bool notApplicable,
+    String? locationId,
+  }) async {
+    try {
+      await _dio.patch(
+        ApiConstants.scoreParameter(auditId, nodeId),
+        data: {
+          'notApplicable': notApplicable,
+          'locationId': ?locationId,
+        },
+      );
+    } catch (e) {
+      if (e is DioException && (e.response?.statusCode ?? 0) >= 500) {
+        return 'The server had a problem. Please try again.';
+      }
+      return _saveErrorMessage(
+        e,
+        notApplicable ? 'Could not mark this checkpoint not applicable.' : 'Could not make this checkpoint applicable again.',
+      );
+    }
+    // The PATCH already succeeded — a failed refresh must not read as a failed save.
     try {
       await fetchAuditDetail(auditId, quiet: true);
     } catch (_) {}

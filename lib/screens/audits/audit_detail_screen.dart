@@ -495,12 +495,13 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     return audit.parameters;
   }
 
-  // First unscored leaf, depth-first — same helper (and same reasoning) as
-  // the web app's AuditReportDetail.jsx#findFirstIncompleteLeaf.
+  // First checkpoint that still blocks Final Submit, depth-first: no finding yet, an OFI with no picked score, or no remark
+  // (Not Applicable ones need nothing) — same helper (and same reasoning) as the web app's
+  // AuditReportDetail.jsx#findFirstIncompleteLeaf.
   ParameterNode? _findFirstIncompleteLeaf(List<ParameterNode> nodes) {
     for (final node in nodes) {
       if (node.isLeaf) {
-        if (node.findingType == null) return node;
+        if (node.submitGap != null) return node;
         continue;
       }
       final found = _findFirstIncompleteLeaf(node.children);
@@ -528,7 +529,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     return null;
   }
 
-  // Final Submit, while something's still unscored, jumps straight to it
+  // Final Submit, while a checkpoint still lacks its score or remark, jumps straight to it
   // instead of just sitting disabled — switches location tab first if the
   // blocking checkpoint is on a different one, expands any collapsed
   // ancestor group it's nested under (see _GroupHeader below — a collapsed
@@ -554,7 +555,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     if (target == null) {
       showErrorSnackBar(
         context,
-        'Every checkpoint is scored — pull to refresh and try again.',
+        'Every checkpoint has its score and remark — pull to refresh and try again.',
       );
       return;
     }
@@ -587,7 +588,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
         curve: Curves.easeInOut,
         alignment: 0.3,
       );
-      showErrorSnackBar(context, 'Score this checkpoint before submitting.');
+      showErrorSnackBar(context, submitGapMessage(target!.submitGap));
     }
 
     if (switchingLocation || ancestorGroups.isNotEmpty) {
@@ -709,6 +710,27 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
       ),
     );
     return proceed ?? false;
+  }
+
+  // Final Submit was pressed while the audit as loaded is short of a score or a remark. That picture can be a moment behind
+  // — a remark just typed, or a photo just added, has not reached the server yet — so push every pending edit out first,
+  // look again at the audit as it stands then, and only if something is still missing jump to the first such checkpoint.
+  Future<void> _onFinalSubmitNotReady(AuditDetailModel audit) async {
+    setState(() => _isFinalSubmitting = true);
+    try {
+      await _flushAll();
+    } finally {
+      if (mounted) setState(() => _isFinalSubmitting = false);
+    }
+    if (!mounted) return;
+    final fresh = context.read<AuditsProvider>().activeAudit ?? audit;
+    if (fresh.readyForFinalSubmit) {
+      await _handleFinalSubmit(fresh);
+    } else if (fresh.everyCheckpointNotApplicable) {
+      showErrorSnackBar(context, allNotApplicableText);
+    } else {
+      _scrollToFirstIncomplete(fresh);
+    }
   }
 
   Future<void> _handleFinalSubmit(AuditDetailModel audit) async {
@@ -1102,9 +1124,13 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                 ],
               ),
             ),
-          if (audit.scoreResult.percentage != null)
+          // "Done" counts a Not Applicable checkpoint (handled) but the percentage leaves it out, so the line says how many of the
+          // checkpoints are N/A. With every checkpoint N/A there is no percentage — never a 0% — and the line still shows the count.
+          if (audit.scoreResult.percentage != null ||
+              audit.scoreResult.notApplicableCount > 0)
             Text(
-              'Score: ${audit.scoreResult.percentage!.round()}% (${audit.scoreResult.scoredCount}/${audit.scoreResult.leafCount})',
+              scoreSummaryLine(audit.scoreResult),
+              key: const ValueKey('score-summary'),
               style: Theme.of(
                 context,
               ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
@@ -1446,6 +1472,14 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                             url: url,
                             locationId: cardLocationId,
                           ),
+                      // "Not applicable" / "Make applicable again" — its own request, not an autosave (see checkpoint_card.dart).
+                      onSetNotApplicable: (notApplicable) =>
+                          _auditsProvider.setCheckpointNotApplicable(
+                            auditId: widget.auditId,
+                            nodeId: node.id,
+                            notApplicable: notApplicable,
+                            locationId: cardLocationId,
+                          ),
                       currentEmployeeId: myId,
                       onUpdateNc:
                           node.ncId == null
@@ -1543,7 +1577,11 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   Widget _buildActions(BuildContext context, AuditDetailModel audit) {
     // An open NC no longer blocks Final Submit — see the identical
     // comment in server/controllers/audit.controller.js#completeAudit.
-    final canFinalSubmit = audit.scoreResult.isFullyScored;
+    // An audit whose every checkpoint is Not Applicable has nothing to score: the server refuses to complete it (and says
+    // so), so the button does not pretend it is ready.
+    final allNotApplicable = audit.everyCheckpointNotApplicable;
+    // ...and it needs every checkpoint's score and remark (a Not Applicable one needs neither) — the server refuses otherwise.
+    final canFinalSubmit = audit.readyForFinalSubmit;
     final myId = context.read<AuthProvider>().user?.id;
     final isPrimary = _isPrimaryAuditor(audit, myId);
     if (!isPrimary ||
@@ -1572,7 +1610,9 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                 ? null
                 : canFinalSubmit
                 ? () => _handleFinalSubmit(audit)
-                : () => _scrollToFirstIncomplete(audit),
+                : allNotApplicable
+                ? () => showErrorSnackBar(context, allNotApplicableText)
+                : () => _onFinalSubmitNotReady(audit),
             style: FilledButton.styleFrom(
               backgroundColor: canFinalSubmit
                   ? AppColors.green
@@ -1593,6 +1633,26 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
       ],
     );
   }
+}
+
+/// What pressing Final Submit says when EVERY checkpoint is marked Not Applicable — word for word the server's refusal
+/// (audit.controller.js#completeAudit), so it reads the same wherever it is met.
+const String allNotApplicableText =
+    'Every checkpoint is marked Not Applicable, so there is nothing to score. Make at least one applicable and score it before submitting.';
+
+/// What pressing Final Submit says when it jumps to a checkpoint that is still short: what that checkpoint needs.
+String submitGapMessage(SubmitGap? gap) => switch (gap) {
+      SubmitGap.score => 'Pick a score for this OFI checkpoint before submitting.',
+      SubmitGap.remark => 'Add a remark to this checkpoint before submitting.',
+      _ => 'Score this checkpoint before submitting.',
+    };
+
+/// The "Score: 90% (6/6 · 4 N/A)" line: the percentage (— when nothing is graded, e.g. every checkpoint is N/A), then done / total
+/// checkpoints — a Not Applicable one counts as done — and how many of them are N/A (left out of the percentage).
+String scoreSummaryLine(AuditScoreResult r) {
+  final pct = r.percentage != null ? '${r.percentage!.round()}%' : '—';
+  final na = r.notApplicableCount > 0 ? ' · ${r.notApplicableCount} N/A' : '';
+  return 'Score: $pct (${r.scoredCount}/${r.leafCount}$na)';
 }
 
 class _GroupHeader extends StatelessWidget {

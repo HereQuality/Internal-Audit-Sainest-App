@@ -4,7 +4,6 @@ import 'dart:io';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/theme/app_colors.dart';
@@ -23,17 +22,18 @@ import 'nc_details_sheet.dart';
 
 /// One leaf checkpoint — mirrors the web app's ParameterScoreCard.jsx:
 ///  - interactive (assigned auditor, audit still active): 4 finding
-///    buttons (Strong / Compliance / OFI / NC), a score that follows the
-///    finding (see [scoreRuleFor]), an optional remark, and optional photo
-///    evidence.
+///    buttons (Strong / Compliance / OFI / NC) plus "Not applicable", a score
+///    that follows the finding (see [scoreRuleFor]) — nothing is typed: Strong
+///    and Compliance are the full max, NC is 0, and an OFI is picked from a row
+///    of buttons 0..max-1 — an optional remark, and optional photo evidence.
 ///  - read-only: just shows whatever was recorded.
 ///
 /// Nothing the auditor does is left to a Save button — every edit saves
 /// itself, and the card always knows whether it has anything the server
 /// hasn't confirmed yet:
-///  - a finding pick / finishing the NC-details popup saves right away;
-///    remark and score typing save a short pause after the last keystroke
-///    (_scheduleSave); a picked photo uploads immediately on its own.
+///  - a finding pick / an OFI score pick / finishing the NC-details popup
+///    saves right away; remark typing saves a short pause after the last
+///    keystroke (_scheduleSave); a picked photo uploads immediately on its own.
 ///  - every request for this checkpoint (score saves AND photo uploads) goes
 ///    through one queue (_exclusive), and each score save reads the fields
 ///    at the moment it actually runs — so two saves can never race and a
@@ -50,6 +50,13 @@ import 'nc_details_sheet.dart';
 ///    own too (findingType omitted — see _payload/_canSave), the same way a
 ///    photo already does independent of the finding; it is also kept as a
 ///    device draft (_writeDraft) purely as an offline fallback.
+///  - "Not applicable" is the one thing that is NOT an autosave: a deliberate
+///    tap, ALWAYS confirmed first (what would be cleared is named when
+///    something is recorded), that sends its own request through the same
+///    queue, clears what was typed / picked here and what the server holds,
+///    and from then on nothing is sent for the checkpoint — no remark, no
+///    score, no photo — until "Make applicable again" returns it blank (see
+///    _markNotApplicable).
 /// `onSave` returns an error message on failure (null on success) — same
 /// shape as AuditsProvider#scoreCheckpoint so this widget never needs to
 /// know about Dio/HTTP directly.
@@ -62,6 +69,10 @@ typedef SaveCheckpoint = Future<String?> Function({
   DateTime? targetDate,
   String? severity,
 });
+
+/// Marks the checkpoint Not Applicable (true) or applicable again (false) — see AuditsProvider#setCheckpointNotApplicable.
+/// Returns an error message on failure, null on success. Optional on the card: without it there is no such button.
+typedef SetCheckpointNotApplicable = Future<String?> Function(bool notApplicable);
 
 /// Uploads freshly-picked evidence photos right away — the server attaches
 /// them to this checkpoint's photoUrls the moment each upload finishes, no
@@ -103,10 +114,14 @@ typedef UpdateNc = Future<String?> Function({
 ///    it (a score, NC details) is still missing, so nothing can be sent.
 enum CheckpointSyncState { clean, saving, failed, incomplete }
 
-/// How a finding constrains its score. Strong is fixed at the full max, NC
-/// is fixed at 0, Compliance takes 0..max and OFI takes 0..max-1 (an OFI is
-/// by definition a partial score). Whole numbers only — same as the web's
-/// ParameterScoreCard.jsx, and the server's scoring never uses fractions.
+/// How a finding constrains its score. Nothing is typed any more, so every
+/// rule is either fixed or a short list of picks: Strong Compliance AND
+/// Compliance are fixed at the full max, NC is fixed at 0, and OFI — the one
+/// finding with a choice — takes a WHOLE number 0..max-1 (an OFI is by
+/// definition a partial score; full marks belong to Compliance). Same as the
+/// server's scoreParameter, which stores the full max for Strong/Compliance
+/// whatever is sent. Always derived from the audit's own max (new audits are
+/// 10, an older one may carry another), never a hard-coded 10.
 class ScoreRule {
   final bool fixed;
   final double min;
@@ -123,31 +138,36 @@ class ScoreRule {
 
 ScoreRule scoreRuleFor(String? findingType, double maxScore) {
   switch (findingType) {
-    case 'Strong Compliance':
-      return ScoreRule.fixed(maxScore);
-    case 'NC':
-      return const ScoreRule.fixed(0);
     case 'OFI':
       return ScoreRule.range(0, maxScore > 1 ? maxScore - 1 : 0);
-    default: // Compliance
-      return ScoreRule.range(0, maxScore);
+    case 'NC':
+      return const ScoreRule.fixed(0);
+    default: // Strong Compliance and Compliance: full marks
+      return ScoreRule.fixed(maxScore);
   }
+}
+
+/// The scores an auditor can pick for an OFI: every whole number from 0 to
+/// max-1 (0..9 when the max is 10, 0..2 for an older audit with a max of 3).
+/// A max of 1 or less leaves just 0 — there is no room below it.
+List<int> ofiScoreOptions(double maxScore) {
+  final top = maxScore > 1 ? (maxScore - 1).floor() : 0;
+  return [for (var v = 0; v <= top; v++) v];
+}
+
+// The OFI score a node already carries as a pick: its stored score when it is one of the buttons, else null.
+int? _ofiScoreOf(ParameterNode node, double maxScore) {
+  if (node.findingType != 'OFI' || node.score == null) return null;
+  final v = node.score!.round();
+  return ofiScoreOptions(maxScore).contains(v) ? v : null;
 }
 
 /// Whole number without a trailing ".0" (a Dart double prints "10.0").
 String formatScore(double v) => v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toString();
 
-/// Inline error for a typed score, or null when it is acceptable. An empty
-/// box is reported too — callers decide whether to show it yet.
-String? validateScoreText(String text, ScoreRule rule) {
-  if (rule.fixed) return null;
-  final t = text.trim();
-  if (t.isEmpty) return 'Enter a score';
-  final n = int.tryParse(t);
-  if (n == null) return 'Whole numbers only';
-  if (n < rule.min || n > rule.max) return 'Must be ${formatScore(rule.min)}–${formatScore(rule.max)}';
-  return null;
-}
+/// Up to this many picks an OFI score is a row of buttons; an older audit with a
+/// big max (a 100-point scale would be 100 buttons) falls back to a dropdown.
+const int ofiButtonsLimit = 20;
 
 const _findingLabels = {
   'Strong Compliance': 'Strong',
@@ -155,6 +175,9 @@ const _findingLabels = {
   'OFI': 'OFI',
   'NC': 'NC',
 };
+// Not Applicable is deliberately NOT among _findingLabels / _findingIcons: those drive the four finding chips, and it is not a
+// finding the auditor picks from them — it has its own button and panel (see _notApplicableButton / _buildNotApplicable).
+String _findingLabel(String ft) => ft == notApplicableFinding ? 'N/A' : (_findingLabels[ft] ?? ft);
 const _findingIcons = {
   'Strong Compliance': Icons.check_circle_outline,
   'Compliance': Icons.verified_outlined,
@@ -191,6 +214,8 @@ class CheckpointCard extends StatefulWidget {
   final SaveCheckpoint onSave;
   final UploadCheckpointPhotos onUploadPhotos;
   final DeleteEvidencePhoto? onDeletePhoto;
+  // "Not applicable" / "Make applicable again" (see the typedef). Null = the card offers neither.
+  final SetCheckpointNotApplicable? onSetNotApplicable;
   // Who an NC raised off this checkpoint can be against: the audited
   // location's people, already minus the acting auditor (see
   // audit_detail_screen.dart#_ncAuditeeOptions) — this card never offers, or
@@ -233,6 +258,7 @@ class CheckpointCard extends StatefulWidget {
     required this.onSave,
     required this.onUploadPhotos,
     this.onDeletePhoto,
+    this.onSetNotApplicable,
     this.employees = const [],
     this.onSyncStateChanged,
     this.shouldFlushOnDispose,
@@ -247,7 +273,7 @@ class CheckpointCard extends StatefulWidget {
 }
 
 class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObserver {
-  // How long a pause in typing (remark or score) before it autosaves — long
+  // How long a pause in typing (the remark) before it autosaves — long
   // enough that a save fires once per pause, not once per keystroke/word,
   // but still short enough that leaving right after typing (the "not saved
   // yet" back-guard in audit_detail_screen.dart#_onBlockedPop always
@@ -267,17 +293,15 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // a second blocking field on top of the auditee pick and due date.
   String _severity = 'Minor';
   final _remarkController = TextEditingController();
-  final _scoreController = TextEditingController();
-  // True once the score box has been typed in / focused — an untouched empty
-  // box shows a neutral hint instead of a red "Enter a score".
-  bool _scoreTouched = false;
+  // The OFI score the auditor picked (a whole number 0..max-1), null until
+  // they pick one. The only score that is a choice — see [scoreRuleFor].
+  int? _ofiScore;
   // Programmatic text changes (defaults, restoring a draft, the NC popup's
   // remark) must not count as the auditor editing.
   bool _suppressEdits = false;
-  // Last text seen in each field — a controller also notifies on a bare
-  // cursor move or selection change, which is not an edit.
+  // Last remark text seen — a controller also notifies on a bare cursor move
+  // or selection change, which is not an edit.
   String _seenRemark = '';
-  String _seenScore = '';
   List<String> _existingPhotos = [];
   // Hosted URLs the server confirmed for photos uploaded from THIS card (see
   // _uploadPhotos), kept until the audit data this card is built from lists
@@ -298,6 +322,19 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // person tapping Retry.
   final Set<String> _permanentPaths = {};
   final Set<String> _deletingPhotoUrls = {};
+
+  // ── Not Applicable ────────────────────────────────────────────────────
+  // The checkpoint is marked Not Applicable: left out of the score, nothing recorded on it. Set the moment the person
+  // confirms (and put back if the server refuses), so the card never shows the old finding while the request is on its way.
+  bool _notApplicable = false;
+  // A mark / make-applicable request is in flight (see _markNotApplicable).
+  bool _naBusy = false;
+  // The "Mark as not applicable?" question is open: a second tap on the button while it is (or is about to be) must not open a
+  // second one.
+  bool _naAsking = false;
+  // Photos whose upload was still waiting in the queue when the mark was made: skipped, not sent. If the server then
+  // refuses the mark they go up after all (see _markNotApplicable).
+  final Set<String> _skippedForNa = {};
 
   // ── Save machinery ────────────────────────────────────────────────────
   // Edits the server hasn't confirmed yet (finding / score / remark / NC
@@ -346,19 +383,17 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   @override
   void initState() {
     super.initState();
-    _findingType = widget.node.findingType;
+    _notApplicable = widget.node.isNotApplicable;
+    // Not Applicable is not one of the findings the card edits: it carries no finding, score or remark of its own.
+    _findingType = _notApplicable ? null : widget.node.findingType;
     _onSync = widget.onSyncStateChanged;
-    _remarkController.text = widget.node.remark ?? '';
-    // Whole numbers only (see ScoreRule) — formatScore, not toString(), so a
-    // genuinely-already-scored "3" doesn't show as "3.0". A checkpoint that's
-    // never been scored still starts blank — the server defaults score to
-    // null, not 0 (server/models/Audit.js#AuditNodeSchema).
-    _scoreController.text = widget.node.score != null ? formatScore(widget.node.score!) : '';
+    _remarkController.text = _notApplicable ? '' : widget.node.remark ?? '';
+    // Only an OFI carries a picked score; one stored outside 0..max-1 matches no
+    // button, so it reads as "not picked" and is asked for again if it is edited.
+    _ofiScore = _ofiScoreOf(widget.node, widget.maxScore);
     _existingPhotos = List.of(widget.node.photoUrls);
     _seenRemark = _remarkController.text;
-    _seenScore = _scoreController.text;
     _remarkController.addListener(_onFieldEdited);
-    _scoreController.addListener(_onFieldEdited);
     if (!widget.readOnly) {
       WidgetsBinding.instance.addObserver(this);
       if (widget.node.findingType == null) _restoreDraft();
@@ -369,8 +404,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       // app to free memory. _newPhotos is in-memory only, so that wipes
       // out any photo whose upload hadn't confirmed yet. Recover it here
       // the same way _restoreDraft recovers an unsaved remark.
-      _restorePendingPhotos();
-      _recoverLostPick();
+      // A Not Applicable checkpoint takes no photos: whatever this device still holds for it is forgotten, not resent.
+      if (_notApplicable) {
+        _forgetDrafts();
+      } else {
+        _restorePendingPhotos();
+        _recoverLostPick();
+      }
     }
     debugPrint('[photo-trace] $_logTag initState — existingPhotos=${_existingPhotos.length} readOnly=${widget.readOnly}');
   }
@@ -384,6 +424,22 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   void didUpdateWidget(covariant CheckpointCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     _onSync = widget.onSyncStateChanged;
+    // Marked (or made applicable again) from somewhere else — another phone, the web: follow the server. Not while this
+    // card's own request is in flight: that one sets the state itself when it lands.
+    if (!widget.readOnly &&
+        !_naBusy &&
+        widget.node.isNotApplicable != oldWidget.node.isNotApplicable &&
+        widget.node.isNotApplicable != _notApplicable) {
+      _debounce?.cancel();
+      _retryTimer?.cancel();
+      _photoRetryTimer?.cancel();
+      setState(() {
+        if (widget.node.isNotApplicable) _clearLocalWork();
+        _notApplicable = widget.node.isNotApplicable;
+      });
+      if (_notApplicable) _forgetDrafts();
+      _report();
+    }
     // Every save (scoreCheckpoint) refetches the whole audit tree and the
     // parent screen passes a fresh `node` down here under the SAME
     // ValueKey(node.id) — so Flutter reuses this State instead of running
@@ -415,7 +471,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _retryTimer?.cancel();
     _photoRetryTimer?.cancel();
     var report = CheckpointSyncState.clean;
-    if (_dirty && !widget.readOnly && (widget.shouldFlushOnDispose?.call() ?? true)) {
+    if (_dirty && !widget.readOnly && !_notApplicable && (widget.shouldFlushOnDispose?.call() ?? true)) {
       if (_canSave) {
         // Removed from the tree with an edit still on its way (a location-tab
         // switch, a collapsed group): send the latest values anyway, a few
@@ -431,7 +487,6 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // "busy" forever (a detached save reports again when it's done).
     if (report != _lastReported) _onSync?.call(report);
     _remarkController.dispose();
-    _scoreController.dispose();
     super.dispose();
   }
 
@@ -452,18 +507,16 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // before it can save.
   bool get _needsNcDetails => _findingType == 'NC' && widget.node.ncId == null;
 
-  String? get _scoreError => validateScoreText(_scoreController.text, _rule);
-
   // What's still needed before this checkpoint can save at all — mirrors
   // audit.controller.js#scoreParameter's own validation for a mobile
-  // caller (findingType always; a numeric in-range score for Compliance/OFI;
-  // an auditee pick + due date for a fresh NC) so the hint text here never
-  // promises a save the server would actually reject. Remark is
-  // deliberately NOT required here — the server only makes it mandatory
-  // for web callers.
+  // caller (findingType always; a picked score for an OFI — Strong,
+  // Compliance and NC need none; an auditee pick + due date for a fresh NC)
+  // so the hint text here never promises a save the server would actually
+  // reject. Remark is deliberately NOT required here — the server only makes
+  // it mandatory for web callers.
   String? get _missingFieldHint {
     if (_findingType == null) return null; // nothing picked yet — no nag before they've started
-    if (_scoreError != null) return _scoreError == 'Enter a score' ? 'Enter a score to save' : _scoreError;
+    if (_findingType == 'OFI' && _ofiScore == null) return 'Pick a score to save';
     if (_needsNcDetails && _auditeeEmployeeId == null) {
       return widget.employees.isEmpty ? "No one else is tagged to this audit's location." : 'Pick who this NC is against';
     }
@@ -473,17 +526,21 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   bool get _isComplete => _findingType != null && _missingFieldHint == null;
 
+  // A finding is picked (and it is not Not Applicable) but there is no remark yet: Final Submit will want one.
+  bool get _remarkRequiredHint => _findingType != null && !_notApplicable && _remarkController.text.trim().isEmpty;
+
   // Whether a save can actually go out right now: either a real finding is
   // complete, or nothing's picked yet but there's a remark to save on its
   // own (mirrors _uploadPhotos, which already saves independent of the
   // finding). Does NOT count as "complete" for Submit purposes — _isComplete
   // above still requires a real finding.
-  bool get _canSave => _isComplete || (_findingType == null && _remarkController.text.trim().isNotEmpty);
+  // Never while the checkpoint is Not Applicable: nothing is recorded on it, and the server refuses a remark for it.
+  bool get _canSave => !_notApplicable && (_isComplete || (_findingType == null && _remarkController.text.trim().isNotEmpty));
 
   CheckpointSyncState get _syncState {
     if (widget.readOnly) return CheckpointSyncState.clean;
     if (_error != null || _photoUploadError != null) return CheckpointSyncState.failed;
-    if (_saving || _uploadingPhotos) return CheckpointSyncState.saving;
+    if (_saving || _uploadingPhotos || _naBusy) return CheckpointSyncState.saving;
     if (_dirty) {
       if (_canSave) return CheckpointSyncState.saving;
       if (_findingType == null) return CheckpointSyncState.clean; // nothing typed yet to send
@@ -541,12 +598,15 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       // independent save already uses.
       return (findingType: null, score: null, remark: _remarkController.text.trim(), auditee: null, date: null, severity: null);
     }
-    final rule = _rule;
-    final typed = double.tryParse(_scoreController.text.trim());
-    // Strong / NC are fixed by the finding; Compliance / OFI carry what was
-    // typed (already validated by _isComplete). NC always sends a score —
-    // the server rejects an NC save without one.
-    final score = rule.fixed ? rule.fixedValue : (typed ?? rule.max);
+    // Strong Compliance and Compliance send NO score — the server stores the
+    // full max itself and ignores anything sent. NC sends 0 (the server
+    // rejects an NC save without a numeric score), OFI the pick (a save never
+    // goes out without one — see _missingFieldHint).
+    final double? score = switch (_findingType) {
+      'NC' => 0,
+      'OFI' => _ofiScore?.toDouble(),
+      _ => null,
+    };
     return (
       findingType: _findingType,
       score: score,
@@ -623,16 +683,13 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _dirty || _saving || identical(widget.node, nodeBefore)) return;
       final n = widget.node;
-      if (n.findingType == null) return;
-      final score = n.score != null ? formatScore(n.score!) : '';
-      if (n.findingType == _findingType && score == _scoreController.text) return;
-      _suppressEdits = true;
+      if (n.findingType == null || n.isNotApplicable) return;
+      final ofi = _ofiScoreOf(n, widget.maxScore);
+      if (n.findingType == _findingType && ofi == _ofiScore) return;
       setState(() {
         _findingType = n.findingType;
-        _scoreController.text = score;
-        _seenScore = score;
+        _ofiScore = ofi;
       });
-      _suppressEdits = false;
     });
   }
 
@@ -726,12 +783,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _report();
   }
 
-  // Every remark/score keystroke goes through here.
+  // Every remark keystroke goes through here.
   void _onFieldEdited() {
-    final changed = _remarkController.text != _seenRemark || _scoreController.text != _seenScore;
+    final changed = _remarkController.text != _seenRemark;
     _seenRemark = _remarkController.text;
-    _seenScore = _scoreController.text;
-    if (!changed || _suppressEdits || _disposed) return;
+    if (!changed || _suppressEdits || _disposed || _notApplicable) return;
     setState(() {
       _justSaved = false;
       _dirty = true;
@@ -863,6 +919,143 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     }
   }
 
+  // ── Not Applicable ────────────────────────────────────────────────────
+
+  String get _ncName => (widget.linkedNc?.ncId ?? '').isNotEmpty ? widget.linkedNc!.ncId : 'The NC';
+
+  // What marking would clear, in words ("finding, score, remark and 2 photos") — '' when nothing is recorded here.
+  String get _recordedWords {
+    final photos = _existingPhotos.length + _newPhotos.length;
+    final parts = [
+      if (_findingType != null) ...['finding', 'score'],
+      if (_remarkController.text.trim().isNotEmpty) 'remark',
+      if (photos > 0) '$photos ${photos == 1 ? 'photo' : 'photos'}',
+    ];
+    if (parts.length < 2) return parts.join();
+    return '${parts.sublist(0, parts.length - 1).join(', ')} and ${parts.last}';
+  }
+
+  // The tap on "Not applicable": ALWAYS asked first, never marked at once — it leaves the checkpoint out of the score. The
+  // question says what is cleared (and the photos deleted) when something is recorded, and that an NC raised on it is
+  // withdrawn (the server only does that while nobody has responded to it, and says so itself otherwise). One question at a
+  // time: a second tap meanwhile does nothing.
+  Future<void> _onNotApplicableTap() async {
+    if (_naAsking || _naBusy || _notApplicable || widget.onSetNotApplicable == null) return;
+    final recorded = _recordedWords;
+    final text = [
+      'It will be left out of the score.',
+      if (recorded.isNotEmpty) 'The $recorded recorded on it will be cleared.',
+      if (widget.node.ncId != null) '$_ncName raised on it will be withdrawn, unless the auditee has already responded to it.',
+    ].join(' ');
+    _naAsking = true;
+    final bool? confirmed;
+    try {
+      confirmed = await showDialog<bool>(context: context, builder: (_) => _NotApplicableDialog(text: text));
+    } finally {
+      _naAsking = false;
+    }
+    if (confirmed != true || !mounted) return;
+    await _markNotApplicable();
+  }
+
+  // Sends the mark through the request queue, behind anything already on its way. Everything waiting to be sent from here
+  // (typing, a retry, a queued photo) is held back — the server is about to clear the checkpoint, and refuses a remark or a
+  // photo for it. What is typed / picked is only given up once the server has said yes: a refusal (an NC that already has a
+  // response, a closed audit) puts the checkpoint back as it was, what was waiting goes out after all, and the server's own
+  // sentence is shown.
+  Future<void> _markNotApplicable() async {
+    final set = widget.onSetNotApplicable;
+    if (set == null || _naBusy) return;
+    _debounce?.cancel();
+    _retryTimer?.cancel();
+    _photoRetryTimer?.cancel();
+    setState(() {
+      _notApplicable = true;
+      _naBusy = true;
+      _justSaved = false;
+    });
+    _report();
+    final error = await _exclusive(() => set(true));
+    if (_disposed) return;
+    if (error != null) {
+      final resend = _newPhotos.where((f) => _skippedForNa.contains(f.path)).toList();
+      _skippedForNa.clear();
+      _update(() {
+        _notApplicable = false;
+        _naBusy = false;
+      });
+      _report();
+      if (_dirty) _scheduleSave(immediate: true);
+      if (resend.isNotEmpty) {
+        _photoRetryAttempt = 0;
+        unawaited(_uploadPhotos(resend));
+      }
+      if (mounted) showErrorSnackBar(context, error);
+      return;
+    }
+    _update(() {
+      _clearLocalWork();
+      _naBusy = false;
+    });
+    _forgetDrafts();
+    _report();
+  }
+
+  // "Make applicable again": the checkpoint comes back BLANK — the server cleared it when it was marked — and has to be
+  // filled in afresh. Nothing to confirm: nothing is lost.
+  Future<void> _makeApplicableAgain() async {
+    final set = widget.onSetNotApplicable;
+    if (set == null || _naBusy) return;
+    setState(() => _naBusy = true);
+    _report();
+    final error = await _exclusive(() => set(false));
+    if (_disposed) return;
+    if (error != null) {
+      _update(() => _naBusy = false);
+      _report();
+      if (mounted) showErrorSnackBar(context, error);
+      return;
+    }
+    _update(() {
+      _clearLocalWork();
+      _notApplicable = false;
+      _naBusy = false;
+    });
+    _report();
+  }
+
+  // Back to a blank checkpoint, in memory: finding, OFI pick, remark, NC details, photos (and the queue of picked ones).
+  void _clearLocalWork() {
+    _suppressEdits = true;
+    _remarkController.clear();
+    _suppressEdits = false;
+    _seenRemark = '';
+    _findingType = null;
+    _ofiScore = null;
+    _auditeeEmployeeId = null;
+    _targetDate = null;
+    _severity = 'Minor';
+    _existingPhotos = [];
+    _confirmedUrls.clear();
+    _newPhotos.clear();
+    _permanentPaths.clear();
+    _skippedForNa.clear();
+    _deletingPhotoUrls.clear();
+    _dirty = false;
+    _error = null;
+    _retryAttempt = 0;
+    _photoUploadError = null;
+    _photoRetryAttempt = 0;
+    _justSaved = false;
+    _editVersion++;
+  }
+
+  // The same, on this device: the remark draft and the picked-photo draft would otherwise come back on the next open.
+  void _forgetDrafts() {
+    unawaited(_persistDraft(widget.draftKey, ''));
+    unawaited(_persistPendingPhotos());
+  }
+
   // ── NC edit / details ─────────────────────────────────────────────────
 
   // Opens the NC-details sheet in EDIT mode (nc_details_sheet.dart),
@@ -931,25 +1124,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     }
   }
 
-  // Score box defaults for a freshly picked finding: Strong/NC are fixed
-  // (shown, not typed); Compliance and OFI both keep a valid typed value if
-  // there is one, else start BLANK — the auditor enters the actual score
-  // themselves rather than the box silently pre-filling full marks for them.
+  // What a freshly picked finding does to the OFI pick: only an OFI has one, and it starts blank — the auditor picks the
+  // actual score themselves rather than it being silently pre-filled — so any other finding drops a leftover pick.
   void _applyScoreDefaults(String ft) {
-    final rule = scoreRuleFor(ft, widget.maxScore);
-    final current = int.tryParse(_scoreController.text.trim());
-    String next;
-    if (rule.fixed) {
-      next = formatScore(rule.fixedValue);
-    } else if (current != null && current >= rule.min && current <= rule.max) {
-      next = _scoreController.text.trim();
-    } else {
-      next = '';
-    }
-    _suppressEdits = true;
-    _scoreController.text = next;
-    _suppressEdits = false;
-    _scoreTouched = false;
+    if (ft != 'OFI') _ofiScore = null;
   }
 
   void _selectFinding(String ft) {
@@ -970,6 +1148,22 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     } else {
       _scheduleSave(immediate: true);
     }
+  }
+
+  // The auditor taps one of the OFI score buttons (or the dropdown): saved at once, like a finding pick — a tap is a discrete
+  // action, nothing to wait out the way typing is. A quick second tap just queues behind the first (every save reads the
+  // pick at the moment it runs, see _payload/_drain).
+  void _pickOfiScore(int value) {
+    if (_notApplicable || _findingType != 'OFI' || _ofiScore == value) return;
+    setState(() {
+      _ofiScore = value;
+      _justSaved = false;
+      _dirty = true;
+      _error = null;
+      _editVersion++;
+    });
+    _report();
+    _scheduleSave(immediate: true);
   }
 
   // Opens the NC-details popup (auditee pick, restricted to the current
@@ -1065,6 +1259,14 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _report();
     final upload = widget.onUploadPhotos;
     return _exclusive(() async {
+      // Marked Not Applicable since this was queued: the checkpoint takes no photos now. Kept aside — if the server
+      // refuses the mark they are sent after all (see _markNotApplicable); once it accepts, they are dropped with the rest.
+      if (_notApplicable) {
+        _skippedForNa.addAll(photos.map((f) => f.path));
+        _update(() => _uploadingPaths.removeAll(photos.map((f) => f.path)));
+        _report();
+        return;
+      }
       debugPrint('[photo-trace] $_logTag _uploadPhotos ACTUALLY SENDING ${photos.length} file(s) now (queue reached them)');
       final result = await upload(
         photos: photos,
@@ -1090,7 +1292,8 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
         _uploadingPaths.removeAll(photos.map((f) => f.path));
         _uploadPhase = null;
         _uploadFraction = null;
-        _photoUploadError = result.error;
+        // Marked Not Applicable while this was on its way: the server's answer is no news to show.
+        _photoUploadError = _notApplicable ? null : result.error;
         // On success the server already attached these to photoUrls — each
         // confirmed photo is shown from the URL the server answered with
         // RIGHT HERE (and tracked in _confirmedUrls), not only once the
@@ -1125,6 +1328,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       // Only a failure that could go differently next time is tried again by itself (a dropped connection, a server
       // hiccup) — a refused file or a job the server gave up on would just fail the same way, again and again.
       final retryable = failed.where((f) => !result.permanentPaths.contains(f.path)).toList();
+      if (_notApplicable) return;
       if (retryable.isNotEmpty && _photoRetryAttempt < 2) {
         final delay = Duration(seconds: 4 << _photoRetryAttempt);
         _photoRetryAttempt++;
@@ -1143,7 +1347,10 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // Read-only cards are tinted by their finding — same green/blue/amber/
     // red-at-a-glance treatment as the web app's ParameterScoreCard.jsx,
     // instead of every finding looking identical until you read the pill.
-    final tone = widget.readOnly && widget.node.findingType != null ? _findingColor(widget.node.findingType!) : null;
+    final tone = widget.readOnly && widget.node.findingType != null
+        ? _findingColor(widget.node.findingType!)
+        // An interactive Not Applicable card is muted the same way, so it reads as set aside at a glance down a checklist.
+        : (_notApplicable ? AppColors.slate : null);
     return Card(
       margin: EdgeInsets.zero,
       color: tone?.withValues(alpha: 0.08),
@@ -1169,7 +1376,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(color: _findingColor(widget.node.findingType!).withValues(alpha: 0.12), borderRadius: BorderRadius.circular(999)),
-                    child: Text(_findingLabels[widget.node.findingType] ?? widget.node.findingType!,
+                    child: Text(_findingLabel(widget.node.findingType!),
                         style: TextStyle(color: AppColors.readable(context, _findingColor(widget.node.findingType!)), fontSize: 11, fontWeight: FontWeight.w700)),
                   ),
               ],
@@ -1189,6 +1396,23 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     // so it says so instead of looking blank.
     if (widget.node.findingType == null) {
       return Text('Not yet scored', style: TextStyle(color: scheme.outline, fontSize: 12.5, fontStyle: FontStyle.italic));
+    }
+    // Not Applicable: nothing was recorded on it — it says so, calmly, and keeps showing the NC it may still carry.
+    if (widget.node.isNotApplicable) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.do_not_disturb_on_outlined, size: 16, color: AppColors.readable(context, AppColors.slate)),
+            const SizedBox(width: 6),
+            Expanded(child: Text('Not applicable — left out of the score.', style: TextStyle(color: scheme.outline, fontSize: 12.5))),
+          ]),
+          if (widget.linkedNc != null) ...[
+            const SizedBox(height: 8),
+            _linkedNcBlock(scheme, widget.linkedNc!),
+          ],
+        ],
+      );
     }
     final tone = _findingColor(widget.node.findingType!);
     // Only OFI's score is actually auditor-entered — Strong Compliance/
@@ -1427,13 +1651,18 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   }
 
   Widget _buildEditable(ColorScheme scheme) {
+    if (_notApplicable) return _buildNotApplicable(scheme);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Wrap(
           spacing: 8,
           runSpacing: 8,
-          children: _findingLabels.keys.map((ft) {
+          crossAxisAlignment: WrapCrossAlignment.center,
+          // The four findings, then "Not applicable" in the same flow: on a phone the chips already take two lines and it
+          // fits on the second beside NC, so a checklist grows by nothing — and it is styled apart (no outline, a soft grey
+          // fill), so it never reads as a fifth finding.
+          children: [..._findingLabels.keys.map((ft) {
             final active = _findingType == ft;
             final color = _findingColor(ft);
             // Text/icon in the theme-readable shade (the raw token is ~3:1 on the
@@ -1451,7 +1680,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
               labelStyle: TextStyle(color: active ? textColor : scheme.onSurface, fontWeight: FontWeight.w600),
               side: BorderSide(color: active ? color : scheme.outlineVariant),
             );
-          }).toList(),
+          }), if (widget.onSetNotApplicable != null) _notApplicableButton()],
         ),
         if (_findingType != null) ...[
           const SizedBox(height: 10),
@@ -1477,7 +1706,14 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
           keyboardType: TextInputType.multiline,
           textInputAction: TextInputAction.newline,
           textCapitalization: TextCapitalization.sentences,
-          decoration: const InputDecoration(labelText: 'Add remark or observations...', prefixIcon: Icon(Icons.chat_bubble_outline)),
+          decoration: InputDecoration(
+            labelText: 'Add remark or observations...',
+            prefixIcon: const Icon(Icons.chat_bubble_outline),
+            // The remark is not needed to SAVE a checkpoint, but the audit's Final Submit asks for one on every checkpoint that
+            // applies — say so once a finding is picked and the box is still empty (a quiet line, gone as soon as they type).
+            helperText: _remarkRequiredHint ? 'Required to submit the audit' : null,
+            helperStyle: TextStyle(color: scheme.error),
+          ),
         ),
         const SizedBox(height: 10),
         Wrap(
@@ -1648,7 +1884,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     } else if (_justSaved && !_dirty) {
       content = line(const Icon(Icons.check_circle, size: 14, color: AppColors.green), 'Saved',
           color: AppColors.readable(context, AppColors.green), weight: FontWeight.w600);
-    } else if (_missingFieldHint != null && _scoreError == null) {
+    } else if (_missingFieldHint != null) {
       content = Text(_missingFieldHint!, textAlign: TextAlign.end, style: small);
     } else {
       return const SizedBox.shrink();
@@ -1656,64 +1892,199 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     return Align(alignment: Alignment.centerRight, child: content);
   }
 
-  // The score follows the finding: Strong is fixed at the full max, NC is
-  // fixed at 0 (it's the state that raises the NC), Compliance takes
-  // 0..max and OFI 0..max-1 (see scoreRuleFor). A fixed score is shown, not
-  // typed, so there's nothing to get wrong; a typed one is validated inline
-  // and is simply not sent until it's in range.
+  // The score follows the finding and is never typed: Strong and Compliance are fixed at the full max, NC at 0 (it's the
+  // state that raises the NC) — shown, so there is nothing to get wrong — and an OFI is picked from 0..max-1 (see
+  // scoreRuleFor / ofiScoreOptions).
   Widget _scoreSection(ColorScheme scheme) {
     final rule = _rule;
     final max = formatScore(widget.maxScore);
-    if (rule.fixed) {
-      final tone = _findingColor(_findingType!);
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: tone.withValues(alpha: 0.08),
+    if (!rule.fixed) return _ofiPicker(scheme, max);
+    final tone = _findingColor(_findingType!);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: tone.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: tone.withValues(alpha: 0.3)),
+      ),
+      child: Wrap(
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 8,
+        runSpacing: 2,
+        children: [
+          Icon(Icons.lock_outline, size: 15, color: AppColors.readable(context, tone)),
+          Text('Score', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+          Text('${formatScore(rule.fixedValue)} / $max',
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.readable(context, tone))),
+          Text(_findingType == 'NC' ? 'fixed for an NC' : 'full marks', style: TextStyle(color: scheme.outline, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  // The OFI score: one tappable button per whole number 0..max-1, wrapping onto rows, the picked one filled. Required — nothing
+  // saves until one is picked (see _missingFieldHint). Past [ofiButtonsLimit] picks (an older audit on a big scale) a row of
+  // buttons would swamp the card, so it is a dropdown there instead.
+  Widget _ofiPicker(ColorScheme scheme, String max) {
+    final options = ofiScoreOptions(widget.maxScore);
+    final tone = _findingColor('OFI');
+    final readable = AppColors.readable(context, tone);
+    final picked = _ofiScore;
+    return Container(
+      key: const ValueKey('ofi-picker'),
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      decoration: BoxDecoration(
+        color: tone.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: tone.withValues(alpha: 0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 8,
+            runSpacing: 2,
+            children: [
+              Icon(Icons.touch_app_outlined, size: 15, color: readable),
+              Text('Score', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+              if (picked != null)
+                Text('$picked / $max', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: readable))
+              else
+                Text('Pick 0–${options.last} (out of $max)', style: TextStyle(color: scheme.outline, fontSize: 12)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (options.length <= ofiButtonsLimit)
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [for (final v in options) _ofiButton(scheme, v, selected: v == picked, tone: tone)],
+            )
+          else
+            DropdownButtonFormField<int>(
+              key: const ValueKey('ofi-dropdown'),
+              initialValue: picked,
+              isExpanded: true,
+              decoration: InputDecoration(labelText: 'Score', helperText: 'Pick 0–${options.last} (out of $max)'),
+              items: [for (final v in options) DropdownMenuItem(value: v, child: Text('$v'))],
+              onChanged: (v) {
+                if (v != null) _pickOfiScore(v);
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  // One score button: 48dp square (the comfortable touch size), a plain outlined chip when not picked, the OFI amber fill when it is.
+  Widget _ofiButton(ColorScheme scheme, int value, {required bool selected, required Color tone}) {
+    final readable = AppColors.readable(context, tone);
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: 'Score $value',
+      excludeSemantics: true,
+      onTap: () => _pickOfiScore(value),
+      child: Material(
+        key: ValueKey('ofi-$value'),
+        color: selected ? tone.withValues(alpha: 0.22) : scheme.surface,
+        shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: tone.withValues(alpha: 0.3)),
+          side: BorderSide(color: selected ? tone : scheme.outlineVariant, width: selected ? 2 : 1),
         ),
-        child: Wrap(
-          crossAxisAlignment: WrapCrossAlignment.center,
-          spacing: 8,
-          runSpacing: 2,
-          children: [
-            Icon(Icons.lock_outline, size: 15, color: AppColors.readable(context, tone)),
-            Text('Score', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
-            Text('${formatScore(rule.fixedValue)} / $max',
-                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: AppColors.readable(context, tone))),
-            Text(_findingType == 'NC' ? 'fixed for an NC' : 'full marks', style: TextStyle(color: scheme.outline, fontSize: 12)),
-          ],
-        ),
-      );
-    }
-    final error = _scoreTouched || _scoreController.text.isNotEmpty ? _scoreError : null;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: SizedBox(
-        width: 190,
-        child: Focus(
-          onFocusChange: (focused) {
-            if (!focused && !_scoreTouched) setState(() => _scoreTouched = true);
-          },
-          child: TextField(
-            controller: _scoreController,
-            keyboardType: TextInputType.number,
-            // Whole numbers only — no decimal point, no exponent/sign
-            // characters a bare TextInputType.number keyboard can still let
-            // through on some IMEs. Range is checked live (errorText) rather
-            // than silently rewriting what was typed.
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(4)],
-            decoration: InputDecoration(
-              labelText: 'Score',
-              suffixText: '/ $max',
-              helperText: 'Allowed ${formatScore(rule.min)}–${formatScore(rule.max)}',
-              errorText: error,
-              prefixIcon: const Icon(Icons.pin_outlined, size: 20),
+        child: InkWell(
+          onTap: () => _pickOfiScore(value),
+          customBorder: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          child: SizedBox(
+            width: 48,
+            height: 48,
+            child: Center(
+              child: Text(
+                '$value',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: selected ? readable : scheme.onSurface),
+              ),
             ),
           ),
         ),
       ),
+    );
+  }
+
+  // "Not applicable" — set apart from the four finding chips: a soft grey pill with its own icon, never a colour that reads as a
+  // verdict, the same height as a chip with the usual 48dp touch target so a thumb finds it. Goes through _onNotApplicableTap
+  // (confirmed first, always).
+  Widget _notApplicableButton() {
+    return TextButton.icon(
+      key: const ValueKey('na-button'),
+      onPressed: _naBusy ? null : _onNotApplicableTap,
+      icon: const Icon(Icons.do_not_disturb_on_outlined, size: 17),
+      label: const Text('Not applicable'),
+      style: TextButton.styleFrom(
+        foregroundColor: AppColors.readable(context, AppColors.slate),
+        backgroundColor: AppColors.slate.withValues(alpha: 0.10),
+        minimumSize: const Size(0, 36),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        tapTargetSize: MaterialTapTargetSize.padded,
+        shape: const StadiumBorder(),
+        textStyle: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+    );
+  }
+
+  // The checkpoint while it is Not Applicable: a calm panel in place of the chips, score, remark and photos (none of which
+  // apply), and the way back.
+  Widget _buildNotApplicable(ColorScheme scheme) {
+    const tone = AppColors.slate;
+    final readable = AppColors.readable(context, tone);
+    return Column(
+      key: const ValueKey('na-panel'),
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: tone.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: tone.withValues(alpha: 0.3)),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(Icons.do_not_disturb_on_outlined, size: 20, color: readable),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Not applicable', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14, color: readable)),
+                    const SizedBox(height: 2),
+                    Text('Left out of the score. Nothing needs to be filled in here.', style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 12,
+          runSpacing: 4,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            OutlinedButton.icon(
+              key: const ValueKey('na-undo'),
+              onPressed: _naBusy ? null : _makeApplicableAgain,
+              icon: _naBusy
+                  ? SizedBox(height: 14, width: 14, child: CircularProgressIndicator(strokeWidth: 2, color: scheme.outline))
+                  : const Icon(Icons.undo, size: 18),
+              label: Text(_naBusy ? 'Saving…' : 'Make applicable again'),
+              style: OutlinedButton.styleFrom(minimumSize: const Size(0, 44)),
+            ),
+            Text("You'll fill in the finding again.", style: TextStyle(color: scheme.outline, fontSize: 12.5)),
+          ],
+        ),
+      ],
     );
   }
 
@@ -1873,6 +2244,34 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
           ),
         ),
       ),
+    );
+  }
+}
+
+/// The question asked before a checkpoint is marked Not Applicable — what is lost, in words. Pops true to go ahead, false (or
+/// nothing) to leave it as it is.
+class _NotApplicableDialog extends StatelessWidget {
+  final String text;
+
+  const _NotApplicableDialog({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Mark as not applicable?'),
+      content: Text(text, key: const ValueKey('na-confirm-text')),
+      actions: [
+        TextButton(
+          key: const ValueKey('na-cancel'),
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const ValueKey('na-confirm'),
+          onPressed: () => Navigator.pop(context, true),
+          child: const Text('Mark not applicable'),
+        ),
+      ],
     );
   }
 }

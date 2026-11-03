@@ -504,6 +504,18 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   /// Audit Type, Date, Flag) plus the search box.
   Map<String, dynamic> get _ncReportParams => _withSearch(ncFilterParams, ncReportSearch) ?? {};
 
+  /// Copies of the two queries the Reports tab's NCs list is asking RIGHT NOW, for the Excel
+  /// download (utils/final_report_download.dart): the list's (the shared filters + search, and
+  /// a lit tile asked for by NAME — `bucket=` — which the server pages itself, instead of by
+  /// the ids it counted), and the tiles' (the same without the tile, `omitIds` since only the
+  /// counts are wanted). The same scope rules as the screen, because the same params.
+  Map<String, dynamic> ncReportListQuery() => {
+    ..._ncReportParams,
+    if (ncReportTileKeys.isNotEmpty)
+      'bucket': [for (final b in NcBucket.all) if (ncReportTileKeys.contains(b)) b].join(','),
+  };
+  Map<String, dynamic> ncReportStatsQuery() => {..._ncReportParams, 'omitIds': '1'};
+
   // The ids a tile pick of the Final Report reads, and the tiles themselves:
   // /ncs/report/stats under the filters and the search text.
   Future<NcTileStats?> _reportStatsFor({required bool fresh, required String search}) {

@@ -1,6 +1,15 @@
 import 'audit_model.dart' show AuditNcSummary;
 import 'nc_model.dart';
 
+/// The auditor's answer that a checkpoint does not apply to this audit: stored as the checkpoint's finding itself
+/// (server/utils/scoring.js#NOT_APPLICABLE). It counts as handled — the audit can be completed without it — but adds
+/// nothing to the score or to the maximum, and nothing is recorded on it (no score, remark or photos).
+const String notApplicableFinding = 'Not Applicable';
+
+/// What the audit's Final Submit still needs from one checkpoint (see [ParameterNode.submitGap]): a finding ([unscored]), the picked
+/// score of an OFI ([score]), or the remark ([remark]). Mirrors server/utils/scoring.js#submitGaps, which the server enforces.
+enum SubmitGap { unscored, score, remark }
+
 /// Full-detail audit — the scoring workspace's own model, separate from
 /// the lightweight AuditModel used by the My Audits list. Mirrors
 /// server/models/Audit.js#AuditNodeSchema and the audit document shape
@@ -16,7 +25,7 @@ class ParameterNode {
   // score). Falls back to `weight` (then 1) when unset — see leafWeightage
   // in AuditReportShared.jsx, mirrored by ReportPdfBuilder.leafWeightage.
   final double? weightage;
-  final String? findingType; // "Strong Compliance" | "Compliance" | "OFI" | "NC" | null
+  final String? findingType; // "Strong Compliance" | "Compliance" | "OFI" | "NC" | "Not Applicable" | null
   final double? score;
   final String? remark;
   final List<String> photoUrls;
@@ -37,6 +46,22 @@ class ParameterNode {
   });
 
   bool get isLeaf => children.isEmpty;
+
+  /// Marked Not Applicable: handled, but outside the score (see [notApplicableFinding]).
+  bool get isNotApplicable => findingType == notApplicableFinding;
+
+  /// What this checkpoint still lacks before the audit can be Final-Submitted, or null when nothing: every checkpoint that
+  /// applies needs a finding, a REMARK, and — for an OFI — the score the auditor picked. A Not Applicable one needs neither a
+  /// score nor a remark; a group (not a checkpoint) needs nothing. Saving a checkpoint never needed the remark (the autosave
+  /// stores what is there) — it is asked for here, at the end.
+  SubmitGap? get submitGap {
+    if (!isLeaf) return null;
+    if (findingType == null) return SubmitGap.unscored;
+    if (isNotApplicable) return null;
+    if (findingType == 'OFI' && score == null) return SubmitGap.score;
+    if ((remark ?? '').trim().isEmpty) return SubmitGap.remark;
+    return null;
+  }
 
   /// Round-trips a node back to the server's own shape — needed because
   /// PATCH /audits/:id/save-draft replaces the WHOLE `parameters` array
@@ -195,6 +220,9 @@ class AuditScoreResult {
   final double? percentage;
   final int scoredCount;
   final int leafCount;
+  // How many of [leafCount] are marked Not Applicable — counted in [scoredCount] and [leafCount] (handled) but not in the
+  // score: [achieved], [maxPossible] and [percentage] leave them out. 0 from an older server.
+  final int notApplicableCount;
   final bool isFullyScored;
 
   const AuditScoreResult({
@@ -203,6 +231,7 @@ class AuditScoreResult {
     this.percentage,
     this.scoredCount = 0,
     this.leafCount = 0,
+    this.notApplicableCount = 0,
     this.isFullyScored = false,
   });
 
@@ -214,6 +243,7 @@ class AuditScoreResult {
       percentage: (json['percentage'] as num?)?.toDouble(),
       scoredCount: (json['scoredCount'] as num?)?.toInt() ?? 0,
       leafCount: (json['leafCount'] as num?)?.toInt() ?? 0,
+      notApplicableCount: (json['notApplicableCount'] as num?)?.toInt() ?? 0,
       isFullyScored: json['isFullyScored'] as bool? ?? false,
     );
   }
@@ -392,6 +422,68 @@ class AuditDetailModel {
   /// What the header badge / PDF prints: the unified [displayStatus], else
   /// the raw [status] (older server). Gates keep reading [status].
   String get displayLabel => displayStatus ?? status;
+
+  /// Every leaf checkpoint the audit is scored on: the shared checklist, or — in a per-location audit — each place's own
+  /// (locations first, then departments, as the server's scoring walks them).
+  List<ParameterNode> get leaves {
+    final out = <ParameterNode>[];
+    void walk(List<ParameterNode> nodes) {
+      for (final n in nodes) {
+        if (n.isLeaf) {
+          out.add(n);
+        } else {
+          walk(n.children);
+        }
+      }
+    }
+
+    if (structureMode == 'per-location') {
+      for (final g in locationParameters) {
+        walk(g.parameters);
+      }
+      for (final g in departmentParameters) {
+        walk(g.parameters);
+      }
+    } else {
+      walk(parameters);
+    }
+    return out;
+  }
+
+  int get leafTotal => leaves.length;
+
+  /// Checkpoints that have been dealt with — a finding given OR marked Not Applicable (the same count as the server's
+  /// scoreResult.scoredCount). "Done x / y" and the completion gate read this, so an N/A checkpoint never holds an audit back.
+  int get scoredTotal => leaves.where((n) => n.findingType != null).length;
+
+  /// Checkpoints marked Not Applicable — handled, but outside the score.
+  int get notApplicableTotal => leaves.where((n) => n.isNotApplicable).length;
+
+  /// Checkpoints that carry a score: a finding was given and it is not Not Applicable.
+  int get ratedTotal => leaves.where((n) => n.findingType != null && !n.isNotApplicable).length;
+
+  /// How many leaves carry [finding] ("Strong Compliance" | "Compliance" | "OFI" | "NC"). Not Applicable is not one of the
+  /// tallied findings — [notApplicableTotal] counts it.
+  int findingCount(String finding) => leaves.where((n) => n.findingType == finding).length;
+
+  /// Every checkpoint is marked Not Applicable, so there is nothing to score (the server refuses to complete such an
+  /// audit). An Instant audit's checklist is edited live, so it is read from the checklists themselves; the others from
+  /// the cached score.
+  bool get everyCheckpointNotApplicable => isInstant
+      ? leafTotal > 0 && notApplicableTotal == leafTotal
+      : scoreResult.leafCount > 0 && scoreResult.notApplicableCount >= scoreResult.leafCount;
+
+  /// Checkpoints that have a finding but no remark (Not Applicable ones need none) — Final Submit asks for every one.
+  int get missingRemarkTotal => leaves.where((n) => n.submitGap == SubmitGap.remark).length;
+
+  /// OFI checkpoints whose score was never picked.
+  int get missingScoreTotal => leaves.where((n) => n.submitGap == SubmitGap.score).length;
+
+  /// Whether Final Submit can go ahead: every checkpoint has its finding, every OFI its score, every applicable checkpoint its
+  /// remark, and at least one checkpoint applies. The same demands as the server's completeAudit, so the button never promises
+  /// a submit the server would refuse.
+  bool get readyForFinalSubmit =>
+      scoreResult.isFullyScored && !everyCheckpointNotApplicable && leaves.every((n) => n.submitGap == null);
 
   // Fast lookup for checkpoint_card.dart — every leaf's ncId (see
   // ParameterNode.ncId) maps 1:1 onto one of these full NC documents.
