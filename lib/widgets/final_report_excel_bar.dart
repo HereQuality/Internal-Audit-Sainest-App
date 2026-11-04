@@ -13,21 +13,28 @@ import '../utils/final_report_request.dart';
 
 /// widgets/final_report_excel_bar.dart
 /// ─────────────────────────────────────
-/// The Final Report's "Download Excel" action — one slim bar under the tab bar, so it
-/// sits in the same place whichever tab (Audits | NCs | Repeated NCs) is showing and
-/// the three look alike (like the report cards' PDF icon, it is the primary colour, in
-/// light and dark).
+/// The Final Report's Excel actions — one slim bar under the tab bar, so it sits in the
+/// same place whichever tab (Audits | NCs | Repeated NCs) is showing and the tabs look
+/// alike (like the report cards' PDF icon, the buttons are the primary colour, in light
+/// and dark). Two outlined 44 px buttons:
 ///
-/// Tapping it downloads EVERY row the screen's current filters match — all pages, not
-/// the page on screen (utils/final_report_download.dart) — builds the workbook the web
-/// app's Excel has (Summary + detail rows + By Location / By Auditor / By Auditee) and
-/// hands it to the phone's share sheet.
+///  * "Download Excel" — THIS tab: EVERY row the screen's current filters match — all
+///    pages, not the page on screen (utils/final_report_download.dart) — as the web
+///    app's workbook (Summary + detail rows + By Location / By Auditor / By Auditee);
+///  * "Download All" — the Audits, NCs and Repeated NCs workbooks in ONE file with one
+///    Summary (utils/final_report_all.dart), each part read one after the other under
+///    the filters its own tab uses right now.
 ///
-/// While it works the bar shows where it is ("Preparing Excel… 120 of 340 reports")
-/// with a Cancel button instead of the Download button, so a second tap cannot start a
-/// second download; the filters in force are snapshotted at the tap, so changing them
-/// meanwhile cannot change the file. A failed download says why in a snackbar and leaves
-/// the screen as it was.
+/// Either hands the finished file to the phone's share sheet. The buttons sit side by
+/// side when both labels fit and stack when they do not (a 320 px phone, a large system
+/// text size), never overflowing.
+///
+/// While it works the bar shows where it is ("Preparing Excel… 120 of 340 reports", or
+/// in Download All "Audits — 120 of 340 reports" / "NCs — …" / "Repeated NCs — …") with
+/// a Cancel button instead of the two buttons, so a second tap cannot start a second
+/// download; the filters in force are snapshotted at the tap, so changing them meanwhile
+/// cannot change the file. A failed download — any part of Download All — says why in a
+/// snackbar and leaves the screen as it was; a file is never made with a part missing.
 class FinalReportExcelBar extends StatefulWidget {
   const FinalReportExcelBar({super.key, required this.tab, this.service});
 
@@ -43,11 +50,14 @@ class FinalReportExcelBar extends StatefulWidget {
 
 class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
   late final FinalReportExportService _service = widget.service ?? FinalReportExportService();
-  final _buttonKey = GlobalKey();
+  final _excelKey = GlobalKey();
+  final _allKey = GlobalKey();
 
   bool _busy = false;
   bool _cancelling = false;
   FinalReportTab? _runningTab;
+  // "Download All" is the job running (no single tab owns it).
+  bool _runningAll = false;
   ExportProgress? _progress;
   ExportCancelToken? _cancel;
 
@@ -58,10 +68,10 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
     super.dispose();
   }
 
-  // Where an iPad anchors the share popover: the Download button — read BEFORE it is
-  // replaced by the progress row.
-  Rect _shareOrigin() {
-    final box = _buttonKey.currentContext?.findRenderObject();
+  // Where an iPad anchors the share popover: the Download button that was tapped — read
+  // BEFORE it is replaced by the progress row.
+  Rect _shareOrigin(GlobalKey button) {
+    final box = button.currentContext?.findRenderObject();
     if (box is RenderBox && box.hasSize && box.attached) {
       return box.localToGlobal(Offset.zero) & box.size;
     }
@@ -69,17 +79,18 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
     return Rect.fromLTWH(size.width / 2, size.height / 2, 1, 1);
   }
 
-  Future<void> _start() async {
+  Future<void> _start({bool all = false}) async {
     // Set at once, before anything is awaited: a second tap finds the bar busy.
     if (_busy) return;
     final tab = widget.tab;
-    final origin = _shareOrigin();
+    final origin = _shareOrigin(all ? _allKey : _excelKey);
     final token = ExportCancelToken();
     setState(() {
       _busy = true;
       _cancelling = false;
-      _runningTab = tab;
-      _progress = const ExportProgress(noun: '');
+      _runningAll = all;
+      _runningTab = all ? null : tab;
+      _progress = ExportProgress(part: all ? 'Audits' : '');
       _cancel = token;
     });
     try {
@@ -88,21 +99,27 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
       final options = context.read<FilterOptionsProvider>();
       await options.load();
       if (!mounted) return;
-      final request = buildFinalReportRequest(
-        tab: tab,
-        audits: context.read<AuditsProvider>(),
-        ncs: context.read<NcProvider>(),
-        options: options,
-        generatedBy: context.read<AuthProvider>().user?.name ?? '',
-      );
-      final result = await _service.export(
-        request,
-        cancel: token,
-        shareOrigin: origin,
-        onProgress: (p) {
-          if (mounted && !token.isCancelled) setState(() => _progress = p);
-        },
-      );
+      final audits = context.read<AuditsProvider>();
+      final ncs = context.read<NcProvider>();
+      final generatedBy = context.read<AuthProvider>().user?.name ?? '';
+      void onProgress(ExportProgress p) {
+        if (mounted && !token.isCancelled) setState(() => _progress = p);
+      }
+
+      // Both snapshot every filter NOW, in one synchronous step, whatever happens to the screen after.
+      final result = all
+          ? await _service.exportAll(
+              buildFinalReportAllRequest(audits: audits, ncs: ncs, options: options, generatedBy: generatedBy),
+              cancel: token,
+              shareOrigin: origin,
+              onProgress: onProgress,
+            )
+          : await _service.export(
+              buildFinalReportRequest(tab: tab, audits: audits, ncs: ncs, options: options, generatedBy: generatedBy),
+              cancel: token,
+              shareOrigin: origin,
+              onProgress: onProgress,
+            );
       if (mounted && result.warnings.isNotEmpty) showErrorSnackBar(context, result.warnings.join(' '));
     } on ExportCancelled {
       // The person cancelled: nothing to report, the bar is back to Download.
@@ -117,6 +134,7 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
         setState(() {
           _busy = false;
           _cancelling = false;
+          _runningAll = false;
           _runningTab = null;
           _progress = null;
           _cancel = null;
@@ -146,6 +164,9 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
     );
   }
 
+  static const _excelLabel = 'Download Excel';
+  static const _allLabel = 'Download All';
+
   Widget _downloadRow(ColorScheme scheme, TextTheme textTheme) {
     final caption = Text(
       _caption,
@@ -153,11 +174,11 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
       overflow: TextOverflow.ellipsis,
       style: textTheme.bodySmall?.copyWith(color: scheme.outline, fontWeight: FontWeight.w600),
     );
-    final button = OutlinedButton.icon(
-      key: _buttonKey,
-      onPressed: _start,
-      icon: const Icon(Icons.table_chart_outlined, size: 18),
-      label: const Text('Download Excel', maxLines: 1, overflow: TextOverflow.ellipsis),
+    OutlinedButton button(Key key, VoidCallback onPressed, IconData icon, String label) => OutlinedButton.icon(
+      key: key,
+      onPressed: onPressed,
+      icon: Icon(icon, size: 18),
+      label: Text(label, maxLines: 1, overflow: TextOverflow.ellipsis),
       style: OutlinedButton.styleFrom(
         foregroundColor: scheme.primary,
         // 44 px tall: the touch-target minimum.
@@ -165,29 +186,58 @@ class _FinalReportExcelBarState extends State<FinalReportExcelBar> {
         padding: const EdgeInsets.symmetric(horizontal: 12),
       ),
     );
-    // With a large system text size the caption and the button no longer fit side by side on a
-    // narrow phone: the caption goes above, and the button takes the width (its label shortens
-    // rather than overflowing).
-    final large = MediaQuery.textScalerOf(context).scale(14) / 14 > 1.25;
-    if (large) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [caption, const SizedBox(height: 4), button],
-      );
-    }
-    return Row(
+    final excel = button(_excelKey, _start, Icons.table_chart_outlined, _excelLabel);
+    final all = Tooltip(
+      message: 'Audits, NCs and Repeated NCs together in ONE Excel file, with one Summary',
+      child: button(_allKey, () => _start(all: true), Icons.layers_outlined, _allLabel),
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Expanded(child: caption),
-        const SizedBox(width: 8),
-        button,
+        caption,
+        const SizedBox(height: 4),
+        // Side by side when each label fits in half the width; otherwise one above the other, each
+        // taking the width (a 320 px phone, or a large system text size). Measured at the text size
+        // in force, so nothing is guessed from the screen width alone.
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final style = (Theme.of(context).textTheme.labelLarge ?? const TextStyle(fontSize: 14));
+            double natural(String label) {
+              final painter = TextPainter(
+                text: TextSpan(text: label, style: style),
+                textDirection: TextDirection.ltr,
+                textScaler: MediaQuery.textScalerOf(context),
+                maxLines: 1,
+              )..layout();
+              // icon + gap + the button's own padding and border, and a little air.
+              return painter.width + 18 + 8 + 24 + 6;
+            }
+
+            final half = (constraints.maxWidth - 8) / 2;
+            if (natural(_excelLabel) <= half && natural(_allLabel) <= half) {
+              return Row(
+                children: [
+                  Expanded(child: excel),
+                  const SizedBox(width: 8),
+                  Expanded(child: all),
+                ],
+              );
+            }
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [excel, const SizedBox(height: 8), all],
+            );
+          },
+        ),
       ],
     );
   }
 
   Widget _progressRow(ColorScheme scheme, TextTheme textTheme) {
     final progress = _progress ?? const ExportProgress(noun: '');
-    final other = _runningTab != null && _runningTab != widget.tab;
-    // The bar is shared by the three tabs: if the person switched tab meanwhile, say which one is being made.
+    // Download All names the part it is reading itself. For one tab: the bar is shared by the three
+    // tabs, so if the person switched tab meanwhile, say which one is being made.
+    final other = !_runningAll && _runningTab != null && _runningTab != widget.tab;
     final text = _cancelling ? 'Cancelling…' : '${other ? '${finalReportTabLabel(_runningTab!)}: ' : ''}${progress.text}';
     return Column(
       mainAxisSize: MainAxisSize.min,

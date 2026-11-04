@@ -1,485 +1,525 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
-/// One thing to show on a given day — an audit's scheduledDate, or an
-/// NC's targetDate. Deliberately generic (not AuditModel/NcModel
-/// specific) so the same month grid serves both the Auditor and Auditee
-/// calendar screens.
-class CalendarEvent {
-  final DateTime date;
-  final String title;
-  final String subtitle;
-  final Color color;
-  final VoidCallback? onTap;
+import '../core/utils/calendar_entries.dart';
+import 'calendar_layers.dart';
 
-  const CalendarEvent({
-    required this.date,
-    required this.title,
-    required this.subtitle,
-    required this.color,
-    this.onTap,
-  });
-}
+const _monthNames = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
 
-DateTime _dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+const _weekdayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
-// Months are compared and stored as their own 1st here, so a caller can
-// hand over any date inside the month it means (and so two DateTimes for
-// "March 2026" built from different days still compare equal, which the
-// didUpdateWidget echo check below depends on).
-DateTime _monthOnly(DateTime d) => DateTime(d.year, d.month, 1);
+/// "November 2026".
+String calendarMonthLabel(DateTime month) => '${_monthNames[month.month - 1]} ${month.year}';
 
-// Order-preserving distinct colors across one day's events — Dart's Color
-// has value equality, so a plain Set collapses repeats correctly.
-List<Color> _distinctColors(List<CalendarEvent> events) {
-  final seen = <Color>{};
-  final ordered = <Color>[];
-  for (final e in events) {
-    if (seen.add(e.color)) ordered.add(e.color);
-  }
-  return ordered;
-}
+/// "Tuesday 3 November 2026" — the long form a screen reader or a day heading reads.
+String calendarLongDay(DateTime day) =>
+    '${_weekdayNames[day.weekday - 1]} ${day.day} ${_monthNames[day.month - 1]} ${day.year}';
 
-/// A self-contained month-grid calendar — no external package, since the
-/// only real requirement is "show which days have something on them, tap
-/// a day to see it below", not a full scheduling UI. Month navigation via
-/// chevrons, a dot under any day with 1+ events, selected day highlighted,
-/// and that day's events listed underneath the grid.
-///
-/// The visible month can optionally be driven from outside as well — see
-/// [visibleMonth]/[onVisibleMonthChanged] and _MonthCalendarState's own
-/// _visibleMonth for how the two directions are reconciled. Both props are
-/// optional and omitting them leaves this widget behaving exactly as it
-/// always has.
-class MonthCalendar extends StatefulWidget {
-  final List<CalendarEvent> events;
-  final Widget Function(BuildContext context, List<CalendarEvent> dayEvents)
-  emptyDayBuilder;
-  // Optional dot+label legend rendered between the month-nav row and the
-  // weekday header — same placement as the web calendar's own legend row
-  // (Calendar.jsx), above the grid. Null keeps this widget usable by any
-  // future caller that doesn't have a fixed color scheme worth spelling
-  // out (e.g. a single-category list with no ambiguity to label).
-  final Widget? legend;
+/// The bar above the grid: ‹ previous · "November 2026 ▾" (tap to pick a month and
+/// a year) · next › · and a way back to today when the view is somewhere else.
+/// Every control is at least 44 px; the title scales down rather than overflowing
+/// at 320 px or a large text size.
+class CalendarMonthBar extends StatelessWidget {
+  final DateTime month;
+  final bool showToday;
+  final VoidCallback onPrev;
+  final VoidCallback onNext;
+  final VoidCallback onPick;
+  final VoidCallback onToday;
 
-  /// The month to render, given as any date inside it (normalised to the
-  /// 1st internally). OPTIONAL, and null keeps the historical behaviour
-  /// exactly: the grid picks the current month in initState and nothing
-  /// outside it can ever move the view again.
-  ///
-  /// Passed by screens/calendar/calendar_screen.dart, where a control that
-  /// lives OUTSIDE the grid — the filter sheet's Month section — also has
-  /// to be able to jump the month. That sheet is opened with the month
-  /// currently on screen (widgets/filter_sheet.dart's `month` argument), so
-  /// the two have to agree on what "currently on screen" is.
-  final DateTime? visibleMonth;
-
-  /// Fired whenever this widget's OWN chevrons move the month, so a parent
-  /// that passes [visibleMonth] can keep its copy current. Without it the
-  /// parent's month goes stale the instant the user taps a chevron, and the
-  /// next filter-sheet open would offer the month from before those taps —
-  /// the classic half-controlled-widget bug, where the data flows down but
-  /// never back up.
-  final ValueChanged<DateTime>? onVisibleMonthChanged;
-
-  const MonthCalendar({
+  const CalendarMonthBar({
     super.key,
-    required this.events,
-    required this.emptyDayBuilder,
-    this.legend,
-    this.visibleMonth,
-    this.onVisibleMonthChanged,
+    required this.month,
+    required this.showToday,
+    required this.onPrev,
+    required this.onNext,
+    required this.onPick,
+    required this.onToday,
   });
-
-  @override
-  State<MonthCalendar> createState() => _MonthCalendarState();
-}
-
-class _MonthCalendarState extends State<MonthCalendar> {
-  /// The month actually being rendered — and deliberately still State, not
-  /// a straight read of [MonthCalendar.visibleMonth]: this widget is only
-  /// half-controlled on purpose.
-  ///
-  /// Making it fully controlled (render the prop, route chevron taps out
-  /// through the callback and wait for a new prop to come back) would mean
-  /// every chevron tap costs a parent rebuild round-trip to repaint, and
-  /// would freeze the grid outright for any caller that wires up
-  /// [MonthCalendar.onVisibleMonthChanged] but forgets to feed the result
-  /// back into [MonthCalendar.visibleMonth] — or passes no props at all,
-  /// which is still a supported way to use this widget. So both directions
-  /// land on this one cursor instead: the prop PUSHES into it
-  /// (didUpdateWidget), the chevrons move it and then TELL the parent
-  /// (onVisibleMonthChanged). It is the single source of truth for what is
-  /// drawn either way.
-  late DateTime _visibleMonth;
-  late DateTime _selectedDay;
-
-  @override
-  void initState() {
-    super.initState();
-    _visibleMonth = _monthOnly(widget.visibleMonth ?? DateTime.now());
-    _selectedDay = _selectionForMonth(_visibleMonth);
-  }
-
-  @override
-  void didUpdateWidget(covariant MonthCalendar oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    final incoming = widget.visibleMonth;
-    // A caller that never passes the prop keeps full local control.
-    if (incoming == null) {
-      return;
-    }
-    final normalised = _monthOnly(incoming);
-    // Almost every rebuild lands here with the month we ourselves just
-    // reported through onVisibleMonthChanged, so this equality check is
-    // what stops the two-way sync from ping-ponging (and from stomping the
-    // selected day back to today on every unrelated parent rebuild).
-    if (normalised == _visibleMonth) {
-      return;
-    }
-    setState(() {
-      _visibleMonth = normalised;
-      _selectedDay = _selectionForMonth(normalised);
-    });
-  }
-
-  /// Which day to select when the grid lands on [month].
-  ///
-  /// The day-detail list under the grid has to be showing a day that is
-  /// actually IN the grid, so a month change can't just leave the previous
-  /// selection alone — jumping from March to April used to leave "Fri 15
-  /// Mar" and its events listed under an April grid. Rule: today if today
-  /// is in the new month (overwhelmingly the day you want, and it matches
-  /// where the screen opens), otherwise the 1st — the first cell of the
-  /// month and an obvious, stable landing spot, as opposed to "keep the
-  /// same day number", which needs clamping for 29-31 and lands somewhere
-  /// arbitrary anyway.
-  DateTime _selectionForMonth(DateTime month) {
-    final today = _dayOnly(DateTime.now());
-    if (today.year == month.year && today.month == month.month) {
-      return today;
-    }
-    return DateTime(month.year, month.month, 1);
-  }
-
-  Map<DateTime, List<CalendarEvent>> get _byDay {
-    final map = <DateTime, List<CalendarEvent>>{};
-    for (final e in widget.events) {
-      final key = _dayOnly(e.date);
-      map.putIfAbsent(key, () => []).add(e);
-    }
-    return map;
-  }
-
-  void _changeMonth(int delta) {
-    // DateTime rolls month 0 / month 13 over into the neighbouring year on
-    // its own, so December -> January needs no special case here.
-    final next = DateTime(_visibleMonth.year, _visibleMonth.month + delta, 1);
-    setState(() {
-      _visibleMonth = next;
-      _selectedDay = _selectionForMonth(next);
-    });
-    // Told AFTER the local move, never instead of it (see _visibleMonth's
-    // own comment). A parent that feeds this straight back into
-    // [MonthCalendar.visibleMonth] hits the equality check in
-    // didUpdateWidget and simply rebuilds, so there is no second setState
-    // and no loop.
-    widget.onVisibleMonthChanged?.call(next);
-  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final byDay = _byDay;
-    final firstOfMonth = _visibleMonth;
-    final daysInMonth = DateTime(
-      _visibleMonth.year,
-      _visibleMonth.month + 1,
-      0,
-    ).day;
-    // Monday-first grid — firstOfMonth.weekday is 1 (Mon) .. 7 (Sun).
-    final leadingBlanks = firstOfMonth.weekday - 1;
-    final totalCells = leadingBlanks + daysInMonth;
-    final rows = (totalCells / 7).ceil();
-    final today = _dayOnly(DateTime.now());
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-          child: Row(
-            children: [
-              IconButton(
-                onPressed: () => _changeMonth(-1),
-                icon: const Icon(Icons.chevron_left),
-              ),
-              Expanded(
-                child: Text(
-                  '${_monthName(_visibleMonth.month)} ${_visibleMonth.year}',
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-              IconButton(
-                onPressed: () => _changeMonth(1),
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ],
-          ),
-        ),
-        if (widget.legend != null) widget.legend!,
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: ['M', 'T', 'W', 'T', 'F', 'S', 'S']
-                .map(
-                  (d) => Expanded(
+    final label = calendarMonthLabel(month);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // The word "Today" only when there is room for it beside a readable title;
+        // otherwise the same control as an icon (tooltip and semantics unchanged).
+        final roomy = constraints.maxWidth >= 360 && MediaQuery.textScalerOf(context).scale(14) <= 14 * 1.3;
+        return Row(
+          children: [
+            IconButton(
+              tooltip: 'Previous month',
+              onPressed: onPrev,
+              icon: const Icon(Icons.chevron_left),
+            ),
+            Expanded(
+              child: Semantics(
+                button: true,
+                label: '$label, choose month',
+                excludeSemantics: true,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: onPick,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(minHeight: 48),
                     child: Center(
-                      child: Text(
-                        d,
-                        style: TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          color: scheme.outline,
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              label,
+                              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                            ),
+                            Icon(Icons.arrow_drop_down, color: scheme.outline),
+                          ],
                         ),
                       ),
                     ),
                   ),
-                )
-                .toList(),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-          child: Column(
-            children: [
-              for (int r = 0; r < rows; r++)
-                Row(
-                  children: [
-                    for (int c = 0; c < 7; c++) ...[
-                      Builder(
-                        builder: (context) {
-                          final cellIndex = r * 7 + c;
-                          final dayNum = cellIndex - leadingBlanks + 1;
-                          if (dayNum < 1 || dayNum > daysInMonth) {
-                            return const Expanded(child: SizedBox(height: 44));
-                          }
-                          final date = DateTime(
-                            _visibleMonth.year,
-                            _visibleMonth.month,
-                            dayNum,
-                          );
-                          final dayEvents = byDay[date] ?? const [];
-                          final isSelected = date == _selectedDay;
-                          final isToday = date == today;
-                          return Expanded(
-                            child: GestureDetector(
-                              onTap: () => setState(() => _selectedDay = date),
-                              child: Container(
-                                height: 44,
-                                margin: const EdgeInsets.all(2),
-                                decoration: BoxDecoration(
-                                  color: isSelected
-                                      ? scheme.primary
-                                      : (isToday
-                                            ? scheme.primaryContainer
-                                                  .withValues(alpha: 0.4)
-                                            : null),
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Text(
-                                      '$dayNum',
-                                      style: TextStyle(
-                                        fontWeight: isToday || isSelected
-                                            ? FontWeight.w800
-                                            : FontWeight.w500,
-                                        color: isSelected
-                                            ? scheme.onPrimary
-                                            : scheme.onSurface,
-                                        fontSize: 13,
-                                      ),
-                                    ),
-                                    if (dayEvents.isNotEmpty)
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 2),
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          // Up to 3 dots, one per distinct
-                                          // status color that day (not one
-                                          // per event) — a day with 5
-                                          // audits all "In Progress" still
-                                          // reads as one calm dot, while a
-                                          // day mixing e.g. Overdue +
-                                          // Completed visibly shows both.
-                                          children: [
-                                            for (final color in _distinctColors(dayEvents).take(3))
-                                              Container(
-                                                margin: const EdgeInsets.symmetric(horizontal: 1),
-                                                width: 5,
-                                                height: 5,
-                                                decoration: BoxDecoration(
-                                                  shape: BoxShape.circle,
-                                                  color: isSelected ? scheme.onPrimary : color,
-                                                ),
-                                              ),
-                                          ],
-                                        ),
-                                      ),
-                                  ],
-                                ),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ],
-                  ],
                 ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: _SelectedDayList(
-            day: _selectedDay,
-            events: byDay[_selectedDay] ?? const [],
-            emptyBuilder: widget.emptyDayBuilder,
-          ),
-        ),
-      ],
+              ),
+            ),
+            IconButton(
+              tooltip: 'Next month',
+              onPressed: onNext,
+              icon: const Icon(Icons.chevron_right),
+            ),
+            if (showToday)
+              roomy
+                  ? TextButton.icon(
+                      onPressed: onToday,
+                      icon: const Icon(Icons.today_outlined, size: 18),
+                      label: const Text('Today'),
+                      style: TextButton.styleFrom(minimumSize: const Size(44, 48)),
+                    )
+                  : IconButton(
+                      tooltip: 'Today',
+                      onPressed: onToday,
+                      icon: const Icon(Icons.today_outlined),
+                    ),
+          ],
+        );
+      },
     );
   }
-
-  String _monthName(int m) => const [
-    'January',
-    'February',
-    'March',
-    'April',
-    'May',
-    'June',
-    'July',
-    'August',
-    'September',
-    'October',
-    'November',
-    'December',
-  ][m - 1];
 }
 
-class _SelectedDayList extends StatelessWidget {
-  final DateTime day;
-  final List<CalendarEvent> events;
-  final Widget Function(BuildContext context, List<CalendarEvent> dayEvents)
-  emptyBuilder;
+/// The month grid: weekday header and one cell per day, Monday first, the
+/// neighbouring months' days dimmed in the first and last week.
+///
+/// A cell shows its day number (today is a filled circle, the selected day a ring
+/// and a tint) and, per layer that has something that day, the layer's icon in the
+/// colour of the most pressing audit status — with the count beside it when there
+/// is more than one. Each audit is counted once, under the first of its layers that
+/// is switched on ([CalendarEntry.primaryLayer]).
+///
+/// Swipe sideways to step a month. The cells span the full width — 45 px each on a
+/// 320 px phone — and grow with the text size, so the numbers stay legible and every
+/// day is a comfortable tap target.
+class CalendarMonthGrid extends StatelessWidget {
+  final DateTime month;
+  final DateTime today;
+  final DateTime selectedDay;
+  final Map<DateTime, List<CalendarEntry>> byDay;
+  final Set<CalendarLayer> layers;
+  final ValueChanged<DateTime> onSelect;
+  final VoidCallback onPrev;
+  final VoidCallback onNext;
 
-  const _SelectedDayList({
-    required this.day,
-    required this.events,
-    required this.emptyBuilder,
+  const CalendarMonthGrid({
+    super.key,
+    required this.month,
+    required this.today,
+    required this.selectedDay,
+    required this.byDay,
+    required this.layers,
+    required this.onSelect,
+    required this.onPrev,
+    required this.onNext,
   });
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
-          child: Text(
-            '${_dayOnly(day) == _dayOnly(DateTime.now()) ? 'Today, ' : ''}${_weekday(day.weekday)} ${day.day} ${_shortMonth(day.month)}',
-            style: TextStyle(
-              fontWeight: FontWeight.w700,
-              color: scheme.outline,
-              fontSize: 13,
+    final first = DateTime(month.year, month.month, 1);
+    final leading = first.weekday - 1; // Monday first
+    final daysInMonth = DateTime(month.year, month.month + 1, 0).day;
+    final rows = (leading + daysInMonth + 6) ~/ 7;
+    final scaler = MediaQuery.textScalerOf(context);
+    final numberBox = math.max(28.0, scaler.scale(14) * 1.2 + 6);
+    // The markers grow with the text size too (up to 1.5x): a 12 px icon beside a 22 px day number is a speck.
+    final markerScale = (scaler.scale(14) / 14).clamp(1.0, 1.5);
+    final markerHeight = 14 * markerScale;
+    final cellHeight = math.max(58.0, numberBox + markerHeight + 12);
+
+    return GestureDetector(
+      // A sideways flick steps the month; the vertical scroll of the page is untouched.
+      onHorizontalDragEnd: (details) {
+        final v = details.primaryVelocity ?? 0;
+        if (v <= -250) {
+          onNext();
+        } else if (v >= 250) {
+          onPrev();
+        }
+      },
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              for (var i = 0; i < 7; i++)
+                Expanded(
+                  child: Semantics(
+                    label: _weekdayNames[i],
+                    excludeSemantics: true,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Center(
+                        child: Text(
+                          _weekdayNames[i].substring(0, 1),
+                          style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: scheme.onSurfaceVariant),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          for (var r = 0; r < rows; r++)
+            Row(
+              children: [
+                for (var c = 0; c < 7; c++)
+                  Builder(
+                    builder: (context) {
+                      final day = DateTime(month.year, month.month, 1 - leading + r * 7 + c);
+                      return Expanded(
+                        child: _DayCell(
+                          day: day,
+                          month: month,
+                          today: today,
+                          selected: day == selectedDay,
+                          entries: byDay[day] ?? const [],
+                          layers: layers,
+                          height: cellHeight,
+                          numberBox: numberBox,
+                          markerScale: markerScale,
+                          onTap: onSelect,
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayCell extends StatelessWidget {
+  final DateTime day;
+  final DateTime month;
+  final DateTime today;
+  final bool selected;
+  final List<CalendarEntry> entries;
+  final Set<CalendarLayer> layers;
+  final double height;
+  final double numberBox;
+  final double markerScale;
+  final ValueChanged<DateTime> onTap;
+
+  const _DayCell({
+    required this.day,
+    required this.month,
+    required this.today,
+    required this.selected,
+    required this.entries,
+    required this.layers,
+    required this.height,
+    required this.numberBox,
+    required this.markerScale,
+    required this.onTap,
+  });
+
+  String _semanticLabel() {
+    final parts = <String>[calendarLongDay(day)];
+    if (day == today) parts.add('today');
+    for (final layer in CalendarLayer.values) {
+      if (!layers.contains(layer)) continue;
+      final n = entries.where((e) => e.primaryLayer(layers) == layer).length;
+      if (n == 0) continue;
+      parts.add(switch (layer) {
+        CalendarLayer.mine => '$n of my audit${n == 1 ? '' : 's'}',
+        CalendarLayer.location => '$n audit${n == 1 ? '' : 's'} at my location',
+        CalendarLayer.nc => '$n NC${n == 1 ? '' : 's'}',
+      });
+    }
+    if (parts.length == 1 || (parts.length == 2 && day == today)) parts.add('nothing scheduled');
+    return parts.join(', ');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final inMonth = day.month == month.month && day.year == month.year;
+    final isToday = day == today;
+    final numberColor = isToday
+        ? scheme.onPrimary
+        : (inMonth ? scheme.onSurface : scheme.onSurfaceVariant.withValues(alpha: 0.6));
+
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: _semanticLabel(),
+      excludeSemantics: true,
+      child: InkWell(
+        key: ValueKey('calendar-day-${calendarDayKey(day)}'),
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => onTap(day),
+        child: Container(
+          height: height,
+          margin: const EdgeInsets.all(2),
+          decoration: BoxDecoration(
+            color: selected ? scheme.primaryContainer.withValues(alpha: 0.55) : null,
+            border: selected ? Border.all(color: scheme.primary, width: 2) : null,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Today is a filled pill hugging the number (not stretched across the cell).
+              ConstrainedBox(
+                constraints: BoxConstraints(minWidth: 30, minHeight: numberBox),
+                child: DecoratedBox(
+                  decoration: isToday
+                      ? BoxDecoration(color: scheme.primary, borderRadius: BorderRadius.circular(999))
+                      : const BoxDecoration(),
+                  child: Center(
+                    widthFactor: 1,
+                    heightFactor: 1,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 5),
+                      child: Text(
+                        '${day.day}',
+                        maxLines: 1,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: isToday || selected ? FontWeight.w800 : FontWeight.w500,
+                          color: numberColor,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              SizedBox(
+                height: 14 * markerScale,
+                child: Opacity(
+                  opacity: inMonth ? 1 : 0.55,
+                  child: _Markers(entries: entries, layers: layers, scale: markerScale),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The marks under a day number: per layer that has something that day, its icon
+/// coloured by the most pressing audit status (red for NCs), with the count when
+/// more than one. Scaled down as a whole to fit a narrow cell.
+class _Markers extends StatelessWidget {
+  final List<CalendarEntry> entries;
+  final Set<CalendarLayer> layers;
+  final double scale;
+
+  const _Markers({required this.entries, required this.layers, required this.scale});
+
+  @override
+  Widget build(BuildContext context) {
+    if (entries.isEmpty) return const SizedBox.shrink();
+    final marks = <Widget>[];
+    for (final layer in CalendarLayer.values) {
+      if (!layers.contains(layer)) continue;
+      final group = entries.where((e) => e.primaryLayer(layers) == layer).toList();
+      if (group.isEmpty) continue;
+      final status = mostUrgentStatus(group);
+      final color = status == null ? layer.color(context) : calendarStatusColor(context, status);
+      if (marks.isNotEmpty) marks.add(const SizedBox(width: 3));
+      marks.add(
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(layer.icon, size: 12 * scale, color: color),
+            if (group.length > 1)
+              Text(
+                '${group.length}',
+                textScaler: TextScaler.noScaling,
+                style: TextStyle(fontSize: 10 * scale, fontWeight: FontWeight.w800, color: color, height: 1),
+              ),
+          ],
+        ),
+      );
+    }
+    return FittedBox(
+      fit: BoxFit.scaleDown,
+      child: Row(mainAxisSize: MainAxisSize.min, children: marks),
+    );
+  }
+}
+
+/// A small month-and-year chooser: the year steps, the twelve months are one tap
+/// each (every button at least 44 px). Resolves to the 1st of the chosen month,
+/// or null when dismissed.
+Future<DateTime?> showCalendarMonthPicker(BuildContext context, {required DateTime month}) {
+  return showDialog<DateTime>(
+    context: context,
+    builder: (_) => _MonthPickerDialog(initial: month),
+  );
+}
+
+class _MonthPickerDialog extends StatefulWidget {
+  final DateTime initial;
+
+  const _MonthPickerDialog({required this.initial});
+
+  @override
+  State<_MonthPickerDialog> createState() => _MonthPickerDialogState();
+}
+
+class _MonthPickerDialogState extends State<_MonthPickerDialog> {
+  late int _year = widget.initial.year;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Dialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 340),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  IconButton(
+                    tooltip: 'Previous year',
+                    onPressed: () => setState(() => _year--),
+                    icon: const Icon(Icons.chevron_left),
+                  ),
+                  Expanded(
+                    child: Center(
+                      child: Text(
+                        '$_year',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Next year',
+                    onPressed: () => setState(() => _year++),
+                    icon: const Icon(Icons.chevron_right),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final width = (constraints.maxWidth - 16) / 3;
+                  return Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (var m = 1; m <= 12; m++)
+                        SizedBox(
+                          width: width,
+                          height: 48,
+                          child: _MonthButton(
+                            label: _monthNames[m - 1].substring(0, 3),
+                            fullLabel: '${_monthNames[m - 1]} $_year',
+                            selected: widget.initial.year == _year && widget.initial.month == m,
+                            onTap: () => Navigator.of(context).pop(DateTime(_year, m, 1)),
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  style: TextButton.styleFrom(minimumSize: const Size(44, 44), foregroundColor: scheme.onSurfaceVariant),
+                  child: const Text('Cancel'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MonthButton extends StatelessWidget {
+  final String label;
+  final String fullLabel;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _MonthButton({required this.label, required this.fullLabel, required this.selected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: fullLabel,
+      excludeSemantics: true,
+      child: Material(
+        color: selected ? scheme.primary : scheme.surfaceContainerHighest.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onTap,
+          child: Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontWeight: FontWeight.w700,
+                  color: selected ? scheme.onPrimary : scheme.onSurface,
+                ),
+              ),
             ),
           ),
         ),
-        Expanded(
-          child: events.isEmpty
-              ? emptyBuilder(context, events)
-              : ListView.separated(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-                  itemCount: events.length,
-                  separatorBuilder: (_, _) => const SizedBox(height: 8),
-                  itemBuilder: (_, i) {
-                    final e = events[i];
-                    return Card(
-                      clipBehavior: Clip.antiAlias,
-                      child: InkWell(
-                        onTap: e.onTap,
-                        child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Row(
-                            children: [
-                              Container(
-                                width: 4,
-                                height: 36,
-                                decoration: BoxDecoration(
-                                  color: e.color,
-                                  borderRadius: BorderRadius.circular(2),
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      e.title,
-                                      style: const TextStyle(
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    Text(
-                                      e.subtitle,
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: scheme.outline,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                              if (e.onTap != null)
-                                Icon(
-                                  Icons.chevron_right,
-                                  size: 18,
-                                  color: scheme.outline,
-                                ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
+      ),
     );
   }
-
-  String _weekday(int w) =>
-      const ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][w - 1];
-  String _shortMonth(int m) => const [
-    'Jan',
-    'Feb',
-    'Mar',
-    'Apr',
-    'May',
-    'Jun',
-    'Jul',
-    'Aug',
-    'Sep',
-    'Oct',
-    'Nov',
-    'Dec',
-  ][m - 1];
 }

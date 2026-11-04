@@ -63,14 +63,6 @@ mixin AuditFilterScope on ChangeNotifier {
   // fetched and needs no reload.
   bool _defaultTeamScopeKnown = false;
 
-  /// Calendar only: the user explicitly picked All Members ON the Calendar.
-  /// The Calendar loads unpaginated data, so — like the web's
-  /// `useScopeFilter({ fullAccessDefault: false })` — it opens on Me for
-  /// everybody, a Full Access user included, and only widens when asked
-  /// ([calendarTeamScope]). Cleared whenever Me is picked anywhere, on Clear
-  /// and on logout.
-  bool calendarAllMembers = false;
-
   /// Adopts the signed-in account's default scope. Plain field writes, no
   /// notify, so main.dart's _RootGate may repeat it on every authenticated
   /// build. An untouched toggle follows the new default; one the user has
@@ -89,14 +81,6 @@ mixin AuditFilterScope on ChangeNotifier {
     if (untouched) isTeamScope = value;
     return untouched && !firstTime;
   }
-
-  /// The Me / All Members scope the Calendar's OWN requests use: the shared
-  /// [isTeamScope], except that a Full Access user's untouched All Members
-  /// default does not carry into the Calendar (it stays on Me, as on the web)
-  /// unless they picked All Members there ([calendarAllMembers]). For an
-  /// ordinary employee it is simply [isTeamScope], as before.
-  bool get calendarTeamScope =>
-      isTeamScope && (!defaultTeamScope || calendarAllMembers);
 
   /// A precise pick of people from the Members filter. Non-empty always
   /// WINS over [isTeamScope] — picking specific people is a more specific
@@ -183,13 +167,21 @@ mixin AuditFilterScope on ChangeNotifier {
   /// a new fetch entry point.
   Map<String, dynamic>? get filterParams => _filterParamsFor(isTeamScope);
 
-  /// [filterParams] for the Calendar's own requests: the same filters under
-  /// [calendarTeamScope], so a Full Access user's All Members default does not
-  /// make the (unpaginated) calendar pull the whole organisation.
+  /// [filterParams] for the Calendar's own requests: the same filters and the same
+  /// Me / All Members scope as every other screen — so, like the web Calendar
+  /// (client/src/pages/Calendar.jsx, which dropped `fullAccessDefault: false` once it
+  /// began loading only the month on screen), a Full Access user opens on the whole
+  /// organisation, not on "just me".
+  ///
+  /// WITHOUT the Date range: like the web Calendar, whose month grid IS its date
+  /// filter. A range picked on the Audits or NC screen (the picks are shared)
+  /// used to narrow this calendar too, so every audit outside it silently
+  /// vanished from the grid. The Calendar asks for the month on screen instead
+  /// (AuditsProvider.setCalendarWindow / NcProvider.setCalendarWindow).
   Map<String, dynamic>? get calendarFilterParams =>
-      _filterParamsFor(calendarTeamScope);
+      _filterParamsFor(isTeamScope, withDates: false);
 
-  Map<String, dynamic>? _filterParamsFor(bool teamScope) {
+  Map<String, dynamic>? _filterParamsFor(bool teamScope, {bool withDates = true}) {
     final params = <String, dynamic>{};
     final people = _employeeIdsParamFor(teamScope);
     if (people != null) params['employeeIds'] = people;
@@ -202,8 +194,8 @@ mixin AuditFilterScope on ChangeNotifier {
     if (auditTypeFilter.isNotEmpty) {
       params['auditType'] = auditTypeFilter.join(',');
     }
-    if (dateFrom != null) params['fromDate'] = DateFormat(_fmt).format(dateFrom!);
-    if (dateTo != null) params['toDate'] = DateFormat(_fmt).format(dateTo!);
+    if (withDates && dateFrom != null) params['fromDate'] = DateFormat(_fmt).format(dateFrom!);
+    if (withDates && dateTo != null) params['toDate'] = DateFormat(_fmt).format(dateTo!);
     return params.isEmpty ? null : params;
   }
 
@@ -248,15 +240,12 @@ mixin AuditFilterScope on ChangeNotifier {
 
   /// The same count for a screen that only offers some dimensions — a Status
   /// pick made on the Audits tab must not light the badge on the Dashboard
-  /// (whose tiles ignore it) or a Flag pick on an audit screen.
-  ///
-  /// [calendar] counts the Calendar's own scope ([calendarTeamScope], whose
-  /// resting state is Me for everyone) instead of the shared one.
+  /// (whose tiles ignore it) or a Flag pick on an audit screen, and the Calendar
+  /// (which has no Date range) passes `date: false`.
   int activeFilterCountFor({
     bool status = true,
     bool date = true,
     bool flag = true,
-    bool calendar = false,
   }) =>
       // Mirrors filterParams' own precedence: a specific-people pick WINS
       // over isTeamScope entirely (the flag is ignored once employeeFilter
@@ -265,10 +254,7 @@ mixin AuditFilterScope on ChangeNotifier {
       // The scope counts only when it differs from the account's default.
       (teamFilter.isNotEmpty ? 1 : 0) +
       (employeeFilter.isNotEmpty ||
-              (teamFilter.isEmpty &&
-                  (calendar
-                      ? calendarTeamScope
-                      : isTeamScope != defaultTeamScope))
+              (teamFilter.isEmpty && isTeamScope != defaultTeamScope)
           ? 1
           : 0) +
       (locationFilter.isNotEmpty || departmentFilter.isNotEmpty ? 1 : 0) +
@@ -353,11 +339,8 @@ mixin AuditFilterScope on ChangeNotifier {
   }) {
     if (resetScope) {
       isTeamScope = defaultTeamScope;
-      calendarAllMembers = false;
     } else if (isTeam != null) {
       isTeamScope = isTeam;
-      // Me, picked anywhere, ends a Calendar-level All Members as well.
-      if (!isTeam) calendarAllMembers = false;
     }
     if (heldTeams != null) heldTeamFilter = List.unmodifiable(heldTeams);
     if (heldEmployees != null) heldEmployeeFilter = List.unmodifiable(heldEmployees);
@@ -419,7 +402,6 @@ mixin AuditFilterScope on ChangeNotifier {
     isTeamScope = false;
     defaultTeamScope = false;
     _defaultTeamScopeKnown = false;
-    calendarAllMembers = false;
     setFilterState(
       employees: const [],
       teams: const [],

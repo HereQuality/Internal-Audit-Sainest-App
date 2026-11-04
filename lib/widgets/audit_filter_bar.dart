@@ -116,7 +116,7 @@ class AuditFilterBar extends StatelessWidget {
         current.employees.isNotEmpty || current.teams.isNotEmpty;
     final pills = <Widget>[
       for (final id in current.teams)
-        _FilterPill(
+        FilterPill(
           icon: Icons.diversity_3_outlined,
           label: _lookup(options.teams.map((t) => (t.id, t.name)), id, 'Team'),
           onRemove: () {
@@ -147,7 +147,7 @@ class AuditFilterBar extends StatelessWidget {
           },
         ),
       if (current.employees.isNotEmpty)
-        _FilterPill(
+        FilterPill(
           icon: Icons.person_outline,
           label: current.employees.length == 1
               ? _lookup(
@@ -161,7 +161,7 @@ class AuditFilterBar extends StatelessWidget {
           ),
         ),
       for (final id in current.locations)
-        _FilterPill(
+        FilterPill(
           icon: Icons.place_outlined,
           label: _lookup(options.locations.map((l) => (l.id, l.name)), id, 'Location'),
           // Employee selections are left alone when a location goes: the two
@@ -179,7 +179,7 @@ class AuditFilterBar extends StatelessWidget {
           ),
         ),
       for (final id in current.departments)
-        _FilterPill(
+        FilterPill(
           icon: Icons.apartment_outlined,
           label: _lookup(options.departments.map((d) => (d.id, d.name)), id, 'Department'),
           onRemove: () => change(
@@ -193,32 +193,32 @@ class AuditFilterBar extends StatelessWidget {
           ),
         ),
       for (final type in current.auditTypes)
-        _FilterPill(
+        FilterPill(
           label: type,
           onRemove: () =>
               change(current.copyWith(auditTypes: [...current.auditTypes]..remove(type))),
         ),
       if (showDateRange && (current.dateFrom != null || current.dateTo != null))
-        _FilterPill(
+        FilterPill(
           icon: Icons.event_outlined,
           label: _rangeLabel(current.dateFrom, current.dateTo),
           onRemove: () => change(current.copyWith(dateRange: (null, null))),
         ),
       if (showStatus)
         for (final s in current.statuses)
-          _FilterPill(
+          FilterPill(
             label: s,
             onRemove: () =>
                 change(current.copyWith(statuses: [...current.statuses]..remove(s))),
           ),
       if (showStatus && current.includeSkipped)
-        _FilterPill(
+        FilterPill(
           label: 'Incl. skipped',
           onRemove: () => change(current.copyWith(includeSkipped: false)),
         ),
       if (showFlag)
         for (final f in current.flags)
-          _FilterPill(
+          FilterPill(
             icon: Icons.flag_outlined,
             label: f,
             onRemove: () =>
@@ -230,7 +230,7 @@ class AuditFilterBar extends StatelessWidget {
       // moving off it — to All Members, or, for Full Access, to Me — is worth
       // showing, and removing the pill goes back to the default.
       if (!specificPeople && current.isTeam != current.defaultIsTeam)
-        _FilterPill(
+        FilterPill(
           icon: current.isTeam ? Icons.groups_outlined : Icons.person_outline,
           label: current.isTeam ? 'All Members' : 'Me',
           onRemove: () => change(current.copyWith(isTeam: current.defaultIsTeam)),
@@ -372,16 +372,22 @@ class AuditFilterBar extends StatelessWidget {
 /// not an InputChip: a Chip widget carries fixed overhead (avatar slot,
 /// delete-icon spacing) that made even one active filter read heavy, and the
 /// pills must stay one compact row. The X removes; the label itself is inert.
-class _FilterPill extends StatelessWidget {
+///
+/// Public so a list with filters of its own (the Auditee's "Audit at My Location"
+/// tab) can draw the same pills. [tapHeight] (default 0 = the compact pill above,
+/// untouched) grows the TOUCH area to at least that tall around the same small pill.
+class FilterPill extends StatelessWidget {
   final String label;
   final IconData? icon;
   final VoidCallback onRemove;
+  final double tapHeight;
 
-  const _FilterPill({required this.label, required this.onRemove, this.icon});
+  const FilterPill({super.key, required this.label, required this.onRemove, this.icon, this.tapHeight = 0});
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    if (tapHeight > 0) return _tallTap(context, scheme);
     return Padding(
       padding: const EdgeInsets.only(right: 6),
       child: Material(
@@ -393,39 +399,81 @@ class _FilterPill extends StatelessWidget {
           child: Semantics(
             button: true,
             label: 'Remove filter $label',
-            child: Padding(
-              padding: const EdgeInsets.only(left: 10, right: 6),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (icon != null) ...[
-                    Icon(icon, size: 12, color: scheme.onPrimaryContainer),
-                    const SizedBox(width: 4),
-                  ],
-                  // A long name must not push this pill (and the whole
-                  // scrollable row) arbitrarily wide.
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 150),
-                    child: Text(
-                      label,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: scheme.onPrimaryContainer,
-                      ),
-                    ),
+            child: _content(scheme),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // The pill's icon, label and X.
+  Widget _content(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 10, right: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 12, color: scheme.onPrimaryContainer),
+            const SizedBox(width: 4),
+          ],
+          // A long name must not push this pill (and the whole
+          // scrollable row) arbitrarily wide.
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 150),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: scheme.onPrimaryContainer,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(4),
+            child: Icon(
+              Icons.close_rounded,
+              size: 13,
+              color: scheme.onPrimaryContainer,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // The same small pill inside a touch area [tapHeight] tall: the tint is drawn on the
+  // inner box only, the ripple and the tap cover the whole band.
+  Widget _tallTap(BuildContext context, ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: Semantics(
+        button: true,
+        label: 'Remove filter $label',
+        excludeSemantics: true,
+        onTap: onRemove,
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            onTap: onRemove,
+            customBorder: const StadiumBorder(),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(minHeight: tapHeight, minWidth: tapHeight),
+              child: Center(
+                widthFactor: 1,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: scheme.primaryContainer.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(999),
                   ),
-                  Padding(
-                    padding: const EdgeInsets.all(4),
-                    child: Icon(
-                      Icons.close_rounded,
-                      size: 13,
-                      color: scheme.onPrimaryContainer,
-                    ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: _content(scheme),
                   ),
-                ],
+                ),
               ),
             ),
           ),

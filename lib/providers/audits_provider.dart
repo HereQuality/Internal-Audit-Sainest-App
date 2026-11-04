@@ -7,14 +7,17 @@ import 'package:flutter/foundation.dart';
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
+import '../core/utils/calendar_window.dart';
 import '../core/utils/evidence_photo.dart';
 import '../models/audit_detail_model.dart';
 import '../models/audit_model.dart';
 import '../models/employee_option.dart';
 import '../models/location_option.dart';
+import '../models/self_audit.dart';
 import '../models/upload_phase.dart';
 import '../core/utils/report_stats.dart';
 import 'audit_filter_scope.dart';
+import 'audits_at_location_list.dart';
 import 'evidence_job_watch.dart';
 
 class AuditsProvider extends ChangeNotifier with AuditFilterScope {
@@ -75,8 +78,9 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       if (reportsInUse) fetchReportStats(),
       // The leader's "My locations" list is showing: same filters, same reload.
       if (ledAuditsInUse) fetchLedAudits(),
-      // The Calendar is open: its own list follows the filters too.
+      // The Calendar is open: its own lists follow the filters too.
       if (calendarInUse) fetchCalendarAudits(),
+      if (calendarInUse) fetchCalendarAtMyLocation(),
     ]);
   }
 
@@ -114,6 +118,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   int _reportStatsSeq = 0;
   int _atMyLocationSeq = 0;
   int _calendarAuditsSeq = 0;
+  int _calendarLocationSeq = 0;
 
   /// Empties every list and the open audit, and puts the filters back to
   /// their defaults — call on logout, without refetching. Every list here is
@@ -131,8 +136,13 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     audits = [];
     auditsAtMyLocation = [];
     calendarAudits = [];
+    calendarAtMyLocation = [];
+    calendarWindow = null;
+    calendarAuditsError = null;
+    calendarAtMyLocationError = null;
     calendarInUse = false;
     isLoadingCalendarAudits = false;
+    isLoadingCalendarAtMyLocation = false;
     reportAudits = [];
     reportsTotal = 0;
     reportsHasMore = false;
@@ -167,6 +177,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     isLoadingDetail = false;
     isLoadingReports = false;
     isLoadingAtMyLocation = false;
+    atLocationList.reset();
     super.resetForLogout();
   }
 
@@ -192,6 +203,12 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         _refreshTimer?.cancel();
         _refreshTimer = Timer(const Duration(milliseconds: 500), () {
           fetchMyAudits();
+          // The Calendar is open: a new, moved or finished audit shows on it too
+          // (the web page refreshes on the same signal, useLiveRefresh).
+          if (calendarInUse) {
+            fetchCalendarAudits();
+            fetchCalendarAtMyLocation();
+          }
           // An audit finishing / changing hands moves the Final Report too (the
           // web page refreshes on the same signal); a tab that is not showing
           // just notes it is out of date.
@@ -206,6 +223,8 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           // A reassignment (by this leader elsewhere, a scheduler, ...) changes
           // who is on the audits at their places.
           if (ledAuditsInUse) fetchLedAudits(quiet: true);
+          // A new or rescheduled audit shows at once in the Auditee's "Audit at My Location" tab.
+          if (atLocationList.inUse) atLocationList.refreshLoaded();
           if (activeAudit != null) {
             fetchAuditDetail(activeAudit!.id, quiet: true);
           }
@@ -513,12 +532,40 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   // it must not read [audits] — that list is fetched with the Audits tab's
   // Include skipped switch and would silently narrow (or widen) the calendar
   // with a pick it can neither show nor clear. Same shared filters otherwise
-  // ([filterParams], not [listFilterParams]) — except the Me / All Members
-  // scope, which follows the Calendar's own rule ([calendarFilterParams]: Me
-  // for everybody unless All Members was picked on the Calendar itself).
+  // ([filterParams], not [listFilterParams]) and the same Me / All Members scope,
+  // minus the Date range the Calendar does not have ([calendarFilterParams]).
   bool calendarInUse = false;
   bool isLoadingCalendarAudits = false;
   List<AuditModel> calendarAudits = [];
+
+  /// The days the Calendar's own lists ([calendarAudits], [calendarAtMyLocation])
+  /// were asked for — the month on screen and its neighbours (the web asks for the
+  /// grid on screen). Set by the Calendar screen before it fetches; null (a caller
+  /// that never sets it) asks for every audit, as before.
+  CalendarWindow? calendarWindow;
+
+  /// Why the Calendar's lists could not be read (null = fine). A failed read keeps
+  /// the audits that were showing, but the screen says so and offers Retry —
+  /// before, a failure left an empty month that looked like "nothing scheduled".
+  String? calendarAuditsError;
+  String? calendarAtMyLocationError;
+
+  void setCalendarWindow(CalendarWindow? window) {
+    calendarWindow = window;
+  }
+
+  /// [params] plus the Calendar's window. fromDate reaches back by the longest a
+  /// multi-day audit is marked, so one that began before the window and runs into
+  /// it is still returned (the server windows an audit by its start date).
+  Map<String, dynamic>? _withCalendarWindow(Map<String, dynamic>? params) {
+    final window = calendarWindow;
+    if (window == null) return params;
+    return {
+      ...?params,
+      'fromDate': CalendarWindow.param(window.auditFrom),
+      'toDate': CalendarWindow.param(window.to),
+    };
+  }
 
   Future<void> fetchCalendarAudits() async {
     final epoch = _epoch;
@@ -529,18 +576,67 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
     try {
       final res = await _dio.get(
         ApiConstants.myAudits,
-        queryParameters: calendarFilterParams,
+        queryParameters: _withCalendarWindow(calendarFilterParams),
       );
       if (stale()) return;
       calendarAudits = (res.data['data'] as List? ?? [])
           .whereType<Map>()
           .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
-    } on DioException {
-      // Fail quiet like the other calendar layers: keep what was showing.
+      calendarAuditsError = null;
+    } catch (e, st) {
+      // Keeps what was showing — and says it could not be refreshed. Not only a
+      // DioException: a row that fails to parse used to escape this and leave the
+      // Calendar's first load hanging.
+      debugPrint('AuditsProvider.fetchCalendarAudits: $e\n$st');
+      if (!stale()) {
+        calendarAuditsError = e is DioException
+            ? extractErrorMessage(e, fallback: 'Could not load your audits.')
+            : 'Could not read your audits.';
+      }
     } finally {
       if (!stale()) {
         isLoadingCalendarAudits = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  /// The Calendar's own copy of "audits at my location": the same read as
+  /// [fetchAuditsAtMyLocation] (location / department / audit type filters, never
+  /// employeeIds), asked for the Calendar's [calendarWindow] like the web does.
+  /// Kept apart from [auditsAtMyLocation] so that list stays the whole answer for
+  /// anything else that reads it.
+  bool isLoadingCalendarAtMyLocation = false;
+  List<AuditModel> calendarAtMyLocation = [];
+
+  Future<void> fetchCalendarAtMyLocation() async {
+    final epoch = _epoch;
+    final seq = ++_calendarLocationSeq;
+    bool stale() => epoch != _epoch || seq != _calendarLocationSeq;
+    isLoadingCalendarAtMyLocation = true;
+    notifyListeners();
+    try {
+      final res = await _dio.get(
+        ApiConstants.auditsAtMyLocation,
+        queryParameters: _withCalendarWindow(_placeAndTypeParams),
+      );
+      if (stale()) return;
+      calendarAtMyLocation = (res.data['data'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => AuditModel.fromJson(Map<String, dynamic>.from(e)))
+          .toList();
+      calendarAtMyLocationError = null;
+    } catch (e, st) {
+      debugPrint('AuditsProvider.fetchCalendarAtMyLocation: $e\n$st');
+      if (!stale()) {
+        calendarAtMyLocationError = e is DioException
+            ? extractErrorMessage(e, fallback: 'Could not load the audits at your places.')
+            : 'Could not read the audits at your places.';
+      }
+    } finally {
+      if (!stale()) {
+        isLoadingCalendarAtMyLocation = false;
         notifyListeners();
       }
     }
@@ -1257,6 +1353,15 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
   bool isLoadingAtMyLocation = false;
   List<AuditModel> auditsAtMyLocation = [];
 
+  /// The Auditee's "Audit at My Location" TAB: the same endpoint in its paged mode, with
+  /// filters of its own (see audits_at_location_list.dart). Unrelated to the unpaged list
+  /// above, which the Calendar reads and which follows the app-wide filters.
+  late final AuditsAtLocationList atLocationList = AuditsAtLocationList(
+    dio: _dio,
+    epoch: () => _epoch,
+    onChanged: notifyListeners,
+  );
+
   Map<String, dynamic>? get _placeAndTypeParams {
     final params = <String, dynamic>{};
     if (locationFilter.isNotEmpty) {
@@ -1737,6 +1842,35 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
       return extractErrorMessage(
         e,
         fallback: 'Could not save the representative.',
+      );
+    }
+  }
+
+  /// The other answer to the representative step: "Self" — nobody from the
+  /// auditee side responded or was available, so nobody is named. The server
+  /// clears the audit's representative, keeps the reason + remark and the
+  /// report's Auditee then reads "Self" (models/self_audit.dart). Refetches so
+  /// activeAudit reflects it immediately. Returns an error message, or null.
+  Future<String?> setAuditSelf(
+    String auditId, {
+    required SelfAuditReason reason,
+    required String remark,
+  }) async {
+    try {
+      await _dio.patch(
+        ApiConstants.auditRepresentative(auditId),
+        data: {
+          'selfAudit': true,
+          'selfAuditReason': reason.code,
+          'selfAuditRemark': remark.trim(),
+        },
+      );
+      await fetchAuditDetail(auditId);
+      return null;
+    } on DioException catch (e) {
+      return extractErrorMessage(
+        e,
+        fallback: 'Could not save the self audit.',
       );
     }
   }

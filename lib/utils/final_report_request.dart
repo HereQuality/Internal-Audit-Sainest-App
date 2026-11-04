@@ -137,8 +137,34 @@ FinalReportRequest buildFinalReportRequest({
           dateText: ncs.repeatsUseDefaultWindow
               ? 'Last 6 months (from ${formatPickedDay(from)}) — the default'
               : describeDateRange(ncs.dateFrom, ncs.dateTo),
+          search: ncs.repeatsSearch,
           extra: [('Minimum repeats', '${ncs.repeatsMinCount}+ times at the same place')],
         ),
       );
   }
+}
+
+/// "Download All": the three tabs' requests at once, each under the filters ITS OWN tab uses
+/// right now — the Audits' chip, search and lit tiles, the NCs' flag, search and lit tile, the
+/// Repeated NCs' six-month window, Min. times and search — snapshotted together at the tap, so
+/// the combined file says exactly what the three separate downloads would.
+FinalReportAllRequest buildFinalReportAllRequest({
+  required AuditsProvider audits,
+  required NcProvider ncs,
+  required FilterOptionsProvider options,
+  String generatedBy = '',
+}) {
+  FinalReportRequest of(FinalReportTab tab) => buildFinalReportRequest(
+    tab: tab,
+    audits: audits,
+    ncs: ncs,
+    options: options,
+    generatedBy: generatedBy,
+  );
+  return FinalReportAllRequest(
+    audits: of(FinalReportTab.audits),
+    ncs: of(FinalReportTab.ncs),
+    repeats: of(FinalReportTab.repeats),
+    generatedBy: generatedBy,
+  );
 }

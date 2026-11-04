@@ -1,3 +1,4 @@
+import 'self_audit.dart';
 import 'audit_model.dart' show AuditNcSummary;
 import 'nc_model.dart';
 
@@ -336,6 +337,13 @@ class AuditDetailModel {
   // change, same convention models/Audit.js#auditeeIds documents.
   final List<String> auditeeIds;
   final List<String> auditeeNames;
+  // A SELF audit (models/self_audit.dart): the auditor chose "Self" in the
+  // representative step because the auditee did not respond / was not available.
+  // Raw as the server stores it — read [isSelfAudit], which also requires that
+  // nobody is named.
+  final bool selfAudit;
+  final String? selfAuditReason;
+  final String selfAuditRemark;
   final List<String> auditorIds;
   // Populated alongside auditorIds (server populates "employeeName
   // profilePic") — kept as a parallel display-name list rather than
@@ -395,6 +403,9 @@ class AuditDetailModel {
     this.auditeeName,
     this.auditeeIds = const [],
     this.auditeeNames = const [],
+    this.selfAudit = false,
+    this.selfAuditReason,
+    this.selfAuditRemark = '',
     this.auditorIds = const [],
     this.auditorNames = const [],
     this.scheduledEndDate,
@@ -474,6 +485,24 @@ class AuditDetailModel {
       : scoreResult.leafCount > 0 && scoreResult.notApplicableCount >= scoreResult.leafCount;
 
   /// Checkpoints that have a finding but no remark (Not Applicable ones need none) — Final Submit asks for every one.
+  /// Self only while nobody is named: a named representative always wins, so a
+  /// stale flag can never hide a real auditee.
+  bool get isSelfAudit =>
+      selfAudit &&
+      auditeeIds.every((id) => id.isEmpty) &&
+      (auditeeId ?? '').isEmpty;
+
+  /// "Auditee not responding — Called twice, no answer" for a self audit, else ''.
+  String get selfAuditNote =>
+      isSelfAudit ? selfAuditNoteOf(selfAuditReason, selfAuditRemark) : '';
+
+  /// What the Auditee field says: the names, else "Self", else [fallback].
+  String auditeeLabel({String fallback = '—'}) {
+    if (auditeeNames.isNotEmpty) return auditeeNames.join(', ');
+    if ((auditeeName ?? '').isNotEmpty) return auditeeName!;
+    return isSelfAudit ? kSelfLabel : fallback;
+  }
+
   int get missingRemarkTotal => leaves.where((n) => n.submitGap == SubmitGap.remark).length;
 
   /// OFI checkpoints whose score was never picked.
@@ -517,6 +546,9 @@ class AuditDetailModel {
           .map((e) => e['employeeName']?.toString() ?? '')
           .where((n) => n.isNotEmpty)
           .toList(),
+      selfAudit: json['selfAudit'] == true,
+      selfAuditReason: json['selfAuditReason']?.toString(),
+      selfAuditRemark: json['selfAuditRemark']?.toString() ?? '',
       auditorIds: (json['auditorIds'] as List? ?? []).map((e) => idOf(e)?.toString() ?? '').toList(),
       auditorNames: (json['auditorIds'] as List? ?? [])
           .whereType<Map>()

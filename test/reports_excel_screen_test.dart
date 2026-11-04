@@ -18,7 +18,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'support/session_fakes.dart';
 
-/// The Excel action on the real Final Report screen: every one of the three tabs has it,
+/// The Excel actions on the real Final Report screen (Download Excel for the tab, and Download All): every one of the three tabs has them,
 /// in the same place, under the shared filter bar and the tab bar, at the narrowest phone
 /// width, in both themes — and it does not get in the way of the lists.
 void main() {
@@ -94,11 +94,13 @@ void main() {
         final bar = tester.getRect(find.byType(FinalReportExcelBar));
         expect(bar.top, greaterThanOrEqualTo(tabBar.bottom - 0.5), reason: name);
         expect(bar.top - tabBar.bottom, lessThan(8), reason: name);
-        expect(
-          tester.getSize(find.descendant(of: find.byType(FinalReportExcelBar), matching: find.byType(OutlinedButton))).height,
-          greaterThanOrEqualTo(44),
-          reason: name,
-        );
+        // Both buttons: this tab's Excel, and Download All (every tab, one file) — each a 44 px touch target.
+        expect(find.text('Download All'), findsOneWidget, reason: name);
+        for (final label in ['Download Excel', 'Download All']) {
+          final button = find.descendant(of: find.byType(FinalReportExcelBar), matching: find.widgetWithText(OutlinedButton, label));
+          expect(tester.getSize(button).height, greaterThanOrEqualTo(44), reason: '$name $label');
+          expect(tester.getRect(button).right, lessThanOrEqualTo(320), reason: '$name $label');
+        }
         expect(tester.takeException(), isNull, reason: name);
       }
     });

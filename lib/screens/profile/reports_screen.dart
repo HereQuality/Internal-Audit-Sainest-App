@@ -70,10 +70,12 @@ import '../reports/repeated_ncs_tab.dart';
 /// "final report" without a second, parallel detail screen to keep in
 /// sync with the scoring workspace.
 ///
-/// Above the lists a "Download Excel" bar (widgets/final_report_excel_bar.dart) exports
-/// the LIST of the tab showing — every report / NC / repeated checkpoint the shared
-/// filters match, all pages — as the web app's Final Report workbook (Summary, detail
-/// rows, By Location / By Auditor / By Auditee) through the phone's share sheet.
+/// Above the lists an Excel bar (widgets/final_report_excel_bar.dart) has two buttons.
+/// "Download Excel" exports the LIST of the tab showing — every report / NC / repeated
+/// checkpoint the shared filters match, all pages — as the web app's Final Report
+/// workbook (Summary, detail rows, By Location / By Auditor / By Auditee) through the
+/// phone's share sheet; "Download All" makes ONE workbook of all three tabs, each read
+/// under the filters its own tab uses right now, with one combined Summary.
 ///
 /// A multi-zone Schedule/Frequency Audit (see AuditModel.scheduleBatchId)
 /// groups its zones into one expandable card — same "N locations"

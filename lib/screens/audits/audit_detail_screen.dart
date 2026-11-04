@@ -7,6 +7,7 @@ import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
 import '../../models/employee_option.dart';
 import '../../models/location_option.dart';
+import '../../models/self_audit.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/dashboard_provider.dart';
@@ -285,36 +286,41 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   Future<void> _promptForRepresentative(
     AuditDetailModel audit, {
     List<String> initiallySelected = const [],
+    SelfAuditChoice? initialSelf,
   }) async {
     if (!mounted) return;
     final provider = context.read<AuditsProvider>();
     // The pool is empty when the lookup failed (or never ran): try once more
-    // rather than silently doing nothing, and if there really is nobody, say
-    // so — the banner button used to just not respond.
+    // rather than silently doing nothing. If there really is nobody the sheet
+    // still opens — it says so and offers Self, which needs nobody to pick.
     if (provider.auditeeCandidates.isEmpty) {
       await provider.fetchLocationEmployees(
         audit.locationLabels.map((l) => l.id).toList(),
         departmentIds: audit.departmentLabels.map((d) => d.id).toList(),
       );
       if (!mounted) return;
-      if (provider.auditeeCandidates.isEmpty) {
-        showErrorSnackBar(
-          context,
-          'No members found for this audit\'s location. Pull to refresh and try again.',
-        );
-        return;
-      }
     }
+    // Changing a self audit reopens it with its reason and remark filled in.
+    final currentSelf = initialSelf ?? _currentSelf(audit);
     final picked = await showSelectRepresentativeSheet(
       context,
       employees: provider.auditeeCandidates,
       initiallySelected: initiallySelected,
+      initialSelf: currentSelf,
     );
-    if (picked == null || picked.isEmpty || !mounted) return;
+    if (picked == null || !mounted) return;
+    if (!picked.isSelf && picked.employeeIds.isEmpty) return;
     setState(() => _settingRepresentative = true);
     String? error;
     try {
-      error = await provider.setAuditRepresentative(audit.id, picked);
+      final self = picked.self;
+      error = self != null
+          ? await provider.setAuditSelf(
+              audit.id,
+              reason: self.reason,
+              remark: self.remark,
+            )
+          : await provider.setAuditRepresentative(audit.id, picked.employeeIds);
     } finally {
       if (mounted) setState(() => _settingRepresentative = false);
     }
@@ -325,8 +331,21 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
       // picker rather than silently dropping the selection. Backing out
       // of the sheet itself (picked == null, above) is a deliberate skip,
       // not an error, so that path does NOT re-prompt.
-      await _promptForRepresentative(audit, initiallySelected: picked);
+      await _promptForRepresentative(
+        audit,
+        initiallySelected: picked.employeeIds,
+        initialSelf: picked.self,
+      );
     }
+  }
+
+  // The saved Self answer of [audit], to prefill the sheet when it is changed.
+  SelfAuditChoice? _currentSelf(AuditDetailModel audit) {
+    if (!audit.isSelfAudit) return null;
+    return SelfAuditChoice(
+      reason: SelfAuditReason.fromCode(audit.selfAuditReason) ?? SelfAuditReason.notResponding,
+      remark: audit.selfAuditRemark,
+    );
   }
 
   Future<void> _addCheckpoint(
@@ -458,8 +477,11 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // representative auditee is set — see _buildBody's `interactive` and
   // `_buildActions` below, both of which fold this in. There's nothing to
   // gate once the audit is no longer active for scoring anyway.
+  // "Self" (nobody from the auditee side was available — models/self_audit.dart)
+  // answers the step as much as naming people does.
   bool _needsRepresentative(AuditDetailModel audit, String? myId) =>
       audit.auditeeIds.isEmpty &&
+      !audit.isSelfAudit &&
       _isPrimaryAuditor(audit, myId) &&
       _isActiveForScoring(audit);
 
@@ -1041,7 +1063,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Select a representative auditee before you can start scoring this audit.',
+                    'Select a representative auditee — or Self, if nobody from the auditee side is available — before you can start scoring this audit.',
                     style: TextStyle(
                       color: AppColors.readable(context, AppColors.red),
                       fontWeight: FontWeight.w600,
@@ -1075,18 +1097,33 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
             ),
             const SizedBox(height: 10),
           ],
-          if (audit.auditeeNames.isNotEmpty)
+          if (audit.auditeeNames.isNotEmpty || audit.isSelfAudit)
             Padding(
               padding: const EdgeInsets.only(bottom: 4),
               child: Row(
                 children: [
                   Expanded(
-                    child: Text(
-                      'Representative${audit.auditeeNames.length > 1 ? 's' : ''}: ${audit.auditeeNames.join(', ')}',
-                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: scheme.outline,
-                        fontWeight: FontWeight.w600,
-                      ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          audit.isSelfAudit
+                              ? 'Representative: $kSelfLabel'
+                              : 'Representative${audit.auditeeNames.length > 1 ? 's' : ''}: ${audit.auditeeNames.join(', ')}',
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: scheme.outline,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        // Why nobody was named — the reason and the auditor's remark.
+                        if (audit.isSelfAudit && audit.selfAuditNote.isNotEmpty)
+                          Text(
+                            'Self audit — ${audit.selfAuditNote}',
+                            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: scheme.outline,
+                            ),
+                          ),
+                      ],
                     ),
                   ),
                   // Lets the auditor swap in a different representative

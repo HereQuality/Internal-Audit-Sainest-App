@@ -78,6 +78,9 @@ void main() {
   }
 
   final download = find.text('Download Excel');
+  final downloadAll = find.text('Download All');
+  final excelButton = find.widgetWithText(OutlinedButton, 'Download Excel');
+  final allButton = find.widgetWithText(OutlinedButton, 'Download All');
   final cancel = find.byKey(const ValueKey('excel-cancel'));
   final progressText = find.byKey(const ValueKey('excel-progress-text'));
   String shown(WidgetTester tester) => tester.widget<Text>(progressText).data!;
@@ -87,8 +90,11 @@ void main() {
       testWidgets('is on the ${finalReportTabLabel(tab)} tab, 44 px tall, with what it will export', (tester) async {
         await pump(tester, tab: tab);
         expect(download, findsOneWidget);
+        expect(downloadAll, findsOneWidget);
         expect(find.byIcon(Icons.table_chart_outlined), findsOneWidget);
-        expect(tester.getSize(find.byType(OutlinedButton)).height, greaterThanOrEqualTo(44));
+        expect(find.byIcon(Icons.layers_outlined), findsOneWidget);
+        expect(tester.getSize(excelButton).height, greaterThanOrEqualTo(44));
+        expect(tester.getSize(allButton).height, greaterThanOrEqualTo(44));
         expect(
           find.text(switch (tab) {
             FinalReportTab.audits => 'Every report your filters match',
@@ -103,13 +109,22 @@ void main() {
     for (final dark in [false, true]) {
       for (final width in [320.0, 360.0]) {
         for (final scale in [1.0, 1.6]) {
-          testWidgets('fits ${width.round()} px wide (${dark ? 'dark' : 'light'} theme, text x$scale), idle and while busy, on every tab', (tester) async {
+          testWidgets('both buttons fit ${width.round()} px wide (${dark ? 'dark' : 'light'} theme, text x$scale), idle and while busy, on every tab', (tester) async {
             final h = await pump(tester, width: width, theme: dark ? AppTheme.dark() : AppTheme.light(), textScale: scale);
             for (final tab in FinalReportTab.values) {
               h.tab.value = tab;
               await tester.pump();
               expect(download, findsOneWidget);
+              expect(downloadAll, findsOneWidget);
               expect(tester.takeException(), isNull);
+              // Each stays inside the screen and is at least 44 px tall, whether side by side or stacked.
+              for (final button in [excelButton, allButton]) {
+                final r = tester.getRect(button);
+                expect(r.left, greaterThanOrEqualTo(0));
+                expect(r.right, lessThanOrEqualTo(width));
+                expect(r.height, greaterThanOrEqualTo(44));
+              }
+              expect(tester.getRect(excelButton).overlaps(tester.getRect(allButton)), isFalse);
             }
             await tester.tap(download);
             await tester.pump();
@@ -127,10 +142,42 @@ void main() {
             h.service.pending!.completeError(const ExportCancelled());
             await tester.pump();
             await tester.pump();
+
+            // Download All while busy: its own, longer progress line fits too.
+            await tester.tap(downloadAll);
+            await tester.pump();
+            await tester.pump();
+            h.service.onProgress!(const ExportProgress(noun: 'NCs in those checkpoints', done: 1200, total: 3400, part: 'Repeated NCs'));
+            await tester.pump();
+            expect(shown(tester), 'Repeated NCs — 1200 of 3400 NCs in those checkpoints');
+            expect(tester.takeException(), isNull);
+            h.service.pendingAll!.completeError(const ExportCancelled());
+            await tester.pump();
+            await tester.pump();
           });
         }
       }
     }
+
+    testWidgets('side by side when both labels fit in half the width', (tester) async {
+      // (The test font is the wide "Ahem": a label is about 2.5x as wide as in the app's real font, so
+      // the width that is "roomy" here is wider than a phone. On a 360-390 px phone the real labels fit.)
+      await pump(tester, width: 700);
+      final excel = tester.getRect(excelButton);
+      final all = tester.getRect(allButton);
+      expect(excel.top, all.top);
+      expect(excel.right, lessThan(all.left));
+      expect(excel.width, closeTo(all.width, 0.5));
+    });
+
+    testWidgets('one above the other on a narrow one (320 px), each taking the width', (tester) async {
+      await pump(tester, width: 320);
+      final excel = tester.getRect(excelButton);
+      final all = tester.getRect(allButton);
+      expect(excel.left, all.left);
+      expect(excel.bottom, lessThan(all.top));
+      expect(excel.width, all.width);
+    });
   });
 
   group('downloading', () {
@@ -185,7 +232,7 @@ void main() {
 
     testWidgets('hands the share sheet the Download button\'s place on screen (where an iPad anchors its popover)', (tester) async {
       final h = await pump(tester);
-      final button = tester.getRect(find.byType(OutlinedButton));
+      final button = tester.getRect(excelButton);
       await tester.tap(download);
       await tester.pump();
       await tester.pump();
@@ -213,6 +260,156 @@ void main() {
       await tester.pump();
       await tester.pump();
       expect(download, findsOneWidget);
+    });
+  });
+
+  group('Download All', () {
+    for (final tab in FinalReportTab.values) {
+      testWidgets('from the ${finalReportTabLabel(tab)} tab it exports the three tabs at once, each under its own tab\'s filters at the tap', (tester) async {
+        final h = await pump(tester, tab: tab);
+        h.audits
+          ..setFilterState(isTeam: true)
+          ..reportsStatus = 'Overdue'
+          ..reportsSearch = 'press';
+        h.ncs
+          ..setFilterState(isTeam: true, flags: ['Major'])
+          ..ncReportSearch = 'guard'
+          ..ncReportTileKeys = {'overdue'}
+          ..repeatsMinCount = 3
+          ..repeatsSearch = 'floor';
+        await tester.tap(downloadAll);
+        await tester.pump();
+        await tester.pump();
+        expect(h.service.calls, isEmpty, reason: 'it is not the single-tab download');
+        final r = h.service.allCalls.single;
+        expect(r.audits.listQuery['status'], 'Overdue');
+        expect(r.audits.listQuery['search'], 'press');
+        expect(r.ncs.listQuery['bucket'], 'overdue');
+        expect(r.ncs.listQuery['severity'], 'Major');
+        expect(r.ncs.listQuery['search'], 'guard');
+        expect(r.repeats.listQuery['minCount'], 3);
+        expect(r.repeats.listQuery['search'], 'floor');
+        // Whatever happens to the filters now does not reach the file being made.
+        h.audits.reportsStatus = 'Completed';
+        h.ncs.repeatsSearch = 'other';
+        expect(r.audits.listQuery['status'], 'Overdue');
+        expect(r.repeats.listQuery['search'], 'floor');
+        h.service.pendingAll!.completeError(const ExportCancelled());
+        await tester.pump();
+        await tester.pump();
+      });
+    }
+
+    testWidgets('names the part it is reading, with Cancel, and neither Download button — no second download of either kind', (tester) async {
+      final h = await pump(tester, tab: FinalReportTab.ncs);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      expect(download, findsNothing);
+      expect(downloadAll, findsNothing);
+      expect(cancel, findsOneWidget);
+      expect(shown(tester), 'Audits — preparing…');
+
+      h.service.onProgress!(const ExportProgress(noun: 'reports', done: 120, total: 340, part: 'Audits'));
+      await tester.pump();
+      expect(shown(tester), 'Audits — 120 of 340 reports');
+      expect(tester.widget<LinearProgressIndicator>(find.byType(LinearProgressIndicator)).value, closeTo(120 / 340, 1e-6));
+      h.service.onProgress!(const ExportProgress(noun: 'NCs', done: 20, total: 40, part: 'NCs'));
+      await tester.pump();
+      // Whichever tab is showing, the line names the part — never a tab-switch prefix on top of it.
+      expect(shown(tester), 'NCs — 20 of 40 NCs');
+      h.tab.value = FinalReportTab.audits;
+      await tester.pump();
+      expect(shown(tester), 'NCs — 20 of 40 NCs');
+      h.service.onProgress!(const ExportProgress(noun: 'repeated checkpoints', done: 1, total: 2, part: 'Repeated NCs'));
+      await tester.pump();
+      expect(shown(tester), 'Repeated NCs — 1 of 2 repeated checkpoints');
+      h.service.onProgress!(const ExportProgress.building());
+      await tester.pump();
+      expect(shown(tester), 'Building the Excel file…');
+
+      expect(h.service.allCalls, hasLength(1));
+      h.service.pendingAll!.complete(const FinalReportExportResult(fileName: 'Final-Report-All-2026-11-03.xlsx', rowCount: 9));
+      await tester.pump();
+      await tester.pump();
+      expect(download, findsOneWidget);
+      expect(downloadAll, findsOneWidget);
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('hands the share sheet the Download All button\'s place (where an iPad anchors its popover)', (tester) async {
+      final h = await pump(tester);
+      final button = tester.getRect(allButton);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      expect(h.service.origin, button);
+      h.service.pendingAll!.completeError(const ExportCancelled());
+      await tester.pump();
+      await tester.pump();
+    });
+
+    testWidgets('Cancel works at any point; a cancel is not an error', (tester) async {
+      final h = await pump(tester);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      h.service.onProgress!(const ExportProgress(noun: 'NCs', done: 100, total: 300, part: 'NCs'));
+      await tester.pump();
+      await tester.tap(cancel);
+      await tester.pump();
+      expect(h.service.token!.isCancelled, isTrue);
+      expect(shown(tester), 'Cancelling…');
+      h.service.pendingAll!.completeError(const ExportCancelled());
+      await tester.pump();
+      await tester.pump();
+      expect(download, findsOneWidget);
+      expect(downloadAll, findsOneWidget);
+      expect(find.byType(SnackBar), findsNothing);
+    });
+
+    testWidgets('if any part fails the whole download fails with the plain message, and both buttons are back', (tester) async {
+      final h = await pump(tester);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      h.service.pendingAll!.completeError(const ReportExportException('Could not reach the server. Check your connection and try again.'));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('Could not reach the server. Check your connection and try again.'), findsOneWidget);
+      expect(download, findsOneWidget);
+      expect(downloadAll, findsOneWidget);
+      // Usable again: the per-tab download still works.
+      await tester.tap(download);
+      await tester.pump();
+      await tester.pump();
+      expect(h.service.calls, hasLength(1));
+      h.service.pending!.completeError(const ExportCancelled());
+      await tester.pump();
+      await tester.pump();
+    });
+
+    testWidgets('warnings from the parts (a part\'s tiles were missing) are said', (tester) async {
+      final h = await pump(tester);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      h.service.pendingAll!.complete(FinalReportExportResult(fileName: 'f.xlsx', rowCount: 3, warnings: ['NCs: $statsMissingNote']));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('NCs: $statsMissingNote'), findsOneWidget);
+    });
+
+    testWidgets('leaving the screen cancels it too', (tester) async {
+      final h = await pump(tester);
+      await tester.tap(downloadAll);
+      await tester.pump();
+      await tester.pump();
+      final token = h.service.token!;
+      await tester.pumpWidget(const SizedBox());
+      expect(token.isCancelled, isTrue);
+      h.service.pendingAll!.completeError(const ExportCancelled());
+      await tester.pump();
     });
   });
 
@@ -314,7 +511,10 @@ class _Harness {
 /// An export that waits for the test: [pending] is completed (or failed) by hand.
 class _FakeService implements FinalReportExportService {
   final List<FinalReportRequest> calls = [];
+  final List<FinalReportAllRequest> allCalls = [];
   Completer<FinalReportExportResult>? pending;
+  // The pending job, whichever kind it is.
+  Completer<FinalReportExportResult>? pendingAll;
   ExportProgressCallback? onProgress;
   ExportCancelToken? token;
   Rect? origin;
@@ -334,5 +534,19 @@ class _FakeService implements FinalReportExportService {
     token = cancel;
     origin = shareOrigin;
     return (pending = Completer<FinalReportExportResult>()).future;
+  }
+
+  @override
+  Future<FinalReportExportResult> exportAll(
+    FinalReportAllRequest request, {
+    ExportCancelToken? cancel,
+    ExportProgressCallback? onProgress,
+    Rect? shareOrigin,
+  }) {
+    allCalls.add(request);
+    this.onProgress = onProgress;
+    token = cancel;
+    origin = shareOrigin;
+    return (pendingAll = Completer<FinalReportExportResult>()).future;
   }
 }

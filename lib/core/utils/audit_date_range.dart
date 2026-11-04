@@ -18,7 +18,8 @@ List<DateTime> daysInAuditRange(AuditModel audit) {
   var cursor = start;
   while (!cursor.isAfter(end) && days.length < maxAuditRangeDays) {
     days.add(cursor);
-    cursor = cursor.add(const Duration(days: 1));
+    // Calendar arithmetic, not a 24h Duration: across a clock change that lands on the wrong day.
+    cursor = DateTime(cursor.year, cursor.month, cursor.day + 1);
   }
   return days;
 }

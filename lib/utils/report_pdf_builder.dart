@@ -13,6 +13,7 @@ import 'package:pdf/widgets.dart' as pw;
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../models/audit_detail_model.dart';
+import '../models/self_audit.dart';
 import '../models/nc_model.dart';
 import 'bold_marks.dart';
 import 'report_pdf_fonts.dart';
@@ -229,6 +230,10 @@ class _ReportSpec {
   final String? finalAuditorRemark;
   final List<(String, String)>? zoneRemarks;
 
+  /// Why the audit was conducted without the auditee (models/self_audit.dart), one (zone, note) per self-audit zone —
+  /// the zone name is '' for a single audit or when only one zone is a self audit.
+  final List<(String, String)>? selfAuditNotes;
+
   /// What the Location-wise Score chart calls the one bar of an audit whose places all share ONE checklist (its
   /// single section has no name of its own) — the places the audit covers, instead of the placeholder "Location 1".
   final String? unnamedSectionLabel;
@@ -249,6 +254,7 @@ class _ReportSpec {
     required this.isFinalReport,
     this.finalAuditorRemark,
     this.zoneRemarks,
+    this.selfAuditNotes,
     this.unnamedSectionLabel,
     this.serverPercentage,
   });
@@ -533,12 +539,8 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit, {ReportPdfStats? stats}
       reportTitle: audit.title,
       headerFields: [
         ('Auditor', audit.auditorNames.isNotEmpty ? audit.auditorNames.join(', ') : '—'),
-        (
-          'Auditee',
-          audit.auditeeNames.isNotEmpty
-              ? audit.auditeeNames.join(', ')
-              : ((audit.auditeeName ?? '').isNotEmpty ? audit.auditeeName! : '—'),
-        ),
+        // "Self" when the auditor conducted it without the auditee (models/self_audit.dart).
+        ('Auditee', audit.auditeeLabel()),
         ('Start Date', _fmtDate(audit.scheduledDate)),
         ('End Date', _fmtDate(audit.scheduledEndDate ?? audit.completedDate)),
         // The unified lifecycle status the app shows everywhere (e.g.
@@ -554,6 +556,7 @@ Future<Uint8List> buildReportPdf(AuditDetailModel audit, {ReportPdfStats? stats}
       scoringSystem: audit.scoringSystem,
       isFinalReport: audit.status == 'Completed',
       finalAuditorRemark: (audit.finalAuditorRemark ?? '').isNotEmpty ? audit.finalAuditorRemark : null,
+      selfAuditNotes: audit.isSelfAudit ? [('', audit.selfAuditNote)] : null,
       unnamedSectionLabel: audit.locationLabels.isNotEmpty
           ? audit.locationLabels.map((l) => l.display).join(', ')
           : audit.departmentLabels.isNotEmpty
@@ -601,6 +604,7 @@ Future<Uint8List> buildCombinedReportPdf(
   final ncsById = <String, NcModel>{};
   final sections = <_SectionSpec>[];
   final zoneRemarks = <(String, String)>[];
+  final selfZones = <(String, String)>[];
   DateTime? minStart;
   DateTime? maxEnd;
 
@@ -634,6 +638,7 @@ Future<Uint8List> buildCombinedReportPdf(
     if ((zone.finalAuditorRemark ?? '').isNotEmpty) {
       zoneRemarks.add((zoneLabel, zone.finalAuditorRemark!));
     }
+    if (zone.isSelfAudit) selfZones.add((zoneLabel, zone.selfAuditNote));
   }
 
   return _render(
@@ -641,7 +646,8 @@ Future<Uint8List> buildCombinedReportPdf(
       reportTitle: first.title,
       headerFields: [
         ('Auditor', auditorNames.isNotEmpty ? auditorNames.join(', ') : '—'),
-        if (auditeeNames.isNotEmpty) ('Auditee', auditeeNames.join(', ')),
+        // After any names, "Self" once if some zone was conducted without the auditee.
+        if (auditeeNames.isNotEmpty || selfZones.isNotEmpty) ('Auditee', [...auditeeNames, if (selfZones.isNotEmpty) kSelfLabel].join(', ')),
         ('Start Date', _fmtDate(minStart)),
         ('End Date', _fmtDate(maxEnd)),
         // The batch's ONE aggregate status — final only once every zone is
@@ -654,6 +660,10 @@ Future<Uint8List> buildCombinedReportPdf(
       scoringSystem: first.scoringSystem,
       isFinalReport: zones.every((z) => z.status == 'Completed'),
       zoneRemarks: zoneRemarks.isNotEmpty ? zoneRemarks : null,
+      // A zone's name leads its note only when more than one zone has one.
+      selfAuditNotes: selfZones.isEmpty
+          ? null
+          : [for (final z in selfZones) (selfZones.length > 1 ? z.$1 : '', z.$2)],
       serverPercentage: _combinedServerPercentage(zones),
     ),
     stats: stats,
@@ -823,6 +833,7 @@ Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
           ),
         ],
         pw.SizedBox(height: 14),
+        if (spec.selfAuditNotes?.isNotEmpty ?? false) ...[_selfAudit(spec.selfAuditNotes!), pw.SizedBox(height: 14)],
         if (hasRemark) ...[_finalRemark(spec), pw.SizedBox(height: 14)],
         if (paramChartData.isNotEmpty) ...[
           _chartCard('Parameter Score', _barChart(paramChartData)),
@@ -1120,6 +1131,28 @@ pw.Widget _partialBanner() => pw.Inseparable(
     ),
   ),
 );
+
+// Why the audit was conducted without the auditee — the reason and the auditor's remark, laid out like the final remark.
+pw.Widget _selfAudit(List<(String, String)> notes) {
+  return pw.Column(
+    crossAxisAlignment: pw.CrossAxisAlignment.start,
+    children: [
+      pw.Text('SELF AUDIT', style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold, color: _C.slate)),
+      pw.SizedBox(height: 6),
+      for (var i = 0; i < notes.length; i++) ...[
+        if (i > 0) pw.SizedBox(height: 6),
+        if (notes[i].$1.isNotEmpty) ...[
+          pw.Text(
+            notes[i].$1,
+            style: pw.TextStyle(fontSize: 8.5, fontWeight: pw.FontWeight.bold, color: _C.blueDark),
+          ),
+          pw.SizedBox(height: 3),
+        ],
+        pw.Text(notes[i].$2, style: const pw.TextStyle(fontSize: 9, color: _C.ink, lineSpacing: 2.7)),
+      ],
+    ],
+  );
+}
 
 // Single-audit / one-zone view shows one remark; a combined batch shows
 // one per zone that has its own — the same split the web's on-screen

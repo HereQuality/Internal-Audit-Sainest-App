@@ -8,7 +8,11 @@
 
     <!-- Debug builds install next to the Play Store app (applicationIdSuffix ".debug" in app/build.gradle.kts),
          so they get their own launcher name to tell the two icons apart. -->
+    <!-- usesCleartextTraffic: a debug build may talk to the local server over plain http
+         (API_BASE_URL set to http://MAC-IP:5001/api/v1 via dart-define); Android 9+ blocks that otherwise.
+         Debug only: the release build keeps the default (https only). -->
     <application
         android:label="Q Audit360 (dev)"
+        android:usesCleartextTraffic="true"
         tools:replace="android:label" />
 </manifest>

@@ -270,64 +270,50 @@ void main() {
     });
   });
 
-  group('the Calendar keeps Me for everybody', () {
-    test('a Full Access user: the shared scope is All Members, the Calendar asks for just me', () {
+  // The web Calendar dropped `fullAccessDefault: false` once it began loading only the month on screen (commit 43f63e5), so a
+  // Full Access user opens it on the whole organisation like every other page — and the phone Calendar, which now asks for
+  // the month on screen too (CalendarWindow), follows the same scope as every other screen.
+  group('the Calendar follows the account\'s scope like every other screen', () {
+    test('a Full Access user: the shared scope is All Members and so is the Calendar\'s', () {
       final p = trio(fullAccess: true).audits;
       expect(p.filterParams, isNull);
-      expect(p.calendarTeamScope, isFalse);
-      expect(p.calendarFilterParams, {'employeeIds': 'me'});
-      // Its own badge: Me is the Calendar's resting state.
-      expect(p.activeFilterCountFor(status: false, flag: false, calendar: true), 0);
-    });
-
-    test('it widens only when All Members was picked on the Calendar, and Me ends that', () {
-      final p = trio(fullAccess: true).audits;
-      p.calendarAllMembers = true;
-      expect(p.calendarTeamScope, isTrue);
       expect(p.calendarFilterParams, isNull);
-      expect(p.activeFilterCountFor(status: false, flag: false, calendar: true), 1);
-
-      p.setFilterState(isTeam: false); // Me, from anywhere
-      expect(p.calendarAllMembers, isFalse);
-      expect(p.calendarFilterParams, {'employeeIds': 'me'});
-      p.setFilterState(isTeam: true); // All Members from another screen is not a Calendar pick
-      expect(p.calendarTeamScope, isFalse);
+      expect(p.activeFilterCountFor(status: false, flag: false), 0, reason: 'the default itself is not an active filter');
     });
 
-    test('Me picked elsewhere is the Calendar\'s default too, not an active filter there', () {
+    test('Me picked (anywhere) narrows it, and is a real narrowing for a Full Access user', () {
       final p = trio(fullAccess: true).audits..setFilterState(isTeam: false);
-      expect(p.activeFilterCount, 1, reason: 'on the other screens it is a narrowing');
-      expect(p.activeFilterCountFor(status: false, flag: false, calendar: true), 0);
+      expect(p.calendarFilterParams, {'employeeIds': 'me'});
+      expect(p.activeFilterCountFor(status: false, flag: false), 1);
+      p.setFilterState(isTeam: true);
+      expect(p.calendarFilterParams, isNull);
     });
 
-    test('Clear (resetScope) puts the account default back and the Calendar widening off', () async {
-      final p = trio(fullAccess: true).audits..calendarAllMembers = true;
+    test('Clear (resetScope) puts the account default back', () async {
+      final p = trio(fullAccess: true).audits..setFilterState(isTeam: false);
       await p.applyFilters(resetScope: true);
       expect(p.isTeamScope, isTrue);
-      expect(p.calendarAllMembers, isFalse);
-      expect(p.calendarFilterParams, {'employeeIds': 'me'});
+      expect(p.calendarFilterParams, isNull);
     });
 
-    test('an ordinary employee is exactly as before: the Calendar follows the shared scope', () {
+    test('an ordinary employee is exactly as before: Me, and the Calendar follows the shared scope', () {
       final p = trio(fullAccess: false).audits;
       expect(p.calendarFilterParams, {'employeeIds': 'me'});
       p.setFilterState(isTeam: true);
-      expect(p.calendarTeamScope, isTrue);
       expect(p.calendarFilterParams, isNull);
-      expect(p.activeFilterCountFor(status: false, flag: false, calendar: true), 1);
+      expect(p.activeFilterCountFor(status: false, flag: false), 1);
     });
 
-    test('its own requests use the Calendar scope while every other request keeps the shared one', () async {
+    test('the Calendar\'s requests carry the same scope as every other request — and never the Date range', () async {
       final t = trio(fullAccess: true);
+      t.audits.setFilterState(dateRange: (DateTime(2026, 10, 1), DateTime(2026, 10, 31)));
       await Future.wait([t.audits.fetchCalendarAudits(), t.audits.fetchMyAudits(), t.ncs.fetchCalendarNcs()]);
 
       final mine = adapter.where('GET', ApiConstants.myAudits).toList();
-      // Both audit fetches hit /audits/mine: the Calendar's own asks for me, the list for everyone.
-      expect(mine.map((r) => r.queryParameters['employeeIds']), unorderedEquals(['me', null]));
-      expect(
-        adapter.where('GET', ApiConstants.ncsMine).single.queryParameters,
-        {'employeeIds': 'me'},
-      );
+      // Both audit fetches hit /audits/mine for everyone; only the list (not the Calendar) carries the range.
+      expect(mine.map((r) => r.queryParameters['employeeIds']), [null, null]);
+      expect(mine.where((r) => r.queryParameters.containsKey('fromDate')), hasLength(1));
+      expect(adapter.where('GET', ApiConstants.ncsMine).single.queryParameters, isEmpty);
     });
   });
 
@@ -538,78 +524,60 @@ void main() {
       await tester.pumpAndSettle();
     }
 
-    testWidgets('opens on Me for a Full Access user while every other screen is on All Members', (tester) async {
+    testWidgets('opens on All Members for a Full Access user, like every other screen (and like the web Calendar)', (tester) async {
       final t = await mountCalendar(tester, fullAccess: true);
 
-      expect(auditIds(), {'me'});
-      expect(calendarNcIds(), {'me'});
+      expect(auditIds(), {null});
+      expect(calendarNcIds(), {null});
       expect(t.audits.isTeamScope, isTrue);
       expect(t.audits.filterParams, isNull);
-      expect(find.text('Clear'), findsNothing, reason: 'the Calendar\'s resting state is not an active filter');
-      expect(t.audits.activeFilterCountFor(status: false, flag: false, calendar: true), 0);
+      expect(find.text('Clear'), findsNothing, reason: 'the account\'s default is not an active filter');
+      expect(t.audits.activeFilterCountFor(status: false, flag: false), 0);
     });
 
-    testWidgets('its sheet opens on Me, and Apply without touching the scope changes nothing anywhere', (tester) async {
+    testWidgets('its sheet opens on All Members, and Apply without touching the scope changes nothing anywhere', (tester) async {
       final t = await mountCalendar(tester, fullAccess: true);
       await openFilters(tester);
-      expect(chip(tester, 'Me').selected, isTrue);
-      expect(chip(tester, 'All Members').selected, isFalse);
+      expect(chip(tester, 'All Members').selected, isTrue);
+      expect(chip(tester, 'Me').selected, isFalse);
 
       forget();
       await apply(tester);
       for (final p in all(t)) {
-        expect(p.isTeamScope, isTrue, reason: 'the other screens keep their All Members default');
+        expect(p.isTeamScope, isTrue);
         expect(p.filterParams, isNull);
-        expect(p.calendarAllMembers, isFalse);
       }
-      // The Audits list reloads on All Members (no employeeIds), the Calendar's own list on Me.
-      expect(auditIds(), {null, 'me'});
-      expect(calendarNcIds(), {'me'});
+      expect(auditIds(), {null});
+      expect(calendarNcIds(), {null});
       expect(find.text('Clear'), findsNothing);
     });
 
-    testWidgets('All Members picked on the Calendar widens it (and only it); Me, or Clear, narrows it again', (tester) async {
+    testWidgets('Me picked on the Calendar narrows it (it is the shared scope, so every screen follows); Clear returns to the default', (tester) async {
       final t = await mountCalendar(tester, fullAccess: true);
 
       await openFilters(tester);
-      await tester.tap(find.widgetWithText(ChoiceChip, 'All Members'));
-      await tester.pumpAndSettle();
-      forget();
-      await apply(tester);
-
-      expect(t.audits.calendarAllMembers, isTrue);
-      expect(auditIds(), {null});
-      expect(calendarNcIds(), {null});
-      // The Calendar's own bar now says so, and offers Clear.
-      expect(find.text('All Members'), findsOneWidget);
-      expect(find.text('Clear'), findsOneWidget);
-
-      // Me again on the Calendar: only the Calendar narrows, the app-wide default stays.
-      await openFilters(tester);
-      expect(chip(tester, 'All Members').selected, isTrue);
       await tester.tap(find.widgetWithText(ChoiceChip, 'Me'));
       await tester.pumpAndSettle();
       forget();
       await apply(tester);
-      expect(t.audits.calendarAllMembers, isFalse);
-      expect(t.audits.isTeamScope, isTrue);
-      expect(auditIds(), {null, 'me'});
-      expect(calendarNcIds(), {'me'});
-      expect(find.text('Clear'), findsNothing);
 
-      // And Clear after a widening returns to the Calendar's Me.
-      await openFilters(tester);
-      await tester.tap(find.widgetWithText(ChoiceChip, 'All Members'));
-      await tester.pumpAndSettle();
-      await apply(tester);
-      expect(t.audits.calendarAllMembers, isTrue);
+      for (final p in all(t)) {
+        expect(p.isTeamScope, isFalse);
+      }
+      expect(auditIds(), {'me'});
+      expect(calendarNcIds(), {'me'});
+      // The Calendar's own bar now says so, and offers Clear.
+      expect(find.text('Me'), findsOneWidget);
+      expect(find.text('Clear'), findsOneWidget);
+
       forget();
       await tester.tap(find.text('Clear'));
       await tester.pumpAndSettle();
-      expect(t.audits.calendarAllMembers, isFalse);
-      expect(t.audits.isTeamScope, isTrue);
-      expect(auditIds(), {null, 'me'});
-      expect(calendarNcIds(), {'me'});
+      for (final p in all(t)) {
+        expect(p.isTeamScope, isTrue);
+      }
+      expect(auditIds(), {null});
+      expect(calendarNcIds(), {null});
       expect(find.text('Clear'), findsNothing);
     });
 

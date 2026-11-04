@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -34,6 +36,13 @@ const repeatMinCounts = [2, 3, 4, 5, 10];
 /// lists each NC behind it — its id, raised date, audit, who raised it and who
 /// it is against, flag and status — and tapping an NC opens its read-only thread.
 ///
+/// A search box (placeholder "Search checkpoint or location...", like the web tab's) narrows the
+/// groups on the SERVER: GET /ncs/repeats?search= matches the checkpoint wording, the location
+/// name or the department name, case-insensitively, `total` counts the matching groups and a
+/// group's own count is never narrowed. It is debounced like the Audits and NCs tabs' search,
+/// starts the list over from its first page, is remembered with the tab's other state, and goes
+/// into the tab's Excel (its request and its "Filters applied" line).
+///
 /// The groups load ONE page (30) at a time: the next page is appended by itself as
 /// the tab scrolls near its end (a small spinner at the foot; "Try again" when a
 /// page failed) until the server's total is on screen.
@@ -49,6 +58,10 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
 
   late final ListScreenMemory _saved;
   late final ScrollController _scroll;
+  late final TextEditingController _searchController;
+  // The search goes to the server once typing pauses (it changes on every key).
+  Timer? _searchDebounce;
+  static const _searchDelay = Duration(milliseconds: 400);
   // Accordion: the key of the ONE group that is open.
   String? _openKey;
   // The NCs behind each opened group, by `key|ids` so a group whose NCs changed
@@ -68,8 +81,10 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
     _saved = context.read<ListViewMemory>().screen(_memoryId);
     _openKey = _saved.extra['open'] as String?;
     _scroll = ScrollController(initialScrollOffset: _saved.scroll)..addListener(_onScroll);
-    // Before the host's first load: the request must carry the remembered pick.
+    _searchController = TextEditingController(text: _saved.search);
+    // Before the host's first load: the request must carry the remembered pick and search.
     final p = context.read<NcProvider>();
+    p.repeatsSearch = _saved.search;
     final min = _saved.extra['min'];
     if (min is int && repeatMinCounts.contains(min)) {
       p.repeatsMinCount = min;
@@ -79,6 +94,8 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
+    _searchController.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -122,6 +139,28 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
     _saved.extra['open'] = null;
     final p = context.read<NcProvider>();
     p.repeatsMinCount = n;
+    p.fetchRepeats();
+  }
+
+  // The search goes to the server (GET /ncs/repeats?search=) so the list, its count and its
+  // Excel all describe the same groups; debounced, it changes on every keystroke.
+  void _onSearch(String v) {
+    _saved.search = v;
+    setState(() {});
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(v.isEmpty ? Duration.zero : _searchDelay, () {
+      if (mounted) _applySearch();
+    });
+  }
+
+  // Page 1 again under the new search (fetchRepeats always starts from the first page).
+  void _applySearch() {
+    final p = context.read<NcProvider>();
+    // Spaces around the words are not a different search.
+    if (p.repeatsSearch.trim() == _saved.search.trim()) return;
+    _saved.extra['open'] = null;
+    setState(() => _openKey = null);
+    p.repeatsSearch = _saved.search;
     p.fetchRepeats();
   }
 
@@ -199,6 +238,31 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline, fontSize: 11.5),
               ),
             ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: TextField(
+                key: const ValueKey('repeats-search'),
+                controller: _searchController,
+                textInputAction: TextInputAction.search,
+                onChanged: _onSearch,
+                decoration: InputDecoration(
+                  isDense: true,
+                  prefixIcon: const Icon(Icons.search, size: 20),
+                  hintText: 'Search checkpoint or location...',
+                  suffixIcon: _searchController.text.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear, size: 18),
+                          tooltip: 'Clear search',
+                          onPressed: () {
+                            _searchController.clear();
+                            _onSearch('');
+                          },
+                        ),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+              ),
+            ),
             if (showLoading)
               SizedBox(height: MediaQuery.of(context).size.height * 0.4, child: const AppLoading())
             else if (showError)
@@ -209,12 +273,27 @@ class _RepeatedNcsTabState extends State<RepeatedNcsTab> {
             else if (rows.isEmpty)
               SizedBox(
                 height: MediaQuery.of(context).size.height * 0.4,
-                child: EmptyState(
-                  icon: Icons.repeat_rounded,
-                  title: 'No repeats in this window',
-                  subtitle:
-                      'No checkpoint has been raised ${p.repeatsMinCount}+ times at the same place.',
-                ),
+                child: p.repeatsSearch.trim().isNotEmpty
+                    // Names the search, so an empty list is not mistaken for "no repeats at all".
+                    ? EmptyState(
+                        icon: Icons.filter_alt_off_outlined,
+                        title: 'No repeated checkpoints match "${p.repeatsSearch.trim()}"',
+                        subtitle: 'Try another word of the checkpoint or the place, or lower "Min. times".',
+                        action: OutlinedButton.icon(
+                          onPressed: () {
+                            _searchController.clear();
+                            _onSearch('');
+                          },
+                          icon: const Icon(Icons.clear),
+                          label: const Text('Clear search'),
+                        ),
+                      )
+                    : EmptyState(
+                        icon: Icons.repeat_rounded,
+                        title: 'No repeats in this window',
+                        subtitle:
+                            'No checkpoint has been raised ${p.repeatsMinCount}+ times at the same place.',
+                      ),
               )
             else
               Padding(

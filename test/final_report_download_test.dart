@@ -560,6 +560,339 @@ void main() {
     });
   });
 
+  group('Download All', () {
+    FinalReportRequest ncsPart() => const FinalReportRequest(
+      tab: FinalReportTab.ncs,
+      listQuery: {'employeeIds': 'me', 'severity': 'Major', 'bucket': 'overdue', 'search': 'guard'},
+      statsQuery: {'employeeIds': 'me', 'severity': 'Major', 'search': 'guard', 'omitIds': '1'},
+      filters: [('Flag', 'Major')],
+    );
+    FinalReportRequest repeatsPart() => const FinalReportRequest(
+      tab: FinalReportTab.repeats,
+      listQuery: {'minCount': 3, 'fromDate': '2026-05-03', 'search': 'floor'},
+      filters: [('Search', '"floor"'), ('Minimum repeats', '3+ times at the same place')],
+      minCount: 3,
+    );
+    FinalReportAllRequest allRequest() => FinalReportAllRequest(
+      audits: auditsRequest(),
+      ncs: ncsPart(),
+      repeats: repeatsPart(),
+      generatedBy: 'Asha',
+    );
+
+    /// One fake server for the three tabs' endpoints; every request is logged in order.
+    ReportJsonGet server({
+      required List<String> log,
+      int audits = 120,
+      int ncs = 130,
+      Future<dynamic> Function(String path, Map<String, dynamic> q)? override,
+    }) {
+      final auditRows = [for (var i = 0; i < audits; i++) audit(i)];
+      final ncRows = [for (var i = 0; i < ncs; i++) nc(i)];
+      final repeatGroups = [
+        {'key': 'k1', 'title': 'Wet floor', 'locationName': 'Plant 1', 'count': 2, 'openCount': 1, 'firstDate': '2026-07-01', 'lastDate': '2026-09-01', 'latestStatus': 'Raised', 'ncIds': ['r2', 'r1']},
+      ];
+      return (path, q) async {
+        log.add(path);
+        final custom = await override?.call(path, q);
+        if (custom != null) return custom;
+        switch (path) {
+          case ApiConstants.auditsReportStats:
+            return {'isOk': true, 'data': {'percentage': 80, 'totalAudits': audits}};
+          case ApiConstants.auditsReport:
+            return {
+              'isOk': true,
+              'data': {'audits': auditRows.skip(((q['page'] as int) - 1) * 100).take(100).toList(), 'total': audits, 'page': q['page'], 'limit': 100},
+            };
+          case ApiConstants.ncsReportStats:
+            return {'isOk': true, 'data': {'total': ncs, 'overdue': ncs}};
+          case ApiConstants.ncsReport:
+            return {
+              'isOk': true,
+              'data': {'ncs': ncRows.skip(((q['page'] as int) - 1) * 100).take(100).toList(), 'total': ncs, 'page': q['page'], 'limit': 100},
+            };
+          case ApiConstants.ncsRepeats:
+            return {
+              'isOk': true,
+              'data': {'rows': repeatGroups, 'total': 1, 'page': 1, 'limit': 100},
+            };
+          default:
+            return {
+              'isOk': true,
+              'data': [
+                {...nc(0), '_id': 'r1', 'ncId': 'NC-r1', 'startDate': '2026-07-01'},
+                {...nc(0), '_id': 'r2', 'ncId': 'NC-r2', 'startDate': '2026-09-01'},
+              ],
+            };
+        }
+      };
+    }
+
+    bool isAudits(String p) => p == ApiConstants.auditsReport || p == ApiConstants.auditsReportStats;
+    bool isNcs(String p) => p == ApiConstants.ncsReport || p == ApiConstants.ncsReportStats;
+
+    test('reads the three parts ONE AFTER THE OTHER — Audits, then NCs, then Repeated NCs — never together', () async {
+      final log = <String>[];
+      final inner = server(log: log);
+      var inFlight = 0;
+      var partsInFlight = 0;
+      var maxParts = 0;
+      final live = <String, int>{};
+      Future<dynamic> get(String path, Map<String, dynamic> q) async {
+        final part = isAudits(path) ? 'a' : isNcs(path) ? 'n' : 'r';
+        live[part] = (live[part] ?? 0) + 1;
+        inFlight++;
+        partsInFlight = live.values.where((v) => v > 0).length;
+        maxParts = maxParts > partsInFlight ? maxParts : partsInFlight;
+        await Future<void>.delayed(const Duration(milliseconds: 3));
+        try {
+          return await inner(path, q);
+        } finally {
+          live[part] = live[part]! - 1;
+          inFlight--;
+        }
+      }
+
+      final build = await downloader(get).runAll(allRequest());
+      expect(inFlight, 0);
+      expect(maxParts, 1, reason: 'two parts were being read at the same time');
+      final lastAudit = log.lastIndexWhere(isAudits);
+      final firstNc = log.indexWhere(isNcs);
+      final lastNc = log.lastIndexWhere(isNcs);
+      final firstRepeat = log.indexWhere((p) => !isAudits(p) && !isNcs(p));
+      expect(lastAudit, lessThan(firstNc));
+      expect(lastNc, lessThan(firstRepeat));
+      // 120 reports = 2 pages, 130 NCs = 2 pages.
+      expect(log.where((p) => p == ApiConstants.auditsReport), hasLength(2));
+      expect(log.where((p) => p == ApiConstants.ncsReport), hasLength(2));
+      expect(build.rowCount, 120 + 130 + 1);
+    });
+
+    test('each part is read under ITS OWN tab\'s query, frozen at the tap', () async {
+      final calls = <({String path, Map<String, dynamic> query})>[];
+      final inner = server(log: []);
+      Future<dynamic> get(String path, Map<String, dynamic> q) {
+        calls.add((path: path, query: q));
+        return inner(path, q);
+      }
+
+      final request = allRequest();
+      await downloader(get).runAll(request);
+      for (final c in calls.where((c) => c.path == ApiConstants.auditsReport)) {
+        expect(c.query['status'], 'Overdue');
+        expect(c.query['search'], 'press');
+        expect(c.query.containsKey('bucket'), isFalse);
+      }
+      for (final c in calls.where((c) => c.path == ApiConstants.ncsReport)) {
+        expect(c.query['bucket'], 'overdue');
+        expect(c.query['severity'], 'Major');
+        expect(c.query['search'], 'guard');
+      }
+      final repeats = calls.singleWhere((c) => c.path == ApiConstants.ncsRepeats);
+      expect(repeats.query['minCount'], 3);
+      expect(repeats.query['fromDate'], '2026-05-03');
+      expect(repeats.query['search'], 'floor');
+      expect(calls.singleWhere((c) => c.path == ApiConstants.ncsReportStats).query['omitIds'], '1');
+      expect(calls.singleWhere((c) => c.path == ApiConstants.auditsReportStats).query['status'], 'Overdue');
+    });
+
+    test('the progress line names the part being read, and "Building" comes once, at the very end', () async {
+      final progress = <ExportProgress>[];
+      await downloader(server(log: []), progress: progress).runAll(allRequest());
+      final texts = progress.map((p) => p.text).toList();
+      expect(texts, contains('Audits — 100 of 120 reports'));
+      expect(texts, contains('Audits — 120 of 120 reports'));
+      expect(texts, contains('NCs — 100 of 130 NCs'));
+      expect(texts, contains('NCs — 130 of 130 NCs'));
+      expect(texts, contains('Repeated NCs — 1 of 1 repeated checkpoints'));
+      expect(texts, contains('Repeated NCs — 2 of 2 NCs in those checkpoints'));
+      // Parts come in order, and each line carries its part.
+      final parts = [for (final p in progress) if (!p.building) p.part];
+      expect(parts.first, 'Audits');
+      expect(parts.last, 'Repeated NCs');
+      expect(parts.indexOf('NCs'), greaterThan(parts.lastIndexOf('Audits')));
+      expect(parts.indexOf('Repeated NCs'), greaterThan(parts.lastIndexOf('NCs')));
+      expect(parts.every((p) => p.isNotEmpty), isTrue);
+      // "Building the Excel file…" once, last — not between the parts.
+      expect(progress.where((p) => p.building), hasLength(1));
+      expect(progress.last.building, isTrue);
+    });
+
+    test('folds the three parts into ONE workbook: one Summary, then the tabs\' sheets, named for the day', () async {
+      final build = await downloader(server(log: [])).runAll(allRequest());
+      expect(build.spec.filename, 'Final-Report-All-2026-11-03');
+      expect(build.spec.sheets.map((s) => s.name), [
+        'Summary',
+        'Audits', 'Audits By Location', 'Audits By Auditor', 'Audits By Auditee',
+        'NCs', 'NCs By Location', 'NCs By Auditor', 'NCs By Auditee',
+        'Repeated Checkpoints', 'Repeat NC Details', 'Repeats By Location', 'Repeats By Auditor', 'Repeats By Auditee',
+      ]);
+      expect((build.spec.sheet('Audits')! as ReportDataSheet).rows, hasLength(120));
+      expect((build.spec.sheet('NCs')! as ReportDataSheet).rows, hasLength(130));
+      expect((build.spec.sheet('Repeat NC Details')! as ReportDataSheet).rows, hasLength(2));
+      expect(build.spec.generatedBy, 'Asha');
+      // The Search the Repeated NCs part carries is in the file, led by its tab.
+      expect(build.spec.filters, contains(('Repeated NCs · Search', '"floor"')));
+      expect(build.spec.filters, contains(('Repeated NCs · Minimum repeats', '3+ times at the same place')));
+    });
+
+    test('if ANY part fails the whole download fails — and nothing after it is read', () async {
+      final log = <String>[];
+      final ncsDown = server(log: log, override: (path, q) async {
+        if (path == ApiConstants.ncsReport) throw httpError(path, 403, message: 'No access to the NCs.');
+        return null;
+      });
+      await expectLater(
+        downloader(ncsDown).runAll(allRequest()),
+        throwsA(isA<ReportExportException>().having((e) => e.message, 'message', 'No access to the NCs.')),
+      );
+      expect(log.any((p) => p == ApiConstants.ncsRepeats), isFalse, reason: 'the Repeated NCs part must not even start');
+
+      // The LAST part failing loses the first two too: no file with a part missing.
+      final repeatsDown = server(log: [], override: (path, q) async {
+        if (path == ApiConstants.ncsRepeats) throw offline(path);
+        return null;
+      });
+      await expectLater(
+        downloader(repeatsDown).runAll(allRequest()),
+        throwsA(isA<ReportExportException>().having((e) => e.message, 'message', 'Could not reach the server. Check your connection and try again.')),
+      );
+
+      // The FIRST part failing: nothing else is asked.
+      final log2 = <String>[];
+      final auditsDown = server(log: log2, override: (path, q) async {
+        if (path == ApiConstants.auditsReport) throw httpError(path, 500);
+        return null;
+      });
+      await expectLater(downloader(auditsDown).runAll(allRequest()), throwsA(isA<ReportExportException>()));
+      expect(log2.any(isNcs), isFalse);
+    });
+
+    test('a page of a part that fails once is asked again — each part retries like its own tab does', () async {
+      var failed = false;
+      var ncPage2 = 0;
+      final inner = server(log: []);
+      Future<dynamic> get(String path, Map<String, dynamic> q) async {
+        if (path == ApiConstants.ncsReport && q['page'] == 2) {
+          ncPage2++;
+          if (!failed) {
+            failed = true;
+            throw offline(path);
+          }
+        }
+        return inner(path, q);
+      }
+
+      final build = await downloader(get).runAll(allRequest());
+      expect(build.rowCount, 251);
+      expect(ncPage2, 2);
+    });
+
+    test('cancelling at any point stops it: nothing further is read', () async {
+      // During the NCs part.
+      final log = <String>[];
+      final token = ExportCancelToken();
+      final dl = FinalReportDownloader(
+        get: server(log: log),
+        cancel: token,
+        retryDelays: noWait,
+        onProgress: (p) {
+          if (p.part == 'NCs' && !p.building && p.done >= 100) token.cancel();
+        },
+      );
+      await expectLater(dl.runAll(allRequest()), throwsA(isA<ExportCancelled>()));
+      expect(log.any((p) => p == ApiConstants.ncsRepeats), isFalse);
+
+      // During the very first part.
+      final log2 = <String>[];
+      final token2 = ExportCancelToken();
+      final dl2 = FinalReportDownloader(
+        get: server(log: log2),
+        cancel: token2,
+        retryDelays: noWait,
+        onProgress: (p) {
+          if (p.part == 'Audits' && !p.building) token2.cancel();
+        },
+      );
+      await expectLater(dl2.runAll(allRequest()), throwsA(isA<ExportCancelled>()));
+      expect(log2.any(isNcs), isFalse);
+
+      // During the last (Repeated NCs) part, between its two requests.
+      final token3 = ExportCancelToken();
+      final dl3 = FinalReportDownloader(
+        get: server(log: []),
+        cancel: token3,
+        retryDelays: noWait,
+        onProgress: (p) {
+          if (p.part == 'Repeated NCs' && p.noun == 'repeated checkpoints') token3.cancel();
+        },
+      );
+      await expectLater(dl3.runAll(allRequest()), throwsA(isA<ExportCancelled>()));
+    });
+
+    test('a part whose tiles could not be loaded still goes in, and the file and the warnings say which', () async {
+      final noTiles = server(log: [], override: (path, q) async {
+        if (path == ApiConstants.ncsReportStats) throw httpError(path, 500);
+        return null;
+      });
+      final build = await downloader(noTiles).runAll(allRequest());
+      expect(build.warnings, ['NCs: $statsMissingNote']);
+      final summary = build.spec.sheet('Summary')! as ReportSummarySheet;
+      expect(summary.notes, contains('NCs: $statsMissingNote'));
+      expect(summary.tileGroups.map((g) => g.title), isNot(contains('NCs — NC overview')));
+      expect(summary.tileGroups.map((g) => g.title), contains('Audits — Audit overview'));
+    });
+
+    test('an empty result in every part still builds the whole workbook', () async {
+      final build = await downloader(server(log: [], audits: 0, ncs: 0, override: (path, q) async {
+        if (path == ApiConstants.ncsRepeats) {
+          return {
+            'isOk': true,
+            'data': {'rows': <Object>[], 'total': 0, 'page': 1, 'limit': 100},
+          };
+        }
+        return null;
+      })).runAll(allRequest());
+      expect(build.rowCount, 0);
+      expect(build.spec.sheets, hasLength(14));
+    });
+
+    test('the combined file\'s warnings travel with the service result and its name is Final-Report-All-…', () async {
+      final events = <String>[];
+      final svc = FinalReportExportService(
+        getter: (cancel) => server(log: []),
+        encode: (spec) async {
+          events.add('encode ${spec.sheets.length} sheets');
+          return Uint8List.fromList([1, 2]);
+        },
+        sharer: _FakeSharer(events),
+        retryDelays: noWait,
+      );
+      final result = await svc.exportAll(allRequest(), shareOrigin: const Rect.fromLTWH(1, 2, 3, 4));
+      expect(result.fileName, matches(RegExp(r'^Final-Report-All-\d{4}-\d{2}-\d{2}\.xlsx$')));
+      expect(result.rowCount, 251);
+      expect(events, ['encode 14 sheets', 'share ${result.fileName} 2 bytes']);
+    });
+
+    test('a failing part leaves nothing to write or share', () async {
+      final events = <String>[];
+      final svc = FinalReportExportService(
+        getter: (cancel) => server(log: [], override: (path, q) async {
+          if (path == ApiConstants.ncsRepeats) throw httpError(path, 500);
+          return null;
+        }),
+        encode: (spec) async {
+          events.add('encode');
+          return Uint8List.fromList([1]);
+        },
+        sharer: _FakeSharer(events),
+        retryDelays: noWait,
+      );
+      await expectLater(svc.exportAll(allRequest()), throwsA(isA<ReportExportException>()));
+      expect(events, isEmpty);
+    });
+  });
+
   group('ExportProgress', () {
     test('says what is counted, a fraction for the bar, and builds', () {
       const p = ExportProgress(noun: 'NCs', done: 120, total: 340);
@@ -571,6 +904,12 @@ void main() {
       expect(const ExportProgress.building().text, 'Building the Excel file…');
       expect(const ExportProgress.building().fraction, isNull);
       expect(const ExportProgress(noun: 'NCs', done: 500, total: 340).fraction, 1.0);
+      // In "Download All" the line names the part being read.
+      expect(const ExportProgress(noun: 'reports', done: 120, total: 340, part: 'Audits').text, 'Audits — 120 of 340 reports');
+      expect(const ExportProgress(noun: 'NCs', done: 12, part: 'NCs').text, 'NCs — 12 NCs');
+      expect(const ExportProgress(part: 'Repeated NCs').text, 'Repeated NCs — preparing…');
+      expect(const ExportProgress(noun: 'NCs', done: 1, total: 2).forPart('NCs').text, 'NCs — 1 of 2 NCs');
+      expect(const ExportProgress.building().forPart('NCs').text, 'Building the Excel file…');
     });
   });
 

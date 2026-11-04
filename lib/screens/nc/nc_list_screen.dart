@@ -19,6 +19,7 @@ import '../../widgets/max_width_scroll.dart';
 import '../../widgets/nc_page_footer.dart';
 import '../../widgets/report_tiles.dart';
 import '../../widgets/status_badge.dart';
+import 'audits_at_location_tab.dart';
 import 'nc_response_screen.dart';
 import 'nc_review_screen.dart';
 
@@ -134,7 +135,8 @@ class _NcListScreenState extends State<NcListScreen>
       return _NcListBody(raised: true, initialStatusFilter: widget.initialStatusFilter);
     }
     if (widget.mode == NcListMode.auditeeOnly) {
-      return _NcListBody(raised: false, initialStatusFilter: widget.initialStatusFilter);
+      // The Auditee's NCs, and next to them the audits scheduled at their places.
+      return _AuditeeNcHost(initialStatusFilter: widget.initialStatusFilter);
     }
     return Column(
       children: [
@@ -155,6 +157,133 @@ class _NcListScreenState extends State<NcListScreen>
           ),
         ),
       ],
+    );
+  }
+}
+
+/// The auditee side of the NC screen: two views of the same page, "NCs" (the NCs raised
+/// against me — [_NcListBody]) and "Audit at My Location" (every audit scheduled at my
+/// places — [AuditsAtLocationTab]), as on the web Auditee dashboard's `?view=location`.
+///
+/// Not a TabBarView: its horizontal swipe would swallow the drag that moves the shell
+/// to the next tab. Both views stay mounted (IndexedStack) so each keeps its scroll
+/// position; the second is built only once it is first opened, so an auditee who never
+/// opens it never asks the server for it. The view picked is remembered in
+/// ListViewMemory; a dashboard tile jump (initialStatusFilter) is always about NCs.
+class _AuditeeNcHost extends StatefulWidget {
+  final String? initialStatusFilter;
+
+  const _AuditeeNcHost({this.initialStatusFilter});
+
+  @override
+  State<_AuditeeNcHost> createState() => _AuditeeNcHostState();
+}
+
+class _AuditeeNcHostState extends State<_AuditeeNcHost> {
+  static const _memoryId = 'nc-against-view';
+
+  late final ListScreenMemory _saved;
+  late int _view;
+  late bool _locationOpened;
+
+  @override
+  void initState() {
+    super.initState();
+    _saved = context.read<ListViewMemory>().screen(_memoryId);
+    if (widget.initialStatusFilter != null) _saved.tab = 0;
+    _view = _saved.tab == 1 ? 1 : 0;
+    _locationOpened = _view == 1;
+  }
+
+  void _select(int view) {
+    if (view == _view) return;
+    // A search box focused on the view being left must not follow to the next.
+    FocusManager.instance.primaryFocus?.unfocus();
+    _saved.tab = view;
+    setState(() {
+      _view = view;
+      if (view == 1) _locationOpened = true;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        _ViewSwitch(selected: _view, labels: const ['NCs', 'Audit at My Location'], onSelected: _select),
+        Expanded(
+          child: IndexedStack(
+            index: _view,
+            children: [
+              _NcListBody(raised: false, initialStatusFilter: widget.initialStatusFilter),
+              if (_locationOpened) AuditsAtLocationTab(active: _view == 1) else const SizedBox.shrink(),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// A two-way tab strip. A real TabBar fixes a tab's height at one line of text, so a
+/// long label ("Audit at My Location") on a 320 px phone — or at a large text size —
+/// would spill; these segments grow with their text instead and keep a 48 px touch area.
+class _ViewSwitch extends StatelessWidget {
+  final int selected;
+  final List<String> labels;
+  final ValueChanged<int> onSelected;
+
+  const _ViewSwitch({required this.selected, required this.labels, required this.onSelected});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: scheme.outlineVariant)),
+      ),
+      // IntrinsicHeight: the segments stretch to the tallest one (a label that wraps to two lines at a
+      // large text size) inside a Column that gives no height bound.
+      child: IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (var i = 0; i < labels.length; i++)
+              Expanded(
+                child: Semantics(
+                  button: true,
+                  selected: i == selected,
+                  inMutuallyExclusiveGroup: true,
+                  child: InkWell(
+                    key: ValueKey('nc-view-$i'),
+                    onTap: () => onSelected(i),
+                    child: Container(
+                      constraints: const BoxConstraints(minHeight: 48),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(
+                            color: i == selected ? scheme.primary : Colors.transparent,
+                            width: 3,
+                          ),
+                        ),
+                      ),
+                      child: Text(
+                        labels[i],
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: i == selected ? FontWeight.w700 : FontWeight.w500,
+                          color: i == selected ? scheme.primary : scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }

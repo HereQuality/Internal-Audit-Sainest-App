@@ -1,6 +1,7 @@
 import '../core/utils/audit_status.dart';
 import '../models/audit_detail_model.dart';
 import '../models/nc_report_model.dart' show NcBucket;
+import '../models/self_audit.dart';
 import 'report_sections.dart';
 import 'report_sheet_spec.dart';
 
@@ -176,9 +177,13 @@ String _namesOf(Object? list) => [for (final e in _asList(list)) _nameOf(e)].whe
 String _distinctNames(Iterable<String> values) => <String>{...values.where((v) => v.isNotEmpty)}.join(', ');
 
 /// `auditeeIds` (plural) is the source of truth; `auditeeId` only a fallback for an older record.
+/// A self audit (the auditor conducted it without the auditee, models/self_audit.dart) says "Self".
 String auditeesOf(Map a) {
   final many = _namesOf(a['auditeeIds']);
-  return many.isNotEmpty ? many : _nameOf(a['auditeeId']);
+  if (many.isNotEmpty) return many;
+  final one = _nameOf(a['auditeeId']);
+  if (one.isNotEmpty) return one;
+  return a['selfAudit'] == true ? kSelfLabel : '';
 }
 
 String _placeName(Object? l) {

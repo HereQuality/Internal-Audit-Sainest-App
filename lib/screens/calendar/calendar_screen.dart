@@ -1,106 +1,129 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../../core/theme/app_colors.dart';
 import '../../core/utils/audit_date_range.dart';
-import '../../core/utils/audit_status.dart';
+import '../../core/utils/calendar_entries.dart';
+import '../../core/utils/calendar_window.dart';
+import '../../models/audit_model.dart';
+import '../../models/nc_model.dart';
 import '../../providers/audits_provider.dart';
 import '../../providers/filter_options_provider.dart';
 import '../../providers/list_view_memory.dart';
 import '../../providers/nc_provider.dart';
 import '../../widgets/app_loading.dart';
+import '../../widgets/calendar_day_agenda.dart';
+import '../../widgets/calendar_layers.dart';
+import '../../widgets/empty_state.dart';
 import '../../widgets/filter_sheet.dart';
 import '../../widgets/month_calendar.dart';
 import '../audits/audit_detail_screen.dart';
 import '../nc/nc_response_screen.dart';
 import '../nc/nc_review_screen.dart';
 
-/// The single calendar both Auditor and Auditee mode push from
-/// app_shell.dart's app-bar calendar icon — mirrors the web app's own
-/// Calendar.jsx, which fetches and shows the exact same four categories
-/// for EVERY role rather than splitting them across role-specific views:
-/// this used to be two separate screens (auditor_calendar_screen.dart /
-/// auditee_calendar_screen.dart) each showing a different partial subset
-/// (auditor: only its own audits, all one status color; auditee: only NCs
-/// raised against it + others' audits at its own location, never its own
-/// audits) — which is exactly why the two stopped matching each other and
-/// drifted from the web page they were both meant to mirror. One shared
-/// implementation, fetching all three sources unconditionally regardless
-/// of AppMode, is what keeps that from happening again.
+/// The single calendar both Auditor and Auditee mode push from app_shell.dart's
+/// app-bar calendar icon — the phone's twin of the web Calendar.jsx. One shared
+/// implementation, fetching all three sources whatever the AppMode, is what keeps
+/// the role-specific copies it replaced (each showing a different partial subset)
+/// from drifting apart again.
 ///
-///   - Non-Conformance (red) — NcProvider.calendarNcs, one dot per
-///     NcModel#targetDate, tap to respond (still "Raised") or review.
-///   - Audit (coloured by status: Not Started slate, In Progress blue,
-///     Overdue red, NC Response Pending amber, NC Verification Pending
-///     violet, Total Closed teal) — AuditsProvider.calendarAudits (this employee's
-///     own, as auditor), coloured and labelled by AuditModel#displayLabel,
-///     expanded across every day in AuditModel#scheduledDate..
-///     scheduledEndDate via daysInAuditRange. Note red and blue are also
-///     the Non-Conformance / Audit at Your Location layers' colours; the
-///     day list under the grid names each event's status, which is what
-///     tells them apart.
-///   - Audit at Your Location (blue) — AuditsProvider.auditsAtMyLocation,
-///     someone ELSE scheduled to audit one of this employee's own
-///     locations. Deduped against `audits` above (same id showing as both
-///     "mine" and "at my location" — this employee audits their own
-///     location plenty) so nothing plots twice, once as a status dot and
-///     once blue — mirrors Calendar.jsx's own myAuditIds/isOthers filter.
+/// Three LAYERS, each a switch with its own icon (the same icon sits on its day
+/// markers and its cards), remembered in [ListViewMemory] with the month on screen:
 ///
-/// The Filters button in this screen's AppBar is the same shared filter
-/// state every other audit surface uses (providers/audit_filter_scope.dart)
-/// plus one thing only this screen offers: a Month picker, requested by
-/// passing a non-null `month` into showAuditFilterSheet. Month is purely a
-/// VIEW concern — it scrolls the grid, it is never sent to the server (the
-/// audit endpoints hand back the whole scheduled range and always have;
-/// the calendar simply shows one month of it at a time). Everything else
-/// in the sheet is applied to every filter-holding provider (Audits,
-/// Dashboard, NC), so the calendar and the lists never describe different
-/// populations. The exception is what this screen cannot show or clear —
-/// Status, Include skipped and Flag: the calendar reads its OWN audit and NC
-/// lists (AuditsProvider.calendarAudits / NcProvider.calendarNcs), fetched
-/// with the shared filters minus those three, so a pick made on the Audits or
-/// NC screen never silently narrows the calendar (web's Calendar has none of
-/// them either).
+///   - My audits — AuditsProvider.calendarAudits (GET /audits/mine, this
+///     employee as auditor), drawn in the colour of the audit's unified status
+///     (Not Started slate, In Progress blue, Overdue red, NC Response Pending
+///     amber, NC Verification Pending violet, Total Closed teal — the legend under
+///     the switches), on every day of its scheduledDate..scheduledEndDate.
+///   - Audit at My Location — AuditsProvider.calendarAtMyLocation (GET
+///     /audits/at-my-location): every audit at this employee's places, whoever
+///     audits, with WHO IS COMING on its card. An audit that is also in "My
+///     audits" is ONE entry that belongs to both layers (the web's
+///     atMyLocationIds): plotted once, counted and switched under each.
+///   - My NCs — NcProvider.calendarNcs (GET /ncs/mine): each NC on the day it was
+///     raised and on its due date, with the same Respond / Review actions as the
+///     NC list.
+///
+/// What is loaded is the month on screen and its neighbours
+/// ([CalendarWindow.around]) — the web asks for its 42-day grid the same way — and
+/// again once the grid leaves it. A failed read is SAID, with Retry, instead of
+/// leaving an empty month that looks like "nothing scheduled".
+///
+/// The Filters button is the same shared filter state every other audit surface
+/// uses (providers/audit_filter_scope.dart) — including the Me / All Members scope,
+/// so a Full Access user opens on the whole organisation exactly as on the web
+/// Calendar — plus one thing only this screen offers: a Month picker. Month is
+/// purely a VIEW concern. There is NO Date range here, as
+/// on the web (its month grid is the date filter): a range picked on another screen
+/// no longer hides audits from this calendar. Status, Include skipped and Flag are
+/// not offered either — the calendar reads its OWN lists (calendarAudits / calendarNcs),
+/// fetched with the shared filters minus those, so a pick made on the Audits or NC
+/// screen never silently narrows it.
 class CalendarScreen extends StatefulWidget {
-  const CalendarScreen({super.key});
+  const CalendarScreen({super.key, this.clock});
+
+  /// What "now" is — only a test overrides it.
+  @visibleForTesting
+  final DateTime Function()? clock;
 
   @override
   State<CalendarScreen> createState() => _CalendarScreenState();
 }
 
 class _CalendarScreenState extends State<CalendarScreen> {
-  /// The month on screen. Owned here rather than solely inside
-  /// MonthCalendar because the filter sheet has to OPEN on it (and can set
-  /// it), while the grid's own chevrons also move it — see MonthCalendar's
-  /// visibleMonth/onVisibleMonthChanged pair, which is what keeps this
-  /// field and the grid's internal cursor from drifting apart.
+  /// The month on screen (the 1st). Owned here rather than inside the grid
+  /// because the filter sheet has to OPEN on it and can set it.
   late DateTime _visibleMonth;
+
+  /// The day whose agenda is listed under the grid.
+  late DateTime _selectedDay;
+
+  /// The layers switched on.
+  late Set<CalendarLayer> _layers;
 
   /// Whether the very first fetch of all three sources has finished.
   ///
-  /// The alternative — inferring "still cold" from empty lists — misreads
-  /// a legitimately empty result (a filter that matches nothing, a brand
-  /// new account) as "still loading" and parks a full-screen spinner over
-  /// an answer that has already arrived. See build() for how this gates
-  /// the spinner.
+  /// The alternative — inferring "still cold" from empty lists — misreads a
+  /// legitimately empty result (a filter that matches nothing, a brand new
+  /// account) as "still loading" and parks a full-screen spinner over an answer
+  /// that has already arrived.
   bool _hasCompletedFirstLoad = false;
 
   late final AuditsProvider _audits;
   late final NcProvider _ncs;
 
+  final ScrollController _scroll = ScrollController();
+  final GlobalKey _agendaKey = GlobalKey();
+
+  // The entries built from the providers' lists, kept while those lists are the
+  // same objects: a day tap or a layer switch rebuilds the screen but not the data.
+  List<AuditModel> _memoMine = const [];
+  List<AuditModel> _memoLocation = const [];
+  List<NcModel> _memoNcs = const [];
+  String? _memoSelf;
+  List<CalendarEntry> _memoEntries = const [];
+
+  DateTime get _now => widget.clock?.call() ?? DateTime.now();
+  DateTime get _today => dayOnly(_now);
+
   @override
   void initState() {
     super.initState();
-    // The month on screen survives a remount (role switch, shell rebuild) —
-    // held in ListViewMemory, which logout wipes.
-    final remembered = context
-        .read<ListViewMemory>()
-        .screen('calendar')
-        .extra['visibleMonth'];
-    final now = DateTime.now();
+    // The month on screen, the day, and the layers survive a remount (role switch,
+    // shell rebuild) — held in ListViewMemory, which logout wipes.
+    final extra = context.read<ListViewMemory>().screen('calendar').extra;
+    final remembered = extra['visibleMonth'];
+    final now = _now;
     _visibleMonth = remembered is DateTime
-        ? remembered
+        ? DateTime(remembered.year, remembered.month, 1)
         : DateTime(now.year, now.month, 1);
+    final rememberedDay = extra['selectedDay'];
+    final grid = CalendarWindow.gridOf(_visibleMonth);
+    _selectedDay = rememberedDay is DateTime &&
+            !dayOnly(rememberedDay).isBefore(grid.from) &&
+            !dayOnly(rememberedDay).isAfter(grid.to)
+        ? dayOnly(rememberedDay)
+        : _selectionForMonth(_visibleMonth);
+    _layers = _readLayers(extra['layers']);
     // This screen has its own audit + NC lists (no Status / Include skipped /
     // Flag filter here) — flagging it in use makes filter changes made from
     // ANY screen reload them too while it is open.
@@ -113,27 +136,109 @@ class _CalendarScreenState extends State<CalendarScreen> {
   void dispose() {
     _audits.calendarInUse = false;
     _ncs.calendarInUse = false;
+    _scroll.dispose();
     super.dispose();
   }
 
-  void _setVisibleMonth(DateTime month) {
-    setState(() => _visibleMonth = month);
-    context.read<ListViewMemory>().screen('calendar').extra['visibleMonth'] =
-        month;
+  /// Today if it is in [month] (overwhelmingly the day you want, and it matches
+  /// where the screen opens), otherwise the 1st — a stable landing spot.
+  DateTime _selectionForMonth(DateTime month) {
+    final today = _today;
+    return today.year == month.year && today.month == month.month
+        ? today
+        : DateTime(month.year, month.month, 1);
   }
 
-  /// All three sources at once — awaited together only so the first-load
-  /// flag flips once, when there is genuinely nothing left in flight,
+  /// Anything not remembered as off is on (the web's pickLayers).
+  static Set<CalendarLayer> _readLayers(Object? remembered) {
+    if (remembered is! Map) return {...CalendarLayer.values};
+    return {
+      for (final layer in CalendarLayer.values)
+        if (remembered[layer.name] != false) layer,
+    };
+  }
+
+  ListScreenMemory get _memory => context.read<ListViewMemory>().screen('calendar');
+
+  void _remember() {
+    final extra = _memory.extra;
+    extra['visibleMonth'] = _visibleMonth;
+    extra['selectedDay'] = _selectedDay;
+    extra['layers'] = {for (final layer in CalendarLayer.values) layer.name: _layers.contains(layer)};
+  }
+
+  void _setVisibleMonth(DateTime month, {DateTime? select}) {
+    final first = DateTime(month.year, month.month, 1);
+    setState(() {
+      _visibleMonth = first;
+      _selectedDay = select ?? _selectionForMonth(first);
+    });
+    _remember();
+    // Only asks again once the grid leaves what was loaded.
+    final have = _audits.calendarWindow;
+    if (have == null || !have.covers(CalendarWindow.forGrid(first))) {
+      _loadAll();
+    }
+  }
+
+  void _stepMonth(int delta) =>
+      _setVisibleMonth(DateTime(_visibleMonth.year, _visibleMonth.month + delta, 1));
+
+  void _goToday() {
+    final today = _today;
+    _setVisibleMonth(DateTime(today.year, today.month, 1), select: today);
+    if (_scroll.hasClients) {
+      _scroll.animateTo(0, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+    }
+  }
+
+  Future<void> _pickMonth() async {
+    final picked = await showCalendarMonthPicker(context, month: _visibleMonth);
+    if (picked != null && mounted) _setVisibleMonth(picked);
+  }
+
+  void _toggleLayer(CalendarLayer layer) {
+    setState(() {
+      _layers = _layers.contains(layer) ? ({..._layers}..remove(layer)) : {..._layers, layer};
+    });
+    _remember();
+  }
+
+  void _selectDay(DateTime day) {
+    setState(() => _selectedDay = day);
+    _remember();
+    // On a short phone the agenda starts below the fold: bring it up so a tap on a day
+    // visibly answers.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final agenda = _agendaKey.currentContext;
+      if (!mounted || agenda == null || !_scroll.hasClients) return;
+      final box = agenda.findRenderObject();
+      if (box is! RenderBox || !box.attached) return;
+      final top = box.localToGlobal(Offset.zero).dy;
+      if (top > MediaQuery.sizeOf(context).height * 0.62) {
+        Scrollable.ensureVisible(
+          agenda,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+          alignment: 0.2,
+        );
+      }
+    });
+  }
+
+  /// The month's window on all three sources — awaited together only so the
+  /// first-load flag flips once, when there is genuinely nothing left in flight,
   /// rather than after whichever fetch happens to land first.
   Future<void> _loadAll() async {
-    final ncProvider = context.read<NcProvider>();
-    final auditsProvider = context.read<AuditsProvider>();
+    final window = CalendarWindow.around(_visibleMonth);
+    _audits.setCalendarWindow(window);
+    _ncs.setCalendarWindow(window);
     await Future.wait([
-      ncProvider.fetchCalendarNcs(),
-      auditsProvider.fetchCalendarAudits(),
-      auditsProvider.fetchAuditsAtMyLocation(),
+      _ncs.fetchCalendarNcs(),
+      _audits.fetchCalendarAudits(),
+      _audits.fetchCalendarAtMyLocation(),
     ]);
-    if (!mounted) {
+    if (!mounted || _hasCompletedFirstLoad) {
       return;
     }
     setState(() => _hasCompletedFirstLoad = true);
@@ -141,29 +246,27 @@ class _CalendarScreenState extends State<CalendarScreen> {
 
   Future<void> _openFilters() async {
     final audits = context.read<AuditsProvider>();
-    // The Calendar's OWN scope: Me for everybody, a Full Access user included
-    // (it loads unpaginated data — web's `fullAccessDefault: false`), until
-    // All Members is picked here. The sheet therefore opens on what the
-    // calendar really shows, not on the app-wide All Members default.
+    // The same Me / All Members scope as every other screen (a Full Access user opens
+    // on the whole organisation here as on the web Calendar).
     final initial = AuditFilterSelection.fromScope(
       audits,
       // A non-null month is what makes the sheet show its Month section at
       // all — this is the only screen that passes it, because it is the only
       // one whose content is laid out by month.
       month: _visibleMonth,
-      calendar: true,
     );
     final result = await showAuditFilterSheet(
       context,
       initial: initial,
-      // Status/flag don't apply to the month grid; a date range does.
+      // Neither Status/Flag nor a Date range applies to the month grid (the grid IS
+      // the date filter, as on the web).
+      showDateRange: false,
     );
     // Dismissed without applying — leave every dimension exactly as it was.
     if (result == null || !mounted) {
       return;
     }
-    // Month first and locally: it never reaches the server, it just moves
-    // the grid (and flows down into MonthCalendar.visibleMonth).
+    // Month first and locally: it never reaches the server, it just moves the grid.
     if (result.month != null) {
       _setVisibleMonth(DateTime(result.month!.year, result.month!.month, 1));
     }
@@ -173,44 +276,64 @@ class _CalendarScreenState extends State<CalendarScreen> {
     // Pushed to every filter-holding provider (Audits, Dashboard, NC): the
     // filters are one shared state across the app, so the calendar and the
     // lists never describe different populations.
-    //
-    // The one thing that is NOT simply copied over is Me / All Members, which
-    // here is measured against the Calendar's own resting state (Me): leaving
-    // it untouched must not hand the other screens a Me that the user never
-    // picked (a Full Access user's app-wide default is All Members), and a Me
-    // picked on the Calendar after All Members only ends the calendar's own
-    // widening — it does not narrow a Full Access user's other screens.
-    final scopeChanged = result.isTeam != initial.isTeam;
-    final keepShared =
-        !scopeChanged || (!result.isTeam && audits.defaultTeamScope);
-    await applyAuditFilterSelection(
-      context,
-      keepShared ? result.copyWith(isTeam: audits.isTeamScope) : result,
-      // Only an explicit scope pick made here moves the calendar's flag.
-      calendarAllMembers: scopeChanged ? result.isTeam : null,
-    );
+    await applyAuditFilterSelection(context, result);
   }
 
-  /// Back to the resting state — the account's default scope everywhere else
-  /// (the Calendar itself returns to Me), every location and type — on both
-  /// providers, for the same reason _openFilters applies to both. The
-  /// visible month deliberately survives a Clear: it is a view position,
-  /// not a filter, and yanking the user back to the current month while
-  /// they are reading November is not what "clear filters" promises.
+  /// Back to the resting state — the account's default scope, every location and
+  /// type — on both providers, for the same reason _openFilters applies to both.
+  /// The visible month deliberately survives a Clear: it is a view position, not a filter.
   Future<void> _clearFilters() {
-    // Keeps any Status / Flag pick: this screen doesn't offer them, so a
-    // "Clear" here must not wipe something the user can't see.
+    // Keeps any Status / Flag / Date range pick: this screen doesn't offer them, so
+    // a "Clear" here must not wipe something the user can't see.
     final audits = context.read<AuditsProvider>();
     return applyAuditFilterSelection(
       context,
       AuditFilterSelection(
-        // The account's default scope (and the calendar's All Members flag off).
+        // The account's default scope.
         resetScope: true,
+        dateFrom: audits.dateFrom,
+        dateTo: audits.dateTo,
         statuses: audits.statusFilter,
         includeSkipped: audits.includeSkipped,
         flags: audits.flagFilter,
       ),
     );
+  }
+
+  void _openAudit(String auditId) {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => AuditDetailScreen(auditId: auditId)),
+    );
+  }
+
+  /// Respond to an NC waiting for my answer, review one waiting for a decision —
+  /// the same two screens the NC list opens. Another person's NC that is still
+  /// waiting for their answer (All Members) is only viewed.
+  void _openNc(NcModel nc) {
+    final selfId = _audits.selfEmployeeId;
+    final route = CalendarNcCard.canRespond(nc, selfId)
+        ? MaterialPageRoute<void>(builder: (_) => NcResponseScreen(nc: nc))
+        : MaterialPageRoute<void>(builder: (_) => NcReviewScreen(nc: nc, readOnly: nc.status == 'Raised'));
+    Navigator.of(context).push(route);
+  }
+
+  List<CalendarEntry> _entriesFor(AuditsProvider audits, NcProvider ncs) {
+    if (!identical(_memoMine, audits.calendarAudits) ||
+        !identical(_memoLocation, audits.calendarAtMyLocation) ||
+        !identical(_memoNcs, ncs.calendarNcs) ||
+        _memoSelf != audits.selfEmployeeId) {
+      _memoMine = audits.calendarAudits;
+      _memoLocation = audits.calendarAtMyLocation;
+      _memoNcs = ncs.calendarNcs;
+      _memoSelf = audits.selfEmployeeId;
+      _memoEntries = buildCalendarEntries(
+        myAudits: audits.calendarAudits,
+        atMyLocation: audits.calendarAtMyLocation,
+        ncs: ncs.calendarNcs,
+        selfEmployeeId: audits.selfEmployeeId,
+      );
+    }
+    return _memoEntries;
   }
 
   @override
@@ -224,36 +347,35 @@ class _CalendarScreenState extends State<CalendarScreen> {
     // Any of the three sources refetching — after a filter change that is
     // all three at once (both providers' refetchForFilters reload the
     // calendar's own NC and audit lists while this screen is open).
-    final isBusy =
-        ncProvider.isLoadingCalendarNcs ||
+    final isBusy = ncProvider.isLoadingCalendarNcs ||
         auditsProvider.isLoadingCalendarAudits ||
-        auditsProvider.isLoadingAtMyLocation;
+        auditsProvider.isLoadingCalendarAtMyLocation;
 
-    final hasAnythingToShow =
-        ncProvider.calendarNcs.isNotEmpty ||
+    final hasAnythingToShow = ncProvider.calendarNcs.isNotEmpty ||
         auditsProvider.calendarAudits.isNotEmpty ||
-        auditsProvider.auditsAtMyLocation.isNotEmpty;
+        auditsProvider.calendarAtMyLocation.isNotEmpty;
 
-    // A full-screen spinner is only ever right on a genuinely cold start:
-    // nothing on screen yet AND the first pass over all three sources
-    // still unfinished.
-    //
-    // This used to be an AND across all six "loading AND list still empty"
-    // conditions, which happened to behave sensibly only because a refetch
-    // always ran with the PREVIOUS filter's rows still sitting in the
-    // lists. Filters break that assumption: a filter that legitimately
-    // matches nothing empties all three lists, and the next refetch after
-    // it would have blanked the whole calendar to a spinner. Gating on the
-    // first-load flag instead means every later fetch keeps the grid — and
-    // the month the user navigated to — on screen, with the hairline
-    // progress bar above it as the only signal; flashing a spinner over
-    // the calendar on every filter tweak costs the user their place for
-    // the sake of a few hundred milliseconds. It also covers the frame
-    // before initState's post-frame callback has even fired (isBusy is
-    // still false there), which otherwise shows one frame of empty grid.
+    // A full-screen spinner is only ever right on a genuinely cold start: nothing
+    // on screen yet AND the first pass over all three sources still unfinished.
+    // Gating on the first-load flag (not on "the lists are empty") means a filter
+    // that legitimately matches nothing never blanks the calendar to a spinner, and
+    // every later fetch keeps the grid — and the month the user navigated to — on
+    // screen, with the hairline progress bar above it as the only signal. It also
+    // covers the frame before initState's post-frame callback has even fired.
     final showColdStartSpinner = !_hasCompletedFirstLoad && !hasAnythingToShow;
 
-    final myAuditIds = auditsProvider.calendarAudits.map((a) => a.id).toSet();
+    final error = auditsProvider.calendarAuditsError ??
+        auditsProvider.calendarAtMyLocationError ??
+        ncProvider.calendarNcsError;
+    // Nothing to show AND a read failed: say so (an empty month would read as "nothing
+    // scheduled"). With data on screen the same failure is a banner above the grid.
+    final showFullError = _hasCompletedFirstLoad && !isBusy && error != null && !hasAnythingToShow;
+
+    final activeFilters = auditsProvider.activeFilterCountFor(
+      status: false,
+      date: false,
+      flag: false,
+    );
 
     return Scaffold(
       appBar: AppBar(
@@ -263,11 +385,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
           // being stretched to the full toolbar height by the actions Row.
           Center(
             child: FilterButton(
-              activeCount: auditsProvider.activeFilterCountFor(
-                status: false,
-                flag: false,
-                calendar: true,
-              ),
+              minHeight: 44,
+              activeCount: activeFilters,
               onTap: _openFilters,
             ),
           ),
@@ -277,12 +396,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (auditsProvider.activeFilterCountFor(
-                status: false,
-                flag: false,
-                calendar: true,
-              ) >
-              0)
+          if (activeFilters > 0)
             _ActiveFilterBar(
               labels: _activeFilterLabels(auditsProvider, filterOptions),
               onClear: _clearFilters,
@@ -291,125 +405,195 @@ class _CalendarScreenState extends State<CalendarScreen> {
           // doesn't shift down and snap back on every refetch.
           SizedBox(
             height: 2,
-            child: isBusy && !showColdStartSpinner
-                ? const LinearProgressIndicator(minHeight: 2)
-                : null,
+            child: isBusy && !showColdStartSpinner ? const LinearProgressIndicator(minHeight: 2) : null,
           ),
           Expanded(
             child: showColdStartSpinner
                 ? const AppLoading()
-                : MonthCalendar(
-                    visibleMonth: _visibleMonth,
-                    // The grid's own chevrons report back here so the next
-                    // filter-sheet open offers the month actually on
-                    // screen, not the one this screen opened on.
-                    onVisibleMonthChanged: _setVisibleMonth,
-                    legend: const _CalendarLegend(),
-                    events: [
-                      ...ncProvider.calendarNcs
-                          .where((nc) => nc.targetDate != null)
-                          .map(
-                            (nc) => CalendarEvent(
-                              date: nc.targetDate!,
-                              title: nc.title,
-                              subtitle: nc.status,
-                              color: AppColors.red,
-                              onTap: () => Navigator.of(context).push(
-                                MaterialPageRoute(
-                                  builder: (_) => nc.status == 'Raised'
-                                      ? NcResponseScreen(nc: nc)
-                                      : NcReviewScreen(nc: nc),
-                                ),
-                              ),
-                            ),
-                          ),
-                      ...auditsProvider.calendarAudits
-                          .where((a) => a.scheduledDate != null)
-                          .expand(
-                            (a) => daysInAuditRange(a).map(
-                              (day) => CalendarEvent(
-                                date: day,
-                                title: a.title,
-                                // Label and dot colour both follow the
-                                // audit's unified status (Overdue red,
-                                // NC Response Pending amber, ...), not the
-                                // old two-way Completed-green / else-amber
-                                // split that could not tell an overdue
-                                // audit from one due next week.
-                                subtitle: a.displayLabel,
-                                // readable(): the status tokens are tuned as
-                                // text on a light tint; as a bare dot on the
-                                // dark theme they would sink into the grid.
-                                color: AppColors.readable(
-                                  context,
-                                  AppColors.forAuditStatus(a.displayLabel),
-                                ),
-                                onTap: () => Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) =>
-                                        AuditDetailScreen(auditId: a.id),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                      // The blue layer answers a different question from
-                      // the status-coloured one, and the filters reach it
-                      // differently on purpose: AuditsProvider.refetch
-                      // ForFilters re-runs this list with the location and
-                      // audit-type params but NOT employeeIds, because
-                      // GET /audits/at-my-location is scoped by the
-                      // caller's own location membership (see audit.
-                      // controller.js#getAuditsAtMyLocation) — an
-                      // employeeIds there would mean nothing. So a people
-                      // filter narrows the status-coloured layer while blue
-                      // stays put, which is exactly right: "who is coming
-                      // to audit my location" was never a question about
-                      // the people you filtered to.
-                      //
-                      // The dedupe below still holds under filters, and
-                      // note what it now does: myAuditIds is the FILTERED
-                      // set, so an audit of mine that the current people
-                      // filter excludes drops out of the status dots and
-                      // reappears here in blue. That is the honest answer
-                      // — under a filter that isn't about me, that audit
-                      // genuinely is "someone else's audit at my
-                      // location". What it never does is plot twice.
-                      ...auditsProvider.auditsAtMyLocation
-                          .where(
-                            (a) =>
-                                a.scheduledDate != null &&
-                                !myAuditIds.contains(a.id),
-                          )
-                          .expand(
-                            (a) => daysInAuditRange(a).map(
-                              (day) => CalendarEvent(
-                                date: day,
-                                title: a.title,
-                                subtitle: a.auditorNames.isNotEmpty
-                                    ? 'Audit visit — ${a.auditorNames.join(', ')}'
-                                    : 'Audit visit at your location',
-                                color: AppColors.blue,
-                                onTap: () => Navigator.of(context).push(
-                                  MaterialPageRoute(
-                                    builder: (_) =>
-                                        AuditDetailScreen(auditId: a.id),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                    ],
-                    emptyDayBuilder: (context, _) => Center(
-                      child: Text(
-                        'Nothing due this day.',
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.outline,
-                        ),
-                      ),
+                : showFullError
+                ? ErrorState(message: error, onRetry: _loadAll)
+                : Align(
+                    alignment: Alignment.topCenter,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 720),
+                      child: _buildCalendar(context, auditsProvider, ncProvider, error),
                     ),
                   ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCalendar(BuildContext context, AuditsProvider audits, NcProvider ncs, String? error) {
+    final scheme = Theme.of(context).colorScheme;
+    final today = _today;
+    final entries = _entriesFor(audits, ncs);
+    final byDay = entriesByDay(entries, _layers);
+    final counts = CalendarMonthCounts.of(entries, _visibleMonth);
+    final dayEntries = byDay[_selectedDay] ?? const <CalendarEntry>[];
+    final hidden = entries.where((e) => e.day == _selectedDay && !e.shownIn(_layers)).length;
+    final showToday = _selectedDay != today || _visibleMonth.year != today.year || _visibleMonth.month != today.month;
+
+    return RefreshIndicator(
+      onRefresh: _loadAll,
+      child: CustomScrollView(
+        controller: _scroll,
+        physics: const AlwaysScrollableScrollPhysics(),
+        slivers: [
+          SliverPersistentHeader(
+            pinned: true,
+            delegate: _PinnedBarDelegate(
+              color: Theme.of(context).scaffoldBackgroundColor,
+              child: CalendarMonthBar(
+                month: _visibleMonth,
+                showToday: showToday,
+                onPrev: () => _stepMonth(-1),
+                onNext: () => _stepMonth(1),
+                onPick: _pickMonth,
+                onToday: _goToday,
+              ),
+            ),
+          ),
+          if (error != null)
+            SliverToBoxAdapter(
+              child: _CalendarNotice(
+                icon: Icons.cloud_off_outlined,
+                message: "Couldn't refresh the calendar. $error",
+                actionLabel: 'Retry',
+                onAction: _loadAll,
+              ),
+            ),
+          if (ncs.calendarNcsTruncated)
+            const SliverToBoxAdapter(
+              child: _CalendarNotice(
+                icon: Icons.info_outline,
+                message: 'Only the newest NCs are shown — narrow the filters to see the rest.',
+              ),
+            ),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+              child: CalendarLayerChips(on: _layers, counts: counts, onToggle: _toggleLayer),
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: CalendarMonthGrid(
+              month: _visibleMonth,
+              today: today,
+              selectedDay: _selectedDay,
+              byDay: byDay,
+              layers: _layers,
+              onSelect: _selectDay,
+              onPrev: () => _stepMonth(-1),
+              onNext: () => _stepMonth(1),
+            ),
+          ),
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+              child: CalendarStatusLegend(
+                showNotAttempted: entries.any((e) => e.isAudit && e.statusLabel == 'Not Attempted'),
+                showSkipped: entries.any((e) => e.isAudit && e.statusLabel == 'Skipped'),
+              ),
+            ),
+          ),
+          SliverToBoxAdapter(child: Divider(key: _agendaKey, height: 1, color: scheme.outlineVariant)),
+          SliverToBoxAdapter(
+            child: CalendarDayHeader(day: _selectedDay, today: today, shown: dayEntries.length, hidden: hidden),
+          ),
+          if (dayEntries.isEmpty)
+            SliverToBoxAdapter(
+              child: CalendarDayEmpty(allLayersOff: _layers.isEmpty, hidden: hidden, day: _selectedDay),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+              sliver: SliverList.separated(
+                itemCount: dayEntries.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 8),
+                itemBuilder: (_, i) => CalendarEntryCard(
+                  key: ValueKey('${_selectedDay.toIso8601String()}-${dayEntries[i].id}'),
+                  entry: dayEntries[i],
+                  today: today,
+                  layers: _layers,
+                  selfEmployeeId: audits.selfEmployeeId,
+                  onOpenAudit: _openAudit,
+                  onOpenNc: _openNc,
+                ),
+              ),
+            ),
+          const SliverToBoxAdapter(child: SizedBox(height: 16)),
+        ],
+      ),
+    );
+  }
+}
+
+/// A bar pinned under the app bar while the page scrolls, so the month can be
+/// changed from anywhere on it.
+class _PinnedBarDelegate extends SliverPersistentHeaderDelegate {
+  final Widget child;
+  final Color color;
+
+  const _PinnedBarDelegate({required this.child, required this.color});
+
+  static const double _extent = 56;
+
+  @override
+  double get minExtent => _extent;
+
+  @override
+  double get maxExtent => _extent;
+
+  @override
+  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Material(
+      color: color,
+      elevation: overlapsContent ? 2 : 0,
+      child: SizedBox(height: _extent, child: child),
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _PinnedBarDelegate oldDelegate) => true;
+}
+
+/// A one-line notice above the switches: a failed read (with Retry) or a note.
+class _CalendarNotice extends StatelessWidget {
+  final IconData icon;
+  final String message;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  const _CalendarNotice({required this.icon, required this.message, this.actionLabel, this.onAction});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: scheme.onErrorContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text(message, style: TextStyle(fontSize: 12.5, color: scheme.onErrorContainer)),
+            ),
+          ),
+          if (onAction != null)
+            TextButton(
+              onPressed: onAction,
+              style: TextButton.styleFrom(minimumSize: const Size(44, 44), foregroundColor: scheme.onErrorContainer),
+              child: Text(actionLabel ?? 'Retry'),
+            ),
         ],
       ),
     );
@@ -418,8 +602,8 @@ class _CalendarScreenState extends State<CalendarScreen> {
 
 /// One short label per narrowed dimension, in the same order the sheet
 /// lists them. Kept to counts past a single selection because this bar has
-/// exactly one line to spend — the month grid needs the rest of the height
-/// on a phone, and the sheet itself is one tap away for the detail.
+/// exactly one line to spend — the page needs the rest of the height on a
+/// phone, and the sheet itself is one tap away for the detail.
 List<String> _activeFilterLabels(
   AuditsProvider audits,
   FilterOptionsProvider options,
@@ -447,8 +631,10 @@ List<String> _activeFilterLabels(
         'people',
       ),
     );
-  } else if (audits.calendarTeamScope && audits.teamFilter.isEmpty) {
-    labels.add('All Members');
+  } else if (audits.teamFilter.isEmpty && audits.isTeamScope != audits.defaultTeamScope) {
+    // Only a scope that differs from the account's own default is a filter (Me for an employee,
+    // All Members for Full Access) — the same rule as every other screen's bar.
+    labels.add(audits.isTeamScope ? 'All Members' : 'Me');
   }
   if (audits.locationFilter.isNotEmpty) {
     labels.add(
@@ -470,7 +656,7 @@ List<String> _activeFilterLabels(
       ),
     );
   }
-  if (audits.hasDateFilter) labels.add('Date range');
+  // No "Date range": the calendar does not apply one (the month grid is its date filter).
   if (audits.auditTypeFilter.isNotEmpty) {
     // Audit types are filtered by NAME rather than id (models/audit_type_
     // option.dart explains why), so a single pick is already displayable
@@ -516,7 +702,7 @@ class _ActiveFilterBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Container(
-      height: 38,
+      height: 48,
       padding: const EdgeInsets.only(left: 12, right: 4),
       decoration: BoxDecoration(
         color: scheme.surfaceContainerLow,
@@ -558,92 +744,12 @@ class _ActiveFilterBar extends StatelessWidget {
           TextButton(
             onPressed: onClear,
             style: TextButton.styleFrom(
-              minimumSize: const Size(0, 30),
+              minimumSize: const Size(44, 44),
               padding: const EdgeInsets.symmetric(horizontal: 10),
               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
             ),
             child: const Text('Clear', style: TextStyle(fontSize: 12.5)),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-class _CalendarLegendEntry {
-  final String label;
-  final Color color;
-  // An audit-status dot: drawn through AppColors.readable, exactly like the
-  // events it labels (see the audit events above).
-  final bool isStatus;
-  const _CalendarLegendEntry(this.label, this.color, {this.isStatus = false});
-}
-
-// One dot per audit status an event can actually be drawn in. Delayed /
-// On-Time Completed are absent on purpose: they are a timeliness, never a
-// displayStatus (a finished audit is Total Closed or in an NC stage), so no
-// event ever takes their colour. Built from AppColors.forAuditStatus so the
-// legend cannot drift from the dots.
-final _legendEntries = [
-  const _CalendarLegendEntry('Non-Conformance', AppColors.red),
-  for (final status in const [
-    AuditStatus.notStarted,
-    AuditStatus.inProgress,
-    AuditStatus.overdue,
-    AuditStatus.ncResponsePending,
-    AuditStatus.ncVerificationPending,
-    AuditStatus.totalClosed,
-  ])
-    _CalendarLegendEntry(status, AppColors.forAuditStatus(status), isStatus: true),
-  const _CalendarLegendEntry('Audit at Your Location', AppColors.blue),
-];
-
-/// Same dot+label row as the web calendar's own legend (Calendar.jsx) —
-/// wraps onto a second line on a narrow phone rather than the single
-/// `d-flex flex-wrap` row web can afford at full width.
-///
-/// Deliberately static: it labels the four categories this screen can
-/// draw, not the ones currently on screen. A legend that dropped entries
-/// as a filter emptied them would make the colour scheme itself look like
-/// it changes between months, and would hide the fact that e.g. the blue
-/// layer is unaffected by a people filter.
-class _CalendarLegend extends StatelessWidget {
-  const _CalendarLegend();
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
-      child: Wrap(
-        spacing: 14,
-        runSpacing: 4,
-        children: [
-          for (final e in _legendEntries)
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 8,
-                  height: 8,
-                  margin: const EdgeInsets.only(right: 5),
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: e.isStatus
-                        ? AppColors.readable(context, e.color)
-                        : e.color,
-                  ),
-                ),
-                Text(
-                  e.label,
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    color: scheme.outline,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ],
-            ),
         ],
       ),
     );

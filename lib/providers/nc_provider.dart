@@ -9,6 +9,7 @@ import 'package:intl/intl.dart';
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
+import '../core/utils/calendar_window.dart';
 import '../core/utils/evidence_photo.dart';
 import '../models/nc_model.dart';
 import '../models/nc_report_model.dart';
@@ -104,6 +105,9 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     againstMeAll = [];
     againstMeAllInUse = false;
     calendarNcs = [];
+    calendarWindow = null;
+    calendarNcsError = null;
+    calendarNcsTruncated = false;
     calendarInUse = false;
     isLoadingCalendarNcs = false;
     raisedStats = null;
@@ -121,6 +125,7 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     repeatRows = [];
     repeatsTotal = 0;
     repeatsMinCount = 2;
+    repeatsSearch = '';
     repeatsError = null;
     repeatsMoreError = null;
     repeatsHasMore = false;
@@ -209,6 +214,24 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   bool calendarInUse = false;
   bool isLoadingCalendarNcs = false;
   List<NcModel> calendarNcs = [];
+
+  /// The days the Calendar's NCs were asked for (null = every NC, as before). An
+  /// NC sits on the grid on its DUE day and on the day it was RAISED, so a window
+  /// is two reads — dueFrom/dueTo and fromDate/toDate — merged by id, exactly as
+  /// the web Calendar does. Without a window the server's bare list is cut at its
+  /// newest 2000, which silently drops older NCs ([calendarNcsTruncated]).
+  CalendarWindow? calendarWindow;
+
+  /// Why the Calendar's NCs could not be read (null = fine); the NCs that were
+  /// showing stay, and the screen offers Retry.
+  String? calendarNcsError;
+
+  /// The server cut the answer short (it only ever does so without a window).
+  bool calendarNcsTruncated = false;
+
+  void setCalendarWindow(CalendarWindow? window) {
+    calendarWindow = window;
+  }
 
   /// NC Monitoring's six tiles (GET /ncs/raised/stats) under the same filters as
   /// [raisedByMe] — null until loaded or when the request failed (the tiles are
@@ -319,6 +342,12 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   /// loaded so far (paged — [repeatsTotal] is how many there are, [repeatsHasMore]
   /// whether a next page is left) and its state.
   int repeatsMinCount = 2;
+
+  /// The Repeated NCs tab's own search box — sent as `search` (the server matches the checkpoint
+  /// wording, the location name or the department name, case-insensitively, and `total` is the
+  /// number of matching groups; a group's own count is never narrowed). Set by the tab before it
+  /// reloads, like [repeatsMinCount].
+  String repeatsSearch = '';
   List<RepeatGroup> repeatRows = [];
   int repeatsTotal = 0;
   bool repeatsHasMore = false;
@@ -588,10 +617,13 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
   /// What GET /ncs/repeats takes. The server groups org-wide — who raised or
   /// received an NC never enters a group — so the people half of the shared
   /// filters (Me / All Members / Team / Members) is NOT sent; Location +
-  /// Department, Audit Type, Flag and Date are. With no date picked the tab looks
-  /// back six months, like the web's, and says so.
+  /// Department, Audit Type, Flag and Date are, and the tab's own search
+  /// ([repeatsSearch]). With no date picked the tab looks back six months, like
+  /// the web's, and says so.
   Map<String, dynamic> get repeatParams {
     final params = <String, dynamic>{'minCount': repeatsMinCount};
+    final search = repeatsSearch.trim();
+    if (search.isNotEmpty) params['search'] = search;
     if (locationFilter.isNotEmpty) params['locationIds'] = locationFilter.join(',');
     if (departmentFilter.isNotEmpty) params['departmentIds'] = departmentFilter.join(',');
     if (auditTypeFilter.isNotEmpty) params['auditType'] = auditTypeFilter.join(',');
@@ -846,16 +878,37 @@ class NcProvider extends ChangeNotifier with AuditFilterScope {
     isLoadingCalendarNcs = true;
     notifyListeners();
     try {
-      // The Calendar's own scope rule (Me for everybody unless All Members was
-      // picked on the Calendar) — see AuditFilterScope.calendarFilterParams.
-      final res = await _dio.get(ApiConstants.ncsMine, queryParameters: calendarFilterParams);
+      // The shared scope and filters, minus the Date range — see
+      // AuditFilterScope.calendarFilterParams.
+      final base = calendarFilterParams;
+      final window = calendarWindow;
+      final List<Response> answers;
+      if (window == null) {
+        answers = [await _dio.get(ApiConstants.ncsMine, queryParameters: base)];
+      } else {
+        final from = CalendarWindow.param(window.from);
+        final to = CalendarWindow.param(window.to);
+        answers = await Future.wait([
+          _dio.get(ApiConstants.ncsMine, queryParameters: {...?base, 'dueFrom': from, 'dueTo': to}),
+          _dio.get(ApiConstants.ncsMine, queryParameters: {...?base, 'fromDate': from, 'toDate': to}),
+        ]);
+      }
       if (stale()) return;
-      calendarNcs = (res.data['data'] as List? ?? [])
-          .whereType<Map>()
-          .map((e) => NcModel.fromJson(Map<String, dynamic>.from(e)))
-          .toList();
+      final seen = <String>{};
+      calendarNcs = [
+        for (final res in answers)
+          for (final e in (res.data['data'] as List? ?? []).whereType<Map>())
+            if (seen.add((e['_id'] ?? '').toString())) NcModel.fromJson(Map<String, dynamic>.from(e)),
+      ];
+      calendarNcsTruncated = answers.any((res) => res.data['truncated'] == true);
+      calendarNcsError = null;
     } catch (e, st) {
       debugPrint('NcProvider.fetchCalendarNcs: $e\n$st');
+      if (!stale()) {
+        calendarNcsError = e is DioException
+            ? extractErrorMessage(e, fallback: 'Could not load your NCs.')
+            : 'Could not read your NCs.';
+      }
     } finally {
       if (!stale()) {
         isLoadingCalendarNcs = false;

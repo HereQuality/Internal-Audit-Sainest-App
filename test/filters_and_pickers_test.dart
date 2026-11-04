@@ -6,6 +6,7 @@ import 'package:internal_audit_app/core/theme/app_theme.dart';
 import 'package:internal_audit_app/core/utils/report_stats.dart';
 import 'package:internal_audit_app/models/audit_model.dart';
 import 'package:internal_audit_app/models/employee_option.dart';
+import 'package:internal_audit_app/models/self_audit.dart';
 import 'package:internal_audit_app/providers/audits_provider.dart';
 import 'package:internal_audit_app/providers/auth_provider.dart';
 import 'package:internal_audit_app/providers/dashboard_provider.dart';
@@ -243,7 +244,7 @@ void main() {
 
     testWidgets('representative: search narrows, Confirm needs a pick and returns the ids', (tester) async {
       usePhone(tester);
-      List<String>? result;
+      RepresentativeChoice? result;
       await tester.pumpWidget(host((context) => TextButton(
         onPressed: () async => result = await showSelectRepresentativeSheet(context, employees: people),
         child: const Text('open'),
@@ -272,7 +273,8 @@ void main() {
       expect(find.text('Confirm (2)'), findsOneWidget);
       await tester.tap(find.byType(FilledButton));
       await tester.pumpAndSettle();
-      expect(result, ['sara', 'tom']);
+      expect(result?.isSelf, isFalse);
+      expect(result?.employeeIds, ['sara', 'tom']);
     });
 
     testWidgets('an already chosen representative arrives ticked', (tester) async {

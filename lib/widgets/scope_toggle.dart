@@ -17,8 +17,8 @@ import 'package:flutter/material.dart';
 /// an oversight role for whom "just me" opens nearly empty. It opens on All
 /// Members (AuditFilterScope.defaultTeamScope, set from the signed-in user by
 /// main.dart's _RootGate), exactly as the web does (useSelfScope.js); Me is
-/// still one tap away and is a real narrowing for them. The Calendar alone
-/// keeps Me for everybody (it loads unpaginated data).
+/// still one tap away and is a real narrowing for them. The Calendar follows
+/// the same rule (the web Calendar does since it loads only the month on screen).
 ///
 /// For everybody else this deliberately does NOT match the web app's
 /// TeamFilterPanel, whose own default was once "All". An earlier revision of

@@ -527,6 +527,12 @@ void main() {
         await tester.drag(list(), const Offset(0, -700));
         await tester.pumpAndSettle();
       }
+      // Built is not yet on screen (a lazy list builds a little past its edge): bring it into view, so a
+      // tap lands on it however tall the bars above the list are (the Excel bar sits there now).
+      if (target.evaluate().isNotEmpty) {
+        await tester.ensureVisible(target);
+        await tester.pumpAndSettle();
+      }
     }
 
     testWidgets('page 1 on open; Prev/Next turn the pages (a small pair on top, a bar at the foot), up to the server\'s total', (tester) async {

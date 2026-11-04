@@ -57,15 +57,46 @@ class FinalReportExportService {
     ExportCancelToken? cancel,
     ExportProgressCallback? onProgress,
     Rect? shareOrigin,
-  }) async {
+  }) {
     final token = cancel ?? ExportCancelToken();
-    final downloader = FinalReportDownloader(
-      get: _getter(token),
-      cancel: token,
-      onProgress: onProgress,
-      retryDelays: retryDelays ?? const [Duration(milliseconds: 600), Duration(milliseconds: 1800)],
+    return _finish(
+      token,
+      shareOrigin,
+      () => _downloader(token, onProgress).run(request),
     );
-    final build = await downloader.run(request);
+  }
+
+  /// "Download All": the three tabs' parts, one after the other, in ONE workbook
+  /// (`Final-Report-All-<yyyy-MM-dd>.xlsx`). Same rules as [export].
+  Future<FinalReportExportResult> exportAll(
+    FinalReportAllRequest request, {
+    ExportCancelToken? cancel,
+    ExportProgressCallback? onProgress,
+    Rect? shareOrigin,
+  }) {
+    final token = cancel ?? ExportCancelToken();
+    return _finish(
+      token,
+      shareOrigin,
+      () => _downloader(token, onProgress).runAll(request),
+    );
+  }
+
+  FinalReportDownloader _downloader(ExportCancelToken token, ExportProgressCallback? onProgress) =>
+      FinalReportDownloader(
+        get: _getter(token),
+        cancel: token,
+        onProgress: onProgress,
+        retryDelays: retryDelays ?? const [Duration(milliseconds: 600), Duration(milliseconds: 1800)],
+      );
+
+  // Read, write the file off the UI thread, open the share sheet.
+  Future<FinalReportExportResult> _finish(
+    ExportCancelToken token,
+    Rect? shareOrigin,
+    Future<FinalReportBuild> Function() read,
+  ) async {
+    final build = await read();
 
     token.throwIfCancelled();
     final Uint8List bytes;

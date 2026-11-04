@@ -140,6 +140,65 @@ Future<List<T>?> showMultiPickerSheet<T>(
   );
 }
 
+/// What [showMultiPickerWithAlt] returns: the ticked values (Confirm), or
+/// [alt] when the extra action under Confirm was tapped.
+class MultiPickerOutcome<T> {
+  final List<T> picked;
+  final bool alt;
+
+  const MultiPickerOutcome.picked(this.picked) : alt = false;
+
+  const MultiPickerOutcome.alt() : picked = const [], alt = true;
+}
+
+/// [showMultiPickerSheet] with one extra answer — a row labelled [altLabel] at
+/// the top of the list that closes the sheet and reports [alt]. For a required
+/// pick that has a legitimate "none of these" answer (the representative
+/// step's "Self"). It stays reachable when the list is empty and with the
+/// keyboard up; it scrolls with the list rather than adding a second button to
+/// the pinned footer, which left the list no room on a short screen at large
+/// text.
+Future<MultiPickerOutcome<T>?> showMultiPickerWithAlt<T>(
+  BuildContext context, {
+  required String title,
+  required List<PickerItem<T>> items,
+  required String altLabel,
+  String? altSublabel,
+  List<T> selected = const [],
+  String? subtitle,
+  String searchHint = 'Search',
+  int minSelected = 0,
+  String confirmLabel = 'Confirm',
+}) async {
+  final result = await showModalBottomSheet<Object>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: Colors.transparent,
+    constraints: const BoxConstraints(maxWidth: 640),
+    builder: (_) => _PickerBody<T>(
+      title: title,
+      subtitle: subtitle,
+      items: items,
+      multi: true,
+      initiallySelected: selected,
+      searchHint: searchHint,
+      minSelected: minSelected,
+      confirmLabel: confirmLabel,
+      altLabel: altLabel,
+      altSublabel: altSublabel,
+    ),
+  );
+  if (result is _PickerAlt) return const MultiPickerOutcome<Never>.alt();
+  if (result is List<T>) return MultiPickerOutcome<T>.picked(result);
+  return null;
+}
+
+/// Popped by the extra action of [showMultiPickerWithAlt].
+class _PickerAlt {
+  const _PickerAlt();
+}
+
 /// What a single-choice sheet returns: the picked [value], or [cleared]
 /// when the "clear" row was tapped.
 class PickerChoice<T> {
@@ -161,6 +220,8 @@ class _PickerBody<T> extends StatefulWidget {
   final String? clearLabel;
   final String? allLabel;
   final bool initiallyAll;
+  final String? altLabel;
+  final String? altSublabel;
 
   const _PickerBody({
     required this.title,
@@ -174,6 +235,8 @@ class _PickerBody<T> extends StatefulWidget {
     this.clearLabel,
     this.allLabel,
     this.initiallyAll = false,
+    this.altLabel,
+    this.altSublabel,
   });
 
   @override
@@ -330,7 +393,7 @@ class _PickerBodyState<T> extends State<_PickerBody<T>> {
                   ),
                 ),
               Flexible(
-                child: visible.isEmpty && widget.clearLabel == null
+                child: visible.isEmpty && widget.clearLabel == null && widget.altLabel == null
                     ? Padding(
                         padding: const EdgeInsets.symmetric(
                           vertical: 32,
@@ -381,6 +444,26 @@ class _PickerBodyState<T> extends State<_PickerBody<T>> {
                               multi: true,
                               onTap: _toggleAll,
                             ),
+                          // The extra answer ("Self") — in the scrolling list, not the pinned footer: a second
+                          // pinned button left the list no room on a short screen at large text with the keyboard up.
+                          if (widget.altLabel != null && _query.isEmpty)
+                            _PickerAltRow(
+                              label: widget.altLabel!,
+                              sublabel: widget.altSublabel,
+                              onTap: () => Navigator.of(context).pop(const _PickerAlt()),
+                            ),
+                          if (widget.altLabel != null && visible.isEmpty)
+                            Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 20),
+                              child: Text(
+                                widget.items.isEmpty
+                                    ? 'Nothing to pick from.'
+                                    : 'No matches for "${_query.trim()}".',
+                                textAlign: TextAlign.center,
+                                style: Theme.of(context).textTheme.bodyMedium
+                                    ?.copyWith(color: scheme.outline),
+                              ),
+                            ),
                           for (final item in visible)
                             _PickerRow(
                               label: item.label,
@@ -424,6 +507,59 @@ class _PickerBodyState<T> extends State<_PickerBody<T>> {
                 )
               else
                 SizedBox(height: media.padding.bottom + 8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The extra answer of [showMultiPickerWithAlt]: not a tickable row but an action, so it carries an arrow and a
+/// tinted band to read apart from the people under it.
+class _PickerAltRow extends StatelessWidget {
+  final String label;
+  final String? sublabel;
+  final VoidCallback onTap;
+
+  const _PickerAltRow({required this.label, required this.onTap, this.sublabel});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 56),
+          margin: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          decoration: BoxDecoration(
+            color: scheme.secondaryContainer.withValues(alpha: 0.5),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          child: Row(
+            children: [
+              Icon(Icons.person_off_outlined, color: scheme.onSecondaryContainer),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w700),
+                    ),
+                    if (sublabel != null && sublabel!.isNotEmpty)
+                      Text(
+                        sublabel!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.onSecondaryContainer),
+                      ),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, color: scheme.onSecondaryContainer),
             ],
           ),
         ),

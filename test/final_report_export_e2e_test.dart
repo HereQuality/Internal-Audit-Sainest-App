@@ -246,6 +246,105 @@ void main() {
     expect((book['Repeat NC Details'].cell(xl.CellIndex.indexByString('C6')).value as xl.IntCellValue).value, 2);
   });
 
+  test('Download All: the three tabs read one after the other and written as ONE workbook, read back from the shared file', () async {
+    final auditRows = [
+      for (var i = 0; i < 3; i++)
+        {
+          '_id': 'a$i', 'title': 'Audit $i', 'status': 'Completed', 'displayStatus': 'Total Closed', 'timeliness': 'On-Time Completed',
+          'auditorIds': [emp('Asha')], 'auditeeIds': [emp('Ravi')],
+          'locationIds': [{'_id': 'l1', 'name': 'Plant 1', 'code': 'P1'}],
+          'scoreResult': {'achieved': 8, 'maxPossible': 10, 'percentage': 80},
+        },
+    ];
+    final ncRows = [
+      for (var i = 0; i < 4; i++)
+        {
+          '_id': 'n$i', 'ncId': 'NC-$i', 'title': 'Guard $i', 'severity': 'Major', 'status': 'Raised', 'bucket': 'overdue', 'placeLabel': 'Plant 1',
+          'raisedByEmployeeId': emp('Asha'), 'auditeeEmployeeId': emp('Ravi'), 'startDate': '2026-09-01T00:00:00.000Z',
+        },
+    ];
+    final groups = [
+      {'key': 'k1', 'title': 'Wet floor', 'locationName': 'Plant 1', 'count': 2, 'openCount': 1, 'latestStatus': 'Raised', 'ncIds': ['r2', 'r1']},
+    ];
+    final order = <String>[];
+    adapter.handler = (o) async {
+      order.add(o.path);
+      switch (o.path) {
+        case ApiConstants.auditsReport:
+          return json(200, {'isOk': true, 'data': reportListData(auditRows, o.queryParameters)});
+        case ApiConstants.auditsReportStats:
+          return json(200, {'isOk': true, 'data': {'percentage': 80, 'totalAudits': 3, 'onTimeCompleted': 3}});
+        case ApiConstants.ncsReport:
+          return json(200, {
+            'isOk': true,
+            'data': {'ncs': ncRows, 'total': ncRows.length, 'page': 1, 'limit': 100},
+          });
+        case ApiConstants.ncsReportStats:
+          return json(200, {'isOk': true, 'data': {'total': 4, 'overdue': 4}});
+        case ApiConstants.ncsRepeats:
+          return json(200, {
+            'isOk': true,
+            'data': {'rows': groups, 'total': 1, 'page': 1, 'limit': 100},
+          });
+        case ApiConstants.ncsRepeatRows:
+          return json(200, {
+            'isOk': true,
+            'data': [
+              {'_id': 'r1', 'ncId': 'NC-r1', 'startDate': '2026-07-01', 'status': 'Closed', 'completionDate': '2026-07-09', 'auditId': {'_id': 'x', 'title': 'X'}, 'raisedByEmployeeId': emp('Asha'), 'auditeeEmployeeId': emp('Ravi')},
+              {'_id': 'r2', 'ncId': 'NC-r2', 'startDate': '2026-09-01', 'status': 'Raised', 'auditId': {'_id': 'y', 'title': 'Y'}, 'raisedByEmployeeId': emp('Bo'), 'auditeeEmployeeId': emp('Ravi')},
+            ],
+          });
+      }
+      return json(200, {'isOk': true, 'data': <Object>[]});
+    };
+    audits
+      ..setFilterState(isTeam: true, locations: ['l1'])
+      ..reportsStatus = 'Completed';
+    ncs
+      ..setFilterState(isTeam: true, locations: ['l1'], flags: ['Major'])
+      ..ncReportTileKeys = {'overdue'}
+      ..repeatsMinCount = 2
+      ..repeatsSearch = 'wet';
+
+    final request = buildFinalReportAllRequest(audits: audits, ncs: ncs, options: options, generatedBy: 'Asha Rao');
+    final progress = <ExportProgress>[];
+    final result = await FinalReportExportService().exportAll(request, onProgress: progress.add);
+
+    expect(result.rowCount, 3 + 4 + 1);
+    expect(result.fileName, matches(RegExp(r'^Final-Report-All-\d{4}-\d{2}-\d{2}\.xlsx$')));
+    // One part after the other.
+    bool isAudits(String p) => p == ApiConstants.auditsReport || p == ApiConstants.auditsReportStats;
+    bool isNcs(String p) => p == ApiConstants.ncsReport || p == ApiConstants.ncsReportStats;
+    expect(order.lastIndexWhere(isAudits), lessThan(order.indexWhere(isNcs)));
+    expect(order.lastIndexWhere(isNcs), lessThan(order.indexWhere((p) => !isAudits(p) && !isNcs(p))));
+    expect({for (final p in progress) if (!p.building) p.part}.toList(), ['Audits', 'NCs', 'Repeated NCs']);
+    // Each part asked under its own tab's filters, the search on the Repeated NCs request.
+    expect(adapter.where('GET', ApiConstants.auditsReport).single.queryParameters['status'], 'Completed');
+    expect(adapter.where('GET', ApiConstants.ncsReport).single.queryParameters['bucket'], 'overdue');
+    final repeats = adapter.where('GET', ApiConstants.ncsRepeats).single;
+    expect(repeats.uri.toString(), contains('search=wet'));
+    expect(repeats.queryParameters['minCount'], 2);
+
+    // The shared file reads back with the right sheets in the right order.
+    final book = await sharedWorkbook();
+    expect(book.tables.keys.toList(), [
+      'Summary',
+      'Audits', 'Audits By Location', 'Audits By Auditor', 'Audits By Auditee',
+      'NCs', 'NCs By Location', 'NCs By Auditor', 'NCs By Auditee',
+      'Repeated Checkpoints', 'Repeat NC Details', 'Repeats By Location', 'Repeats By Auditor', 'Repeats By Auditee',
+    ]);
+    expect(book['Audits'].maxRows, 4 + 3);
+    expect(book['NCs'].maxRows, 4 + 4);
+    expect(book['Repeat NC Details'].maxRows, 4 + 2);
+    final texts = [
+      for (final row in book['Summary'].rows)
+        for (final cell in row)
+          if (cell?.value is xl.TextCellValue) (cell!.value as xl.TextCellValue).value.text!,
+    ];
+    expect(texts, containsAll(['Repeated NCs · Search', '"wet"', 'Repeated NCs · Minimum repeats', 'NCs · Flag']));
+    expect(texts.where((t) => t == 'Location'), hasLength(1));
+  });
+
   test('a failed read leaves nothing to share, and says why', () async {
     adapter.handler = (o) async => json(403, {'isOk': false, 'message': 'You do not have access to the Final Report.'});
     final request = buildFinalReportRequest(tab: FinalReportTab.audits, audits: audits, ncs: ncs, options: options);

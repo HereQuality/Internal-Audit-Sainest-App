@@ -5,6 +5,7 @@ import 'package:dio/dio.dart';
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart' show extractErrorMessage;
+import 'final_report_all.dart';
 import 'final_report_excel.dart';
 import 'report_sheet_spec.dart';
 
@@ -67,7 +68,8 @@ class ReportExportException implements Exception {
   String toString() => 'ReportExportException: $message${cause == null ? '' : ' ($cause)'}';
 }
 
-/// Where the export is: "Preparing Excel… 120 of 340 reports".
+/// Where the export is: "Preparing Excel… 120 of 340 reports" — or, in "Download All", which of
+/// the three parts is being read: "Audits — 120 of 340 reports".
 class ExportProgress {
   /// What is being counted ("reports", "NCs"); empty for the final build step.
   final String noun;
@@ -77,9 +79,16 @@ class ExportProgress {
   /// The file is being written (all rows are in).
   final bool building;
 
-  const ExportProgress({this.noun = '', this.done = 0, this.total, this.building = false});
+  /// "Download All" only: the tab whose rows are being read ("Audits", "NCs", "Repeated NCs").
+  final String part;
+
+  const ExportProgress({this.noun = '', this.done = 0, this.total, this.building = false, this.part = ''});
 
   const ExportProgress.building() : this(building: true);
+
+  /// The same progress, said for [part].
+  ExportProgress forPart(String part) =>
+      ExportProgress(noun: noun, done: done, total: total, building: building, part: part);
 
   /// 0..1, or null when unknown (a spinner rather than a bar).
   double? get fraction {
@@ -92,9 +101,10 @@ class ExportProgress {
   String get text {
     if (building) return 'Building the Excel file…';
     // Before the first answer there is nothing to count yet.
-    if (noun.isEmpty) return 'Preparing Excel…';
+    if (noun.isEmpty) return part.isEmpty ? 'Preparing Excel…' : '$part — preparing…';
     final t = total;
-    return t == null ? 'Preparing Excel… $done $noun' : 'Preparing Excel… $done of $t $noun';
+    final counted = t == null ? '$done $noun' : '$done of $t $noun';
+    return part.isEmpty ? 'Preparing Excel… $counted' : '$part — $counted';
   }
 }
 
@@ -125,6 +135,22 @@ class FinalReportRequest {
     this.filters = const [],
     this.generatedBy = '',
     this.minCount = 2,
+  });
+}
+
+/// "Download All": the three tabs' requests, each snapshotted under the filters its own tab uses
+/// right now, taken together at the tap.
+class FinalReportAllRequest {
+  final FinalReportRequest audits;
+  final FinalReportRequest ncs;
+  final FinalReportRequest repeats;
+  final String generatedBy;
+
+  const FinalReportAllRequest({
+    required this.audits,
+    required this.ncs,
+    required this.repeats,
+    this.generatedBy = '',
   });
 }
 
@@ -191,6 +217,18 @@ class FinalReportDownloader {
   final int idsPerRequest;
   final DateTime Function() _clock;
 
+  // "Download All" reads three parts one after the other: the tab being read, stamped on every
+  // progress line ("" for a single tab's download).
+  String _part = '';
+
+  void _emit(ExportProgress p) => onProgress?.call(_part.isEmpty ? p : p.forPart(_part));
+
+  // A single tab's download says "Building…" once its rows are in; in "Download All" only the last
+  // part's end is the end of the reading, so the combined build says it instead (see [runAll]).
+  void _emitBuilding() {
+    if (_part.isEmpty) onProgress?.call(const ExportProgress.building());
+  }
+
   /// Reads everything [request] matches and builds the workbook description.
   Future<FinalReportBuild> run(FinalReportRequest request) async {
     try {
@@ -209,6 +247,52 @@ class FinalReportDownloader {
     }
   }
 
+  /// "Download All": the Audits, NCs and Repeated NCs parts, each read exactly as its own tab's
+  /// download reads it (under the filters that tab uses — [request] carries all three), and folded
+  /// into ONE workbook by [buildAllReport]. The parts run one AFTER the other, never together: each
+  /// reads every row its filters match, and three such readers at once would be three heavy
+  /// requests on the server and on a phone's connection. The progress line names the part being
+  /// read. If ANY part fails — or the person cancels — the whole download stops: there is never a
+  /// file with a part missing.
+  Future<FinalReportBuild> runAll(FinalReportAllRequest request) async {
+    try {
+      _part = 'Audits';
+      final audits = await _audits(request.audits);
+      _part = 'NCs';
+      final ncs = await _ncs(request.ncs);
+      _part = 'Repeated NCs';
+      final repeats = await _repeats(request.repeats);
+      _part = '';
+      cancel.throwIfCancelled();
+      onProgress?.call(const ExportProgress.building());
+      final spec = buildAllReport(
+        audits: audits.spec,
+        ncs: ncs.spec,
+        repeats: repeats.spec,
+        generatedBy: request.generatedBy,
+        generatedAt: _clock(),
+      );
+      return FinalReportBuild(
+        spec: spec,
+        rowCount: audits.rowCount + ncs.rowCount + repeats.rowCount,
+        warnings: [
+          for (final w in audits.warnings) 'Audits: $w',
+          for (final w in ncs.warnings) 'NCs: $w',
+          for (final w in repeats.warnings) 'Repeated NCs: $w',
+        ],
+      );
+    } on ExportCancelled {
+      rethrow;
+    } on ReportExportException {
+      rethrow;
+    } catch (e) {
+      if (cancel.isCancelled) throw const ExportCancelled();
+      throw ReportExportException('Could not create the Excel file. Please try again.', e);
+    } finally {
+      _part = '';
+    }
+  }
+
   // ── Audits ────────────────────────────────────────────────────────────────
 
   Future<FinalReportBuild> _audits(FinalReportRequest r) async {
@@ -217,7 +301,7 @@ class FinalReportDownloader {
     final paged = await _readAll(ApiConstants.auditsReport, r.listQuery, listKey: 'audits', noun: 'reports');
     final stats = await statsFuture;
     cancel.throwIfCancelled();
-    onProgress?.call(const ExportProgress.building());
+    _emitBuilding();
 
     final export = auditExportRows(paged.rows);
     final warnings = <String>[
@@ -244,7 +328,7 @@ class FinalReportDownloader {
     final paged = await _readAll(ApiConstants.ncsReport, r.listQuery, listKey: 'ncs', noun: 'NCs');
     final stats = await statsFuture;
     cancel.throwIfCancelled();
-    onProgress?.call(const ExportProgress.building());
+    _emitBuilding();
 
     final now = _clock();
     final rows = ncExportRows(paged.rows, now: now);
@@ -280,7 +364,7 @@ class FinalReportDownloader {
     ];
     final ncsById = <String, Map>{};
     var read = 0;
-    onProgress?.call(ExportProgress(noun: 'NCs in those checkpoints', done: 0, total: ids.length));
+    _emit(ExportProgress(noun: 'NCs in those checkpoints', done: 0, total: ids.length));
     for (var from = 0; from < chunks.length; from += concurrency) {
       final batch = chunks.sublist(from, math.min(from + concurrency, chunks.length));
       final answers = await Future.wait([
@@ -293,10 +377,10 @@ class FinalReportDownloader {
         }
       }
       read += batch.fold<int>(0, (n, c) => n + c.length);
-      onProgress?.call(ExportProgress(noun: 'NCs in those checkpoints', done: math.min(read, ids.length), total: ids.length));
+      _emit(ExportProgress(noun: 'NCs in those checkpoints', done: math.min(read, ids.length), total: ids.length));
     }
     cancel.throwIfCancelled();
-    onProgress?.call(const ExportProgress.building());
+    _emitBuilding();
 
     final warnings = <String>[if (groups.skippedRows > 0) _ceilingNote(groups, 'repeated checkpoints')];
     final spec = buildRepeatsReport(
@@ -409,7 +493,7 @@ class FinalReportDownloader {
     final limit = first.$3 < 1 ? pageSize : first.$3;
     // `done` counts what the list pages by (groups, NCs), not the rows a page carries: a page of
     // 100 audit groups holds more than 100 rows.
-    onProgress?.call(ExportProgress(noun: noun, done: math.min(limit, total ?? rows.length), total: total));
+    _emit(ExportProgress(noun: noun, done: math.min(limit, total ?? rows.length), total: total));
 
     var skipped = 0;
     if (!unpaged) {
@@ -425,7 +509,7 @@ class FinalReportDownloader {
           for (final a in answers) {
             rows.addAll(a.$1);
           }
-          onProgress?.call(ExportProgress(noun: noun, done: math.min(batch.last * limit, total), total: total));
+          _emit(ExportProgress(noun: noun, done: math.min(batch.last * limit, total), total: total));
         }
       } else {
         // An answer without a `total`: read on until a page comes back empty.
@@ -433,7 +517,7 @@ class FinalReportDownloader {
           final a = await page(p);
           if (a.$1.isEmpty) break;
           rows.addAll(a.$1);
-          onProgress?.call(ExportProgress(noun: noun, done: rows.length));
+          _emit(ExportProgress(noun: noun, done: rows.length));
         }
         total = rows.length;
       }

@@ -48,8 +48,8 @@ class AuditFilterSelection {
   final bool isTeam;
 
   /// What an untouched [isTeam] reads for the signed-in account: false = Me, true
-  /// = All Members (a Full Access account — AuditFilterScope.defaultTeamScope; the
-  /// Calendar's own default is Me for everybody). The sheet's reset, its count
+  /// = All Members (a Full Access account — AuditFilterScope.defaultTeamScope). The
+  /// sheet's reset, its count
   /// badge and the bar's pill / Clear all measure [isTeam] against it, so the
   /// default itself is never counted as an active filter.
   final bool defaultIsTeam;
@@ -124,17 +124,14 @@ class AuditFilterSelection {
   /// Full Access account), everywhere, every type, any date.
   static const cleared = AuditFilterSelection(resetScope: true);
 
-  /// What a provider holds right now, as a selection. [calendar] reads the
-  /// Calendar's own scope ([AuditFilterScope.calendarTeamScope]), whose resting
-  /// state is Me for everybody.
+  /// What a provider holds right now, as a selection.
   factory AuditFilterSelection.fromScope(
     AuditFilterScope scope, {
     DateTime? month,
-    bool calendar = false,
   }) {
     return AuditFilterSelection(
-      isTeam: calendar ? scope.calendarTeamScope : scope.isTeamScope,
-      defaultIsTeam: calendar ? false : scope.defaultTeamScope,
+      isTeam: scope.isTeamScope,
+      defaultIsTeam: scope.defaultTeamScope,
       employees: scope.employeeFilter,
       teams: scope.teamFilter,
       teamMembers: scope.teamMemberIds,
@@ -200,27 +197,18 @@ class AuditFilterSelection {
 ///
 /// A [selection] with [AuditFilterSelection.resetScope] puts Me / All Members
 /// back to each provider's own account default ([AuditFilterScope.defaultTeamScope]).
-/// [calendarAllMembers], when given, records whether the user picked All Members
-/// ON the Calendar (see [AuditFilterScope.calendarAllMembers]); only the Calendar
-/// passes it.
 ///
 /// Providers are read before the first await so there is no `context` use
 /// afterwards.
 Future<void> applyAuditFilterSelection(
   BuildContext context,
-  AuditFilterSelection selection, {
-  bool? calendarAllMembers,
-}) {
+  AuditFilterSelection selection,
+) {
   final providers = <AuditFilterScope>[
     context.read<AuditsProvider>(),
     context.read<DashboardProvider>(),
     context.read<NcProvider>(),
   ];
-  if (calendarAllMembers != null) {
-    for (final p in providers) {
-      p.calendarAllMembers = calendarAllMembers;
-    }
-  }
   return Future.wait([
     for (final p in providers)
       p.applyFilters(
@@ -242,12 +230,31 @@ Future<void> applyAuditFilterSelection(
   ]);
 }
 
+/// The Status chips of a list that has its OWN status vocabulary and default (the
+/// Auditee's "Audit at My Location" tab): which chips are on offer (the sheet's
+/// normal ones are the eight pipeline statuses plus an "Include skipped" switch —
+/// with these the switch is gone, Skipped is simply a chip if it is listed), what
+/// an untouched pick reads ([defaults]: "Clear all" goes back to it and it is never
+/// counted as an active filter), and an optional [hint] under the chips.
+class AuditStatusChoices {
+  final List<String> options;
+  final List<String> defaults;
+  final String? hint;
+
+  const AuditStatusChoices({required this.options, this.defaults = const [], this.hint});
+}
+
 /// Opens the filter sheet seeded with [initial].
 ///
 /// Which sections show is per screen: [showStatus] (audit lists — Status +
 /// Include skipped), [showFlag] (NC lists), [showDateRange]. Pass a non-null
 /// `initial.month` to switch the Month section on (the Calendar); leave it
 /// null everywhere else.
+///
+/// [showPeople] false hides the Who section (Me / All Members, Team, Members) for a
+/// list that is not about anyone's people; [statusChoices] swaps the Status chips
+/// for a list's own (see [AuditStatusChoices]). Both default to the sheet's
+/// original behaviour.
 ///
 /// Returns null if dismissed without applying — back button, tap-outside
 /// and drag-to-close all land there, so a null result means "leave every
@@ -258,6 +265,8 @@ Future<AuditFilterSelection?> showAuditFilterSheet(
   bool showStatus = false,
   bool showFlag = false,
   bool showDateRange = true,
+  bool showPeople = true,
+  AuditStatusChoices? statusChoices,
 }) {
   return showModalBottomSheet<AuditFilterSelection>(
     context: context,
@@ -275,6 +284,8 @@ Future<AuditFilterSelection?> showAuditFilterSheet(
       showStatus: showStatus,
       showFlag: showFlag,
       showDateRange: showDateRange,
+      showPeople: showPeople,
+      statusChoices: statusChoices,
     ),
   );
 }
@@ -284,12 +295,16 @@ class _AuditFilterSheet extends StatefulWidget {
   final bool showStatus;
   final bool showFlag;
   final bool showDateRange;
+  final bool showPeople;
+  final AuditStatusChoices? statusChoices;
 
   const _AuditFilterSheet({
     required this.initial,
     required this.showStatus,
     required this.showFlag,
     required this.showDateRange,
+    this.showPeople = true,
+    this.statusChoices,
   });
 
   @override
@@ -379,7 +394,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
       _auditTypes = [];
       _from = null;
       _to = null;
-      _statuses = [];
+      _statuses = [...?widget.statusChoices?.defaults];
       _includeSkipped = false;
       _flags = [];
       final now = DateTime.now();
@@ -387,18 +402,26 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
     });
   }
 
+  // Whether the Status pick differs from what an untouched one reads (nothing picked
+  // for the sheet's own chips; the list's own default for [AuditStatusChoices]).
+  bool get _statusPicked {
+    final defaults = widget.statusChoices?.defaults ?? const <String>[];
+    return _statuses.length != defaults.length || !_statuses.every(defaults.contains);
+  }
+
   // Counts what is really applied: a pick the place set aside is not one.
   int _draftCountFor(WhoCascade who) =>
-      (who.teams.isNotEmpty ? 1 : 0) +
-      (who.members.isNotEmpty ||
-              (who.teams.isEmpty && _isTeam != widget.initial.defaultIsTeam)
+      (widget.showPeople && who.teams.isNotEmpty ? 1 : 0) +
+      (widget.showPeople &&
+              (who.members.isNotEmpty ||
+                  (who.teams.isEmpty && _isTeam != widget.initial.defaultIsTeam))
           ? 1
           : 0) +
       (_locations.isNotEmpty || _departments.isNotEmpty ? 1 : 0) +
       (_auditTypes.isNotEmpty ? 1 : 0) +
       (widget.showDateRange && (_from != null || _to != null) ? 1 : 0) +
-      (widget.showStatus && _statuses.isNotEmpty ? 1 : 0) +
-      (widget.showStatus && _includeSkipped ? 1 : 0) +
+      (widget.showStatus && _statusPicked ? 1 : 0) +
+      (widget.showStatus && widget.statusChoices == null && _includeSkipped ? 1 : 0) +
       (widget.showFlag && _flags.isNotEmpty ? 1 : 0);
 
   /// Me / All Members. Both CLEAR the Team and Members picks: the controls
@@ -691,8 +714,10 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
                         _RetryBanner(
                           onRetry: () => options.load(force: true),
                         ),
-                      _buildPeopleSection(context, options, who),
-                      const _SectionGap(),
+                      if (widget.showPeople) ...[
+                        _buildPeopleSection(context, options, who),
+                        const _SectionGap(),
+                      ],
                       _buildWhereSection(context, options),
                       const _SectionGap(),
                       _buildAuditTypeSection(context, options),
@@ -730,17 +755,28 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
       padding: const EdgeInsets.fromLTRB(20, 12, 8, 4),
       child: Row(
         children: [
-          Text(
-            'Filters',
-            style: Theme.of(
-              context,
-            ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+          // The title (+ count) takes what "Clear all" leaves and ellipsizes before it overflows
+          // (a 320 px phone at a large text size).
+          Expanded(
+            child: Row(
+              children: [
+                Flexible(
+                  child: Text(
+                    'Filters',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(
+                      context,
+                    ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                if (_draftCountFor(who) > 0) ...[
+                  const SizedBox(width: 8),
+                  _CountPill(count: _draftCountFor(who)),
+                ],
+              ],
+            ),
           ),
-          if (_draftCountFor(who) > 0) ...[
-            const SizedBox(width: 8),
-            _CountPill(count: _draftCountFor(who)),
-          ],
-          const Spacer(),
           TextButton(
             onPressed: _draftCountFor(who) == 0 && !_showMonth ? null : _reset,
             style: TextButton.styleFrom(foregroundColor: scheme.primary),
@@ -1046,6 +1082,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
 
   // ── Status (audit lists) ──────────────────────────────────────────────
   Widget _buildStatusSection(BuildContext context) {
+    final choices = widget.statusChoices;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1055,7 +1092,7 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
           spacing: 8,
           runSpacing: 8,
           children: [
-            for (final status in AuditStatus.pipeline)
+            for (final status in choices?.options ?? AuditStatus.pipeline)
               FilterChip(
                 avatar: Container(
                   width: 9,
@@ -1080,13 +1117,23 @@ class _AuditFilterSheetState extends State<_AuditFilterSheet> {
               ),
           ],
         ),
-        SwitchListTile(
-          contentPadding: EdgeInsets.zero,
-          dense: true,
-          title: const Text('Include skipped / reassigned audits'),
-          value: _includeSkipped,
-          onChanged: (v) => setState(() => _includeSkipped = v),
-        ),
+        if (choices == null)
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: const Text('Include skipped / reassigned audits'),
+            value: _includeSkipped,
+            onChanged: (v) => setState(() => _includeSkipped = v),
+          )
+        else if (choices.hint != null) ...[
+          const SizedBox(height: 6),
+          Text(
+            choices.hint!,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.outline,
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -1339,10 +1386,14 @@ class FilterButton extends StatelessWidget {
   final int activeCount;
   final VoidCallback onTap;
 
+  /// The button's height floor: 40 beside a SegmentedButton, 44 where it stands alone as a tap target (the Calendar).
+  final double minHeight;
+
   const FilterButton({
     super.key,
     required this.activeCount,
     required this.onTap,
+    this.minHeight = 40,
   });
 
   @override
@@ -1366,7 +1417,7 @@ class FilterButton extends StatelessWidget {
         // tap target, short enough not to out-size the SegmentedButton it
         // sits next to. Material's default padded target would add 8px of
         // invisible height and push the header row out of line.
-        minimumSize: const Size(0, 40),
+        minimumSize: Size(0, minHeight),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         // No VisualDensity.compact here: compact takes 8px off a button's
         // minimum height, so the 40px floor above rendered as a 32px button

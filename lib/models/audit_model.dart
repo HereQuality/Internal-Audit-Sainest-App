@@ -1,3 +1,5 @@
+import 'self_audit.dart';
+
 class AuditeeInfo {
   final String? name;
   final String? profilePic;
@@ -134,6 +136,15 @@ class AuditModel {
   final DateTime? scheduledEndDate;
   final DateTime? completedDate;
   final AuditeeInfo auditee;
+  // Every named auditee (auditeeIds, the source of truth — [auditee] above is only the first one), and whether the
+  // auditor conducted the audit WITHOUT one ("Self", models/self_audit.dart). Read [auditeeLabel] / [isSelfAudit].
+  final List<String> auditeeNames;
+  // The ids of everyone named as the auditee (auditeeId and auditeeIds, populated or bare) — the Calendar's "you are the
+  // auditee" mark. Unlike [auditeeNames] it also reads from /audits/at-my-location, which leaves auditeeIds unpopulated.
+  final List<String> auditeeIdList;
+  final bool selfAudit;
+  final String? selfAuditReason;
+  final String selfAuditRemark;
   final String location;
   // scoreResult.percentage, same field CompletedAudits.jsx reads for its
   // "Show Report" list row's score column — null until fully scored.
@@ -211,11 +222,47 @@ class AuditModel {
   /// dialog says so.
   final int scoredCount;
 
+  // ── What the "Audit at My Location" tab shows (rows of GET /audits/at-my-location) ──
+  /// Everyone on the auditee side with their id: the legacy single `auditeeId` and the `auditeeIds` list, merged and
+  /// de-duplicated by id like the web table does. Empty for a self audit (the Auditee then reads "Self").
+  final List<({String id, String name, bool inactive})> auditeePeople;
+
+  /// The audited places by name (locations, then departments), each one its own entry; a place that was deleted after
+  /// the audit was scheduled comes back flagged and is labelled "(deleted)". [location] above is the same joined.
+  final List<String> placeLabels;
+
+  /// A Skipped audit's remark and who skipped it (server fillSkipDetails); null / '' on any other audit.
+  final String? skipReason;
+  final String skippedByName;
+
+  /// Part of a repeat series: the series link or a frequency label is enough (old rows carry only one of them),
+  /// like the web's isRecurringAudit.
+  bool get isRepeating => isRecurring || (frequency ?? '').isNotEmpty;
+
+  /// Whether [employeeId] is one of the auditors / on the auditee side — what the "You" mark reads.
+  bool hasAuditor(String? employeeId) =>
+      employeeId != null && employeeId.isNotEmpty && auditors.any((p) => p.id == employeeId);
+  bool hasAuditee(String? employeeId) =>
+      employeeId != null && employeeId.isNotEmpty && auditeePeople.any((p) => p.id == employeeId);
+
   /// What a badge/tile/filter/PDF prints for this audit: the server's
   /// unified [displayStatus], else the raw [status] (older server, cached
   /// data). Every label the user reads goes through this; every behavioural
   /// gate keeps reading [status].
   String get displayLabel => displayStatus ?? status;
+
+  /// Self only while nobody is named: a named auditee always wins over a stale flag.
+  bool get isSelfAudit => selfAudit && auditeeNames.isEmpty && (auditee.name ?? '').isEmpty;
+
+  /// "Auditee not responding — Called twice, no answer" for a self audit, else ''.
+  String get selfAuditNote => isSelfAudit ? selfAuditNoteOf(selfAuditReason, selfAuditRemark) : '';
+
+  /// What the Auditee field says: the names, else "Self", else [fallback].
+  String auditeeLabel({String fallback = '—'}) {
+    if (auditeeNames.isNotEmpty) return auditeeNames.join(', ');
+    if ((auditee.name ?? '').isNotEmpty) return auditee.name!;
+    return isSelfAudit ? kSelfLabel : fallback;
+  }
 
   /// The status a multi-zone batch's parent row shows — [batchDisplayStatus]
   /// (aggregated over ALL zones, so it can differ from this one zone's own),
@@ -238,6 +285,11 @@ class AuditModel {
     this.scheduledEndDate,
     this.completedDate,
     this.auditee = const AuditeeInfo(),
+    this.auditeeNames = const [],
+    this.auditeeIdList = const [],
+    this.selfAudit = false,
+    this.selfAuditReason,
+    this.selfAuditRemark = '',
     this.location = '',
     this.scorePercentage,
     this.scoreAchieved,
@@ -258,6 +310,10 @@ class AuditModel {
     this.canReassign = false,
     this.reassignBlockedReason,
     this.scoredCount = 0,
+    this.auditeePeople = const [],
+    this.placeLabels = const [],
+    this.skipReason,
+    this.skippedByName = '',
   });
 
   factory AuditModel.fromJson(Map<String, dynamic> json) {
@@ -280,6 +336,17 @@ class AuditModel {
       scheduledEndDate: _localDate(json['scheduledEndDate']),
       completedDate: _localDate(json['completedDate']),
       auditee: AuditeeInfo.fromJson(json['auditeeId']),
+      auditeeNames: (json['auditeeIds'] as List? ?? [])
+          .whereType<Map>()
+          .map((e) => e['employeeName']?.toString() ?? '')
+          .where((n) => n.isNotEmpty)
+          .toList(),
+      auditeeIdList: {
+        ..._refIds([json['auditeeId'], ...(json['auditeeIds'] is List ? json['auditeeIds'] as List : const [])]),
+      }.toList(),
+      selfAudit: json['selfAudit'] == true,
+      selfAuditReason: json['selfAuditReason']?.toString(),
+      selfAuditRemark: json['selfAuditRemark']?.toString() ?? '',
       location: _locationLabel(json),
       scorePercentage: scoreResult is Map ? (scoreResult['percentage'] as num?)?.toDouble() : null,
       scoreAchieved: scoreResult is Map ? (scoreResult['achieved'] as num?)?.toDouble() : null,
@@ -318,8 +385,51 @@ class AuditModel {
       canReassign: json['canReassign'] == true,
       reassignBlockedReason: _nonEmpty(json['reassignBlockedReason']),
       scoredCount: scoreResult is Map ? (scoreResult['scoredCount'] as num?)?.toInt() ?? 0 : 0,
+      auditeePeople: _auditeePeople(json),
+      placeLabels: _placeLabels(json),
+      skipReason: _nonEmpty(json['skipReason']),
+      skippedByName: json['skippedByName']?.toString() ?? '',
     );
   }
+}
+
+// The auditee side with ids: the legacy `auditeeId` first, then `auditeeIds`, each person once. A person with neither
+// an id nor a name is dropped (a bare ObjectId that was never populated tells the reader nothing).
+List<({String id, String name, bool inactive})> _auditeePeople(Map<String, dynamic> json) {
+  final seen = <String>{};
+  final people = <({String id, String name, bool inactive})>[];
+  void add(dynamic e) {
+    if (e is! Map) return;
+    final id = (e['_id'] ?? '').toString();
+    final name = e['employeeName']?.toString() ?? '';
+    if (id.isEmpty || name.isEmpty || !seen.add(id)) return;
+    people.add((id: id, name: name, inactive: e['isActive'] == false));
+  }
+
+  add(json['auditeeId']);
+  if (json['auditeeIds'] is List) {
+    for (final e in json['auditeeIds'] as List) {
+      add(e);
+    }
+  }
+  return people;
+}
+
+// Each audited place by name — locations, then departments. A place deleted since the audit was scheduled is a
+// placeholder that still carries its frozen name, flagged `_removed`.
+List<String> _placeLabels(Map<String, dynamic> json) {
+  String label(Map e, String key) {
+    final name = (e[key] ?? e['name'] ?? e['departmentName'])?.toString().trim() ?? '';
+    final removed = e['_removed'] == true || e['isDeleted'] == true;
+    return '${name.isEmpty ? 'Unknown place' : name}${removed ? ' (deleted)' : ''}';
+  }
+
+  return [
+    if (json['locationIds'] is List)
+      for (final e in (json['locationIds'] as List).whereType<Map>()) label(e, 'name'),
+    if (json['departmentIds'] is List)
+      for (final e in (json['departmentIds'] as List).whereType<Map>()) label(e, 'departmentName'),
+  ];
 }
 
 class AuditorStats {

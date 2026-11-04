@@ -196,10 +196,92 @@ void main() {
       expect(r.listQuery['fromDate'], isNotNull);
     });
 
+    test('the tab\'s own search is sent to /ncs/repeats and said in the Summary', () {
+      ncs.repeatsSearch = '  Wet floor ';
+      final r = buildFinalReportRequest(tab: FinalReportTab.repeats, audits: audits, ncs: ncs, options: options);
+      expect(r.listQuery['search'], 'Wet floor');
+      expect(r.listQuery, ncs.repeatParams);
+      final l = lines(r.filters);
+      expect(l['Search'], '"Wet floor"');
+      // In the filter bar's order: the date, then the search, then the tab's own minimum.
+      expect(r.filters.map((f) => f.$1).toList().sublist(r.filters.length - 3), ['Date range', 'Search', 'Minimum repeats']);
+    });
+
+    test('no search: no search param and no Search line', () {
+      final r = buildFinalReportRequest(tab: FinalReportTab.repeats, audits: audits, ncs: ncs, options: options);
+      expect(r.listQuery.containsKey('search'), isFalse);
+      expect(lines(r.filters).containsKey('Search'), isFalse);
+      ncs.repeatsSearch = '   ';
+      expect(ncs.repeatParams.containsKey('search'), isFalse);
+    });
+
+    test('the search is not the Audits\' or the NCs\' search: each tab keeps its own', () {
+      audits.reportsSearch = 'press';
+      ncs
+        ..ncReportSearch = 'guard'
+        ..repeatsSearch = 'floor';
+      expect(buildFinalReportRequest(tab: FinalReportTab.audits, audits: audits, ncs: ncs, options: options).listQuery['search'], 'press');
+      expect(buildFinalReportRequest(tab: FinalReportTab.ncs, audits: audits, ncs: ncs, options: options).listQuery['search'], 'guard');
+      expect(buildFinalReportRequest(tab: FinalReportTab.repeats, audits: audits, ncs: ncs, options: options).listQuery['search'], 'floor');
+    });
+
     test('a picked date range replaces the default window', () {
       ncs.setFilterState(dateRange: (DateTime(2026, 1, 1), DateTime(2026, 6, 30)));
       final l = lines(buildFinalReportRequest(tab: FinalReportTab.repeats, audits: audits, ncs: ncs, options: options).filters);
       expect(l['Date range'], '01 Jan 2026 to 30 Jun 2026');
+    });
+  });
+
+  group('Download All', () {
+    test('snapshots the three tabs together, each under the filters its OWN tab uses right now', () {
+      audits
+        ..setFilterState(isTeam: true, locations: ['l1'], auditTypes: ['Safety'])
+        ..reportsStatus = 'Overdue'
+        ..reportsSearch = 'press'
+        ..reportsTileKeys = {'onTime'};
+      ncs
+        ..setFilterState(isTeam: true, locations: ['l1'], auditTypes: ['Safety'], flags: ['Major'])
+        ..ncReportSearch = 'guard'
+        ..ncReportTileKeys = {'overdue'}
+        ..repeatsMinCount = 3
+        ..repeatsSearch = 'floor';
+      final all = buildFinalReportAllRequest(audits: audits, ncs: ncs, options: options, generatedBy: 'Asha Rao');
+
+      expect(all.generatedBy, 'Asha Rao');
+      expect(all.audits.tab, FinalReportTab.audits);
+      expect(all.audits.listQuery, audits.reportListQuery());
+      expect(all.audits.listQuery['status'], 'Overdue,On-Time Completed');
+      expect(all.audits.statsQuery, audits.reportStatsQuery());
+      expect(all.ncs.tab, FinalReportTab.ncs);
+      expect(all.ncs.listQuery, ncs.ncReportListQuery());
+      expect(all.ncs.listQuery['bucket'], 'overdue');
+      expect(all.ncs.listQuery['severity'], 'Major');
+      expect(all.ncs.statsQuery, ncs.ncReportStatsQuery());
+      expect(all.repeats.tab, FinalReportTab.repeats);
+      expect(all.repeats.listQuery, ncs.repeatParams);
+      expect(all.repeats.listQuery['minCount'], 3);
+      expect(all.repeats.listQuery['search'], 'floor');
+      expect(all.repeats.listQuery['fromDate'], isNotNull, reason: 'the six-month default window');
+      expect(all.repeats.listQuery.containsKey('employeeIds'), isFalse);
+      expect(all.repeats.statsQuery, isNull);
+      expect(all.repeats.minCount, 3);
+      // Each part says its own filters, in plain words.
+      expect(lines(all.audits.filters)['Stat tile'], 'On-Time Completed');
+      expect(lines(all.audits.filters)['Search'], '"press"');
+      expect(lines(all.ncs.filters)['Stat tile'], 'Overdue');
+      expect(lines(all.ncs.filters)['Search'], '"guard"');
+      expect(lines(all.repeats.filters)['Search'], '"floor"');
+      expect(lines(all.repeats.filters)['Minimum repeats'], '3+ times at the same place');
+      expect(lines(all.repeats.filters)['Date range'], startsWith('Last 6 months'));
+    });
+
+    test('is a snapshot: later filter changes do not reach it', () {
+      ncs.repeatsSearch = 'floor';
+      final all = buildFinalReportAllRequest(audits: audits, ncs: ncs, options: options);
+      ncs.repeatsSearch = 'other';
+      audits.reportsStatus = 'Overdue';
+      expect(all.repeats.listQuery['search'], 'floor');
+      expect(all.audits.listQuery.containsKey('status'), isFalse);
     });
   });
 }
