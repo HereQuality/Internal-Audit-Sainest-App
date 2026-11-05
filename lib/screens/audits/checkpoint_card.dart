@@ -6,6 +6,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/storage/pending_checkpoint_store.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/formatters.dart';
 import '../../core/utils/snackbar.dart';
@@ -408,6 +409,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       if (_notApplicable) {
         _forgetDrafts();
       } else {
+        _restorePendingEdit();
         _restorePendingPhotos();
         _recoverLostPick();
       }
@@ -477,7 +479,8 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
         // switch, a collapsed group): send the latest values anyway, a few
         // tries, queued behind whatever is already in flight.
         report = CheckpointSyncState.saving;
-        _detachedSave(_payload(), widget.onSave, _onSync);
+        unawaited(_persistPendingEdit()); // kept on the device until the detached save below is confirmed
+        _detachedSave(_payload(), widget.onSave, _onSync, widget.draftKey);
       } else if (_findingType == null) {
         _persistDraft(widget.draftKey, _remarkController.text);
       }
@@ -647,7 +650,11 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
             // local copy too — the automatic retry below will still resend
             // it to the server; this is just a safety net against losing it
             // if the app is killed before that succeeds.
-            if (p.findingType == null) _persistDraft(widget.draftKey, p.remark);
+            if (p.findingType == null) {
+              _persistDraft(widget.draftKey, p.remark);
+            } else {
+              unawaited(_persistPendingEdit()); // a scored checkpoint keeps its own on-device copy too
+            }
             _update(() {
               _saving = false;
               _error = error;
@@ -669,6 +676,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
           // Now on the server — the on-device draft (if any) is obsolete.
           if (unchanged) {
             _persistDraft(widget.draftKey, '');
+            unawaited(PendingCheckpointStore.clear(widget.draftKey));
             _resyncAfterSave(nodeBefore);
           }
         }
@@ -710,6 +718,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     ({String? findingType, double? score, String remark, String? auditee, DateTime? date, String? severity}) p,
     SaveCheckpoint save,
     ValueChanged<CheckpointSyncState>? report,
+    String? draftKey,
   ) {
     _exclusive(() async {
       String? error;
@@ -725,6 +734,9 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
         if (error == null) break;
         await Future<void>.delayed(Duration(seconds: 3 * (attempt + 1)));
       }
+      // Confirmed: the on-device copy is obsolete. Not confirmed after the tries: it stays, and is sent the next time
+      // this checkpoint or audit is opened.
+      if (error == null) await PendingCheckpointStore.clear(draftKey);
       // Clean either way: the card is gone, so nothing will ever retry — a
       // lingering "failed" would keep the screen's save chip and back-guard
       // stuck for good.
@@ -766,6 +778,9 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
     _debounce?.cancel();
     _retryTimer?.cancel();
     _retryAttempt = 0;
+    // The moment an edit is made it also goes on the device, so it is not lost if the app is closed or killed before
+    // the server confirms it (no signal, a slow connection...). Removed again once the server has it.
+    unawaited(_persistPendingEdit());
     if (immediate) {
       _drain();
     } else {
@@ -819,6 +834,68 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   }
 
   Future<void> _writeDraft() => _persistDraft(widget.draftKey, _remarkController.text);
+
+  // ── On-device copy of an unconfirmed edit (finding / score / remark / NC details) ──
+  // See core/storage/pending_checkpoint_store.dart for the why. A remark typed before any finding keeps using the
+  // draft above; once a finding is picked, the whole edit is kept here.
+
+  Future<void> _persistPendingEdit() async {
+    if (widget.draftKey == null || widget.readOnly || _notApplicable || _findingType == null) return;
+    final p = _payload();
+    await PendingCheckpointStore.write(
+      widget.draftKey,
+      PendingCheckpoint(
+        findingType: p.findingType,
+        score: p.score,
+        remark: p.remark,
+        auditeeEmployeeId: p.auditee,
+        targetDate: p.date,
+        severity: p.severity,
+        savedAt: DateTime.now(),
+      ),
+    );
+  }
+
+  // The checkpoint was opened again after an edit that never reached the server (the app was closed or killed, or
+  // there was no signal): put the person's edit back on the card and send it.
+  Future<void> _restorePendingEdit() async {
+    final pending = await PendingCheckpointStore.read(widget.draftKey);
+    if (pending == null) return;
+    if (!mounted || _disposed || widget.readOnly || _notApplicable) return;
+    if (pending.findingType == null || pending.isStale()) {
+      await PendingCheckpointStore.clear(widget.draftKey);
+      return;
+    }
+    // Already editing since this opened: what they are doing now wins.
+    if (_dirty) return;
+    // What the server holds is already this: nothing to resend. (A fresh NC always carries details the server's
+    // checkpoint data does not show back, so it is always resent.)
+    final sameAsServer = pending.findingType == _findingType &&
+        (pending.findingType != 'OFI' || pending.score?.round() == _ofiScore) &&
+        pending.remark.trim() == _remarkController.text.trim() &&
+        !(pending.findingType == 'NC' && widget.node.ncId == null);
+    if (sameAsServer) {
+      await PendingCheckpointStore.clear(widget.draftKey);
+      return;
+    }
+    _suppressEdits = true;
+    _remarkController.text = pending.remark;
+    _suppressEdits = false;
+    setState(() {
+      _findingType = pending.findingType;
+      _ofiScore = pending.findingType == 'OFI' ? pending.score?.round() : null;
+      _auditeeEmployeeId = pending.auditeeEmployeeId;
+      _targetDate = pending.targetDate;
+      _severity = pending.severity ?? 'Minor';
+      _seenRemark = pending.remark;
+      _justSaved = false;
+      _error = null;
+      _dirty = true;
+      _editVersion++;
+    });
+    _report();
+    _scheduleSave(immediate: true);
+  }
 
   // ── On-device draft (photo picked but not yet confirmed uploaded) ────
   // Same safety net as the remark draft above, for _newPhotos — see the
@@ -1053,6 +1130,7 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   // The same, on this device: the remark draft and the picked-photo draft would otherwise come back on the next open.
   void _forgetDrafts() {
     unawaited(_persistDraft(widget.draftKey, ''));
+    unawaited(PendingCheckpointStore.clear(widget.draftKey));
     unawaited(_persistPendingPhotos());
   }
 

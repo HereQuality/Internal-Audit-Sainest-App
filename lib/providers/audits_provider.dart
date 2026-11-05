@@ -9,6 +9,7 @@ import '../core/network/dio_client.dart';
 import '../core/network/socket_service.dart';
 import '../core/utils/calendar_window.dart';
 import '../core/utils/evidence_photo.dart';
+import '../core/utils/nc_timeliness.dart' show ncDayString;
 import '../models/audit_detail_model.dart';
 import '../models/audit_model.dart';
 import '../models/employee_option.dart';
@@ -1690,7 +1691,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
           'remark': remark,
           'locationId': ?locationId,
           'auditeeEmployeeId': ?auditeeEmployeeId,
-          'targetDate': ?targetDate?.toIso8601String(),
+          'targetDate': ?(targetDate == null ? null : ncDayString(targetDate)),
           'severity': ?severity,
         },
       );
@@ -1761,7 +1762,7 @@ class AuditsProvider extends ChangeNotifier with AuditFilterScope {
         data: {
           'auditeeEmployeeId': ?auditeeEmployeeId,
           'severity': ?severity,
-          'targetDate': ?targetDate?.toIso8601String(),
+          'targetDate': ?(targetDate == null ? null : ncDayString(targetDate)),
         },
       );
       await fetchAuditDetail(auditId, quiet: true);

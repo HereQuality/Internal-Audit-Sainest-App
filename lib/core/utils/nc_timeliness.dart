@@ -30,6 +30,23 @@ DateTime _startOfDayUtc(DateTime d) {
   return DateTime.utc(u.year, u.month, u.day);
 }
 
+/// The INDIA (IST) calendar day an instant falls on, as that day at UTC midnight. Mirrors startOfDayIST in
+/// server/utils/dueDate.js. 00:00-05:30 IST is still "yesterday" in UTC, so truncating a real instant (when an NC was
+/// raised / closed) to its UTC day put anything done in the first 5½ hours of an Indian day on the wrong day.
+DateTime _startOfDayIst(DateTime d) {
+  final shifted = d.toUtc().add(const Duration(milliseconds: _companyUtcOffsetMs));
+  return DateTime.utc(shifted.year, shifted.month, shifted.day);
+}
+
+/// An NC's due date as it goes over the wire: a plain calendar day (yyyy-MM-dd) - never a time and never a timezone.
+/// (It used to be sent as "2026-11-11T00:00:00.000", which a server in another timezone read as a different instant:
+/// the NC then expired a day early.) A date the person picked (a local date) is already the day; an instant that came
+/// from the server (UTC) is placed on its IST day.
+String ncDayString(DateTime d) {
+  final day = d.isUtc ? d.add(const Duration(milliseconds: _companyUtcOffsetMs)) : d;
+  return '${day.year.toString().padLeft(4, '0')}-${day.month.toString().padLeft(2, '0')}-${day.day.toString().padLeft(2, '0')}';
+}
+
 /// effectiveDeadline — the actual instant a due date expires.
 ///
 /// A bare calendar date (exactly midnight UTC) means "by end of that day IN
@@ -50,17 +67,17 @@ DateTime effectiveDeadline(DateTime targetDate) {
 ///   Case 1 (targetDate carries real Hours & Minutes — not exactly midnight):
 ///     use full date+time for start/target/completion.
 ///   Case 2 (targetDate is a bare date — exactly midnight):
-///     truncate start/target/completion to UTC midnight first, i.e.
-///     compare dates only.
+///     truncate start/completion to their INDIA (IST) calendar day first
+///     (the target is already a bare day), i.e. compare dates only.
 ///   Then, in whichever unit case 1/2 leaves them in (days):
 ///     start != target:  (target - start) / (completion - start)
 ///     start == target:  1 / (completion - start)
 ///   ...× 100, clamped to [0, 100].
 int computeTurnaroundRatio(DateTime startDate, DateTime targetDate, DateTime completionDate) {
   final dateOnly = !_hasTimeComponent(targetDate);
-  final start = dateOnly ? _startOfDayUtc(startDate) : startDate;
+  final start = dateOnly ? _startOfDayIst(startDate) : startDate;
   final targetForCalc = dateOnly ? _startOfDayUtc(targetDate) : targetDate;
-  final actual = dateOnly ? _startOfDayUtc(completionDate) : completionDate;
+  final actual = dateOnly ? _startOfDayIst(completionDate) : completionDate;
 
   final plannedDays = targetForCalc.difference(start).inMilliseconds / _msPerDay;
   final actualDays = actual.difference(start).inMilliseconds / _msPerDay;

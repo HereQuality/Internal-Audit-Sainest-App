@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:provider/provider.dart';
 
+import '../../core/storage/pending_checkpoint_store.dart';
 import '../../core/theme/app_colors.dart';
 import '../../core/utils/snackbar.dart';
 import '../../models/audit_detail_model.dart';
@@ -280,6 +283,61 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     // and _buildBody's banner offers a way back into this same prompt.
     if (promptRepresentative && audit != null && _needsRepresentative(audit, myId)) {
       await _promptForRepresentative(audit);
+    }
+    // Edits made on this device that never reached the server (no signal, the app closed or killed before they were
+    // saved) are sent now. Once the tree below has been built, so a checkpoint that is on screen restores its own.
+    if (audit != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_replayPendingEdits(audit, myId));
+      });
+    }
+  }
+
+  // Replays once per visit to this screen.
+  bool _pendingReplayed = false;
+
+  // A checkpoint edit that the server never confirmed is kept on the device (core/storage/pending_checkpoint_store.dart).
+  // A checkpoint whose card is built restores and sends its own (CheckpointCard._restorePendingEdit); the others - in a
+  // collapsed section, or scrolled out of view, whose cards do not exist yet - are sent from here, so a score or remark
+  // is not forgotten just because its checkpoint was not on screen when the app was opened again.
+  Future<void> _replayPendingEdits(AuditDetailModel audit, String? myId) async {
+    if (_pendingReplayed) return;
+    _pendingReplayed = true;
+    final pending = await PendingCheckpointStore.forAudit(widget.auditId);
+    if (pending.isEmpty || !mounted) return;
+    // A finished (or no longer yours) audit takes no more scoring: forget what was waiting for it.
+    if (!_isPrimaryAuditor(audit, myId) || !_isActiveForScoring(audit)) {
+      await PendingCheckpointStore.clearAudit(widget.auditId);
+      return;
+    }
+    // Scoring is blocked until a representative is set: keep the edits, send them once it is.
+    if (_needsRepresentative(audit, myId)) {
+      _pendingReplayed = false;
+      return;
+    }
+    for (final entry in pending) {
+      if (!mounted) return;
+      final key = DraftKey.parse(entry.draftKey);
+      final edit = entry.pending;
+      if (key == null || edit.findingType == null) {
+        await PendingCheckpointStore.clear(entry.draftKey);
+        continue;
+      }
+      // On screen: the card handles it.
+      if (_checkpointKeys[key.nodeId]?.currentState != null) continue;
+      final error = await _auditsProvider.scoreCheckpoint(
+        auditId: widget.auditId,
+        nodeId: key.nodeId,
+        findingType: edit.findingType,
+        score: edit.score,
+        remark: edit.remark,
+        locationId: key.locationId,
+        auditeeEmployeeId: edit.auditeeEmployeeId,
+        targetDate: edit.targetDate,
+        severity: edit.severity,
+      );
+      // Confirmed: forget it. Refused or unreachable: it stays, and goes again the next time this audit is opened.
+      if (error == null) await PendingCheckpointStore.clear(entry.draftKey);
     }
   }
 
