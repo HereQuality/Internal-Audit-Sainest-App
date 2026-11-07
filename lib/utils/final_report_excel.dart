@@ -1,4 +1,5 @@
 import '../core/utils/audit_status.dart';
+import '../core/utils/score_math.dart';
 import '../models/audit_detail_model.dart';
 import '../models/nc_report_model.dart' show NcBucket;
 import '../models/self_audit.dart';
@@ -208,7 +209,11 @@ String auditPlaceLabel(Map a) => [
     if (d != null) _departmentName(d),
 ].join(', ');
 
-int? _pctOf(num achieved, num possible) => possible > 0 ? (achieved / possible * 100).round() : null;
+// The totals to ADD UP for a stored scoreResult (server: scoring.js#achievedOf / #maxPossibleOf): the exact figure, else the
+// whole number of an audit saved before the exact ones existed. The whole numbers are only for showing - added up they give
+// wrong totals (three audits of exactly 3.5 / 4, each stored "4 of 4", are 88%, not 12/12 = 100%).
+num _achievedOf(Map? sr) => _asNum(sr?['achievedExact']) ?? _num0(sr?['achieved']);
+num _possibleOf(Map? sr) => _asNum(sr?['maxPossibleExact']) ?? _num0(sr?['maxPossible']);
 
 int _byCountThenName(Map<String, Object?> a, Map<String, Object?> b, String key) {
   final byCount = (b[key] as int).compareTo(a[key] as int);
@@ -234,7 +239,19 @@ class ZoneSection {
   final num achieved;
   final num max;
 
-  const ZoneSection({required this.label, required this.pct, required this.achieved, required this.max});
+  /// The unrounded totals [achieved] / [max] were rounded from - what the By-Location / By-Auditor tallies add up.
+  /// Null: [achieved] / [max] are already exact.
+  final num? achievedExact;
+  final num? maxExact;
+
+  const ZoneSection({
+    required this.label,
+    required this.pct,
+    required this.achieved,
+    required this.max,
+    this.achievedExact,
+    this.maxExact,
+  });
 }
 
 typedef ZoneSectionsOf = List<ZoneSection> Function(Map audit);
@@ -252,7 +269,14 @@ List<ZoneSection> zoneSectionsOf(Map audit) {
     for (final section in buildReportSections(detail))
       () {
         final am = sumAchievedMax(collectScoredLeaves(section.tree), system, detail.maxScore);
-        return ZoneSection(label: section.label, pct: percentageOf(am), achieved: am.achieved, max: am.max);
+        return ZoneSection(
+          label: section.label,
+          pct: percentageOf(am),
+          achieved: am.achieved,
+          max: am.max,
+          achievedExact: am.achievedExact,
+          maxExact: am.maxExact,
+        );
       }(),
   ];
 }
@@ -265,10 +289,10 @@ int? bundleScoreOf(List<Map> members) {
   for (final m in members) {
     if (m['status'] != AuditStatus.completed) continue;
     final sr = _asMap(m['scoreResult']);
-    achieved += _num0(sr?['achieved']);
-    max += _num0(sr?['maxPossible']);
+    achieved += _achievedOf(sr);
+    max += _possibleOf(sr);
   }
-  return _pctOf(achieved, max);
+  return percentFrom(achieved, max);
 }
 
 String? _batchIdOf(Map a) {
@@ -327,6 +351,9 @@ Map<String, Object?> _auditRow(Map a, {String bundle = '', ZoneSection? zone}) {
     'score': zone != null ? (finished ? zone.pct : null) : (finished ? _asNum(sr?['percentage']) : null),
     'achieved': zone != null ? (finished ? zone.achieved : null) : (finished ? _num0(sr?['achieved']) : null),
     'possible': zone != null ? (finished ? zone.max : null) : (finished ? _num0(sr?['maxPossible']) : null),
+    // Not a column: the exact totals the two whole numbers above were rounded from, which the tallies add up.
+    'achievedExact': zone != null ? (finished ? zone.achievedExact ?? zone.achieved : null) : (finished ? _achievedOf(sr) : null),
+    'possibleExact': zone != null ? (finished ? zone.maxExact ?? zone.max : null) : (finished ? _possibleOf(sr) : null),
     'ncTotal': ncTotal,
     'ncOpen': (ncTotal - ncClosed) < 0 ? 0 : ncTotal - ncClosed,
     'repeat': _str(recurrence?['frequency']),
@@ -423,6 +450,8 @@ List<Map<String, Object?>> tallyAuditRows(List<Map<String, Object?>> rows, List<
         'notAttempted': 0,
         'achieved': 0.0,
         'possible': 0.0,
+        'achievedExact': 0.0,
+        'possibleExact': 0.0,
       });
       void bump(String k) => g[k] = (g[k] as int) + 1;
       bump('audits');
@@ -444,13 +473,21 @@ List<Map<String, Object?>> tallyAuditRows(List<Map<String, Object?>> rows, List<
         } else if (r['timeliness'] == 'Delayed') {
           bump('delayed');
         }
-        g['achieved'] = (g['achieved'] as double) + _num0(r['achieved']);
-        g['possible'] = (g['possible'] as double) + _num0(r['possible']);
+        // The EXACT totals (a row without them - an older file - falls back to its whole numbers).
+        g['achievedExact'] = (g['achievedExact'] as double) + _num0(r['achievedExact'] ?? r['achieved']);
+        g['possibleExact'] = (g['possibleExact'] as double) + _num0(r['possibleExact'] ?? r['possible']);
       }
     }
   }
+  // The marks SHOWN are whole numbers; the score is worked out from the exact sums and rounded once.
   final out = [
-    for (final g in map.values) {...g, 'score': _pctOf(g['achieved'] as double, g['possible'] as double)},
+    for (final g in map.values)
+      {
+        ...g,
+        'achieved': (g['achievedExact'] as double).roundToDouble(),
+        'possible': (g['possibleExact'] as double).roundToDouble(),
+        'score': percentFrom(g['achievedExact'] as double, g['possibleExact'] as double),
+      },
   ]..sort((a, b) => _byCountThenName(a, b, 'audits'));
   return out;
 }
@@ -485,8 +522,9 @@ ReportTone? _redWhenPositive(Object? v, Map<String, Object?> row) {
 
 ReportTotals _auditTotals(List<Map<String, Object?>> tallies) {
   num sum(String key) => tallies.fold<num>(0, (n, g) => n + (g[key] as num));
-  final achieved = sum('achieved');
-  final possible = sum('possible');
+  // Added up from the places' exact totals; the whole numbers shown are rounded from those sums.
+  final achievedExact = sum('achievedExact');
+  final possibleExact = sum('possibleExact');
   return ReportTotals(values: {
     'audits': sum('audits'),
     'inProgress': sum('inProgress'),
@@ -496,9 +534,9 @@ ReportTotals _auditTotals(List<Map<String, Object?>> tallies) {
     'delayed': sum('delayed'),
     'skipped': sum('skipped'),
     'notAttempted': sum('notAttempted'),
-    'achieved': achieved,
-    'possible': possible,
-    'score': _pctOf(achieved, possible),
+    'achieved': achievedExact.roundToDouble(),
+    'possible': possibleExact.roundToDouble(),
+    'score': percentFrom(achievedExact, possibleExact),
   });
 }
 

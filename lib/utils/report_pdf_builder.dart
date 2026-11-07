@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 import 'package:pdf/pdf.dart';
@@ -12,6 +13,7 @@ import 'package:pdf/widgets.dart' as pw;
 
 import '../core/constants/api_constants.dart';
 import '../core/network/dio_client.dart';
+import '../core/utils/score_math.dart';
 import '../models/audit_detail_model.dart';
 import '../models/self_audit.dart';
 import '../models/nc_model.dart';
@@ -671,9 +673,12 @@ Future<Uint8List> buildCombinedReportPdf(
 }
 
 /// Server's aggregateRollup (utils/scoring.js) over every zone's stored
-/// scoreResult: achieved/maxPossible summed first, THEN divided. Null when any
-/// zone that has scored leaves carries no server percentage (older server) —
-/// a partial rollup would be wrong, so the caller recomputes instead.
+/// scoreResult: achieved/maxPossible summed first, THEN divided — the EXACT
+/// totals (achievedExact / maxPossibleExact, else the whole numbers of an older
+/// audit), never the rounded ones: three zones that are each exactly 3.5 / 4
+/// (stored "4 of 4") are 88%, not 100%. Null when any zone that has scored
+/// leaves carries no server percentage (older server) — a partial rollup would
+/// be wrong, so the caller recomputes instead.
 int? _combinedServerPercentage(List<AuditDetailModel> zones) {
   double achieved = 0, max = 0;
   for (final z in zones) {
@@ -682,10 +687,10 @@ int? _combinedServerPercentage(List<AuditDetailModel> zones) {
       if (collectScoredLeaves(buildReportSections(z).expand((s) => s.tree).toList()).isNotEmpty) return null;
       continue;
     }
-    achieved += r.achieved;
-    max += r.maxPossible;
+    achieved += r.exactAchieved;
+    max += r.exactMaxPossible;
   }
-  return max > 0 ? (achieved.roundToDouble() / max.roundToDouble() * 100).round() : null;
+  return percentFrom(achieved, max);
 }
 
 // ── Renderer — the block order below is exportAuditReportToPdf.js's own
@@ -803,13 +808,12 @@ Future<Uint8List> _buildPdfBytes(_RenderJob job) async {
       if (ft != null && counts.containsKey(ft)) counts[ft] = counts[ft]! + 1;
     }
   }
-  final achieved = rawAchieved.round();
-  final max = rawMax.round();
-  final overallPct = spec.serverPercentage ?? (max > 0 ? (achieved / max * 100).round() : null);
+  // The percentage comes from the raw sums (rounded once, here) - never from the whole numbers they round to.
+  final overallPct = spec.serverPercentage ?? percentFrom(rawAchieved, rawMax);
   final scoreColor = _scoreColor(overallPct);
 
   final hasRemark = spec.finalAuditorRemark != null || (spec.zoneRemarks?.isNotEmpty ?? false);
-  final paramChartData = _parameterChartData(spec.sections);
+  final paramChartData = _parameterChartData(spec.sections, spec.scoringSystem);
   final locationChartData = _locationChartData(spec.sections, spec.scoringSystem, unnamedLabel: spec.unnamedSectionLabel);
 
   doc.addPage(
@@ -1209,7 +1213,28 @@ double? _leafRatio(ParameterNode leaf, double? auditMaxScore) {
   return ((leaf.score ?? 0) / max).clamp(0.0, 1.0);
 }
 
-List<(String, int)> _parameterChartData(List<_SectionSpec> sections) {
+/// One axis of the Parameter Score chart for one location: the average of its scored checkpoints. A WEIGHTAGE audit
+/// weights each checkpoint by its weightage (the same way the table and the header ring score it), so a weight-3
+/// checkpoint counts three times a weight-1 one; a normal audit counts every checkpoint once. Null = nothing scored.
+double? _averageRatio(List<ParameterNode> leaves, double? auditMaxScore, String scoringSystem) {
+  var weighted = 0.0;
+  var totalWeight = 0.0;
+  for (final leaf in leaves) {
+    final ratio = _leafRatio(leaf, auditMaxScore);
+    if (ratio == null) continue;
+    final weight = scoringSystem == 'weightage' ? leafWeightage(leaf, auditMaxScore) : 1.0;
+    weighted += ratio * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? weighted / totalWeight : null;
+}
+
+/// Visible for tests: the (axis name, %) pairs the Parameter Score chart draws.
+@visibleForTesting
+List<(String, int)> parameterChartDataForTest(List<ParameterNode> tree, String scoringSystem, {double? maxScore}) =>
+    _parameterChartData([_SectionSpec(label: '', tree: tree, maxScore: maxScore)], scoringSystem);
+
+List<(String, int)> _parameterChartData(List<_SectionSpec> sections, String scoringSystem) {
   final axisNames = <String>[];
   final seen = <String>{};
   for (final section in sections) {
@@ -1229,10 +1254,8 @@ List<(String, int)> _parameterChartData(List<_SectionSpec> sections) {
         }
       }
       if (top == null) continue;
-      final ratios = collectScoredLeaves([
-        top,
-      ]).map((l) => _leafRatio(l, section.maxScore)).whereType<double>().toList();
-      if (ratios.isNotEmpty) perLocationAverages.add(ratios.reduce((a, b) => a + b) / ratios.length);
+      final average = _averageRatio(collectScoredLeaves([top]), section.maxScore, scoringSystem);
+      if (average != null) perLocationAverages.add(average);
     }
     if (perLocationAverages.isEmpty) continue;
     final avg = perLocationAverages.reduce((a, b) => a + b) / perLocationAverages.length;
@@ -1591,13 +1614,12 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
   // in from outside — same reason the web's own drawIndexTable computes
   // its `grand` from the identical per-top-level-node walk that builds
   // each section's SUBTOTAL row (see exportAuditReportToPdf.js), rather
-  // than from a separately-computed report-wide total: that guarantees
-  // FINAL SCORE always equals the sum of the SUBTOTAL rows above it.
-  // Deliberately a DIFFERENT rounding granularity than the header
-  // ring/stat tile above (which rounds once over every raw leaf
-  // contribution) — this one rounds per top-level node, matching what
-  // each SUBTOTAL row itself sums, mirroring the web's own two distinct
-  // aggregations for these two displayed numbers.
+  // than from a separately-computed report-wide total.
+  // Every group, SUBTOTAL and the FINAL SCORE add up the EXACT (unrounded)
+  // totals of their top-level nodes and round only the figures they SHOW and
+  // the final percentage - adding up already-rounded groups gives wrong
+  // totals (two groups of exactly 3.5 / 4 each show "4/4" but are 88%, and
+  // together 7 / 8, not 8 / 8 = 100%). Same numbers as the header ring above.
   var grandAchieved = 0.0;
   var grandMax = 0.0;
 
@@ -1612,10 +1634,10 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
       final leaves = collectScoredLeaves([node]);
       final am = sumAchievedMax(leaves, spec.scoringSystem, section.maxScore);
       if (depth == 0) {
-        sectionAchieved += am.achieved;
-        sectionMax += am.max;
-        grandAchieved += am.achieved;
-        grandMax += am.max;
+        sectionAchieved += am.achievedExact;
+        sectionMax += am.maxExact;
+        grandAchieved += am.achievedExact;
+        grandMax += am.maxExact;
       }
       // Four spaces per level, matching the web's own name indent — the
       // hierarchy has to read from the name column alone once a row is
@@ -1702,7 +1724,7 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
     rows.add(pw.Table(columnWidths: columnWidths, children: sectionRows));
 
     if (spec.sections.length > 1) {
-      final subPct = sectionMax > 0 ? (sectionAchieved / sectionMax * 100).round() : null;
+      final subPct = percentFrom(sectionAchieved, sectionMax);
       final subTotals = sectionMax > 0 ? '${sectionAchieved.round()}/${sectionMax.round()}' : '—';
       rows.add(
         _spanRow(
@@ -1714,7 +1736,7 @@ List<pw.Widget> _indexTableRows(_ReportSpec spec) {
     }
   }
 
-  final finalPct = grandMax > 0 ? (grandAchieved / grandMax * 100).round() : null;
+  final finalPct = percentFrom(grandAchieved, grandMax);
   final finalTotals = grandMax > 0 ? '${grandAchieved.round()}/${grandMax.round()}' : '—';
   rows.add(
     _spanRow(
@@ -1799,7 +1821,7 @@ List<pw.Widget> _findingNode(
     final leaves = collectScoredLeaves([node]);
     final am = sumAchievedMax(leaves, spec.scoringSystem, section.maxScore);
     final scale = spec.scaleFor(section);
-    final avg = leaves.isNotEmpty && am.max > 0 ? (am.achieved / am.max * scale).round() : null;
+    final avg = leaves.isNotEmpty && am.maxExact > 0 ? (am.achievedExact / am.maxExact * scale).round() : null;
     final counts = [for (final ft in _findingSummaryOrder) leaves.where((l) => l.findingType == ft).length];
     // Not Applicable checkpoints are not calculated: they add to no tally and no average. A group of ONLY those has nothing
     // to grade, so its score reads "—" (never 0) — see [allNotApplicable] below.

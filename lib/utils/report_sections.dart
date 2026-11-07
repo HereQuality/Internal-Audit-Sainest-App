@@ -1,3 +1,4 @@
+import '../core/utils/score_math.dart';
 import '../models/audit_detail_model.dart';
 
 /// utils/report_sections.dart
@@ -86,7 +87,16 @@ double leafWeightage(ParameterNode node, double? auditMaxScore) {
 class AchievedMax {
   final double achieved;
   final double max;
-  const AchievedMax(this.achieved, this.max);
+
+  // The unrounded totals [achieved] / [max] come from (the same numbers when nothing was rounded, e.g. [rawAchievedMax]).
+  // [achieved] / [max] are what a report SHOWS (whole numbers); a percentage, and any further adding up, use these —
+  // rounded numbers added together give wrong totals (server/utils/scoring.js, core/utils/score_math.dart).
+  final double achievedExact;
+  final double maxExact;
+
+  const AchievedMax(this.achieved, this.max, {double? achievedExact, double? maxExact})
+    : achievedExact = achievedExact ?? achieved,
+      maxExact = maxExact ?? max;
 }
 
 // Unrounded achieved/max — the same per-leaf formula sumAchievedMax below
@@ -137,7 +147,9 @@ AchievedMax rawAchievedMax(List<ParameterNode> leaves, String scoringSystem, dou
 // see its own doc comment for why.
 AchievedMax sumAchievedMax(List<ParameterNode> leaves, String scoringSystem, double? auditMaxScore) {
   final raw = rawAchievedMax(leaves, scoringSystem, auditMaxScore);
-  return AchievedMax(raw.achieved.roundToDouble(), raw.max.roundToDouble());
+  return AchievedMax(raw.achieved.roundToDouble(), raw.max.roundToDouble(), achievedExact: raw.achieved, maxExact: raw.max);
 }
 
-int? percentageOf(AchievedMax am) => am.max > 0 ? (am.achieved / am.max * 100).round() : null;
+// The whole percentage of an (achieved, max) pair - worked out from the EXACT totals and rounded once, never from the
+// whole numbers shown beside it (a group of exactly 3.5 out of 4 shows "4 of 4" and is 88%, not 100%).
+int? percentageOf(AchievedMax am) => percentFrom(am.achievedExact, am.maxExact);

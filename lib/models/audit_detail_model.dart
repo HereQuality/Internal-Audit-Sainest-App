@@ -218,6 +218,11 @@ class AuditAssignment {
 class AuditScoreResult {
   final double achieved;
   final double maxPossible;
+  // The EXACT totals [achieved] / [maxPossible] were rounded from (a weighted audit of exactly 3.5 out of 4 is stored as
+  // "4 of 4"). Never shown — only added up when several scores are combined, so the percentage is right (3 such audits are
+  // 87.5%, not 12/12 = 100%). Null from an older audit / server: fall back to the whole numbers.
+  final double? achievedExact;
+  final double? maxPossibleExact;
   final double? percentage;
   final int scoredCount;
   final int leafCount;
@@ -229,6 +234,8 @@ class AuditScoreResult {
   const AuditScoreResult({
     this.achieved = 0,
     this.maxPossible = 0,
+    this.achievedExact,
+    this.maxPossibleExact,
     this.percentage,
     this.scoredCount = 0,
     this.leafCount = 0,
@@ -241,6 +248,8 @@ class AuditScoreResult {
     return AuditScoreResult(
       achieved: (json['achieved'] as num?)?.toDouble() ?? 0,
       maxPossible: (json['maxPossible'] as num?)?.toDouble() ?? 0,
+      achievedExact: (json['achievedExact'] as num?)?.toDouble(),
+      maxPossibleExact: (json['maxPossibleExact'] as num?)?.toDouble(),
       percentage: (json['percentage'] as num?)?.toDouble(),
       scoredCount: (json['scoredCount'] as num?)?.toInt() ?? 0,
       leafCount: (json['leafCount'] as num?)?.toInt() ?? 0,
@@ -248,6 +257,11 @@ class AuditScoreResult {
       isFullyScored: json['isFullyScored'] as bool? ?? false,
     );
   }
+
+  /// The totals to ADD UP when scores are combined (server: scoring.js#achievedOf / #maxPossibleOf): the exact figure,
+  /// else the whole number.
+  double get exactAchieved => achievedExact ?? achieved;
+  double get exactMaxPossible => maxPossibleExact ?? maxPossible;
 }
 
 /// A Lead + Support ("shared") audit is claimed by whichever assigned auditor

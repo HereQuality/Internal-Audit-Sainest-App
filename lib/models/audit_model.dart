@@ -156,6 +156,11 @@ class AuditModel {
   // rollup in this app uses (see pages/CompletedAudits.jsx#batchScore).
   final double? scoreAchieved;
   final double? scoreMax;
+  // scoreResult.achievedExact/maxPossibleExact — the EXACT totals the whole numbers above were rounded from (a weighted
+  // audit of exactly 3.5 out of 4 is stored as "4 of 4"). Never shown: only ever ADDED UP, so several audits combine to the
+  // right percentage (3 such audits are 87.5%, not 12/12 = 100%). Null from an older audit / server — see [exactScoreAchieved].
+  final double? scoreAchievedExact;
+  final double? scoreMaxExact;
   final List<String> auditorNames;
   // A multi-zone Schedule/Frequency Audit submission creates one separate
   // Audit document per zone, all sharing this same id (see
@@ -294,6 +299,8 @@ class AuditModel {
     this.scorePercentage,
     this.scoreAchieved,
     this.scoreMax,
+    this.scoreAchievedExact,
+    this.scoreMaxExact,
     this.auditorNames = const [],
     this.scheduleBatchId,
     this.structureMode = 'same',
@@ -315,6 +322,11 @@ class AuditModel {
     this.skipReason,
     this.skippedByName = '',
   });
+
+  /// The totals to ADD UP when scores are combined (server: scoring.js#achievedOf / #maxPossibleOf): the exact figure,
+  /// else the whole number for an audit saved before the exact ones existed, else 0.
+  double get exactScoreAchieved => scoreAchievedExact ?? scoreAchieved ?? 0;
+  double get exactScoreMax => scoreMaxExact ?? scoreMax ?? 0;
 
   factory AuditModel.fromJson(Map<String, dynamic> json) {
     final scoreResult = json['scoreResult'];
@@ -351,6 +363,8 @@ class AuditModel {
       scorePercentage: scoreResult is Map ? (scoreResult['percentage'] as num?)?.toDouble() : null,
       scoreAchieved: scoreResult is Map ? (scoreResult['achieved'] as num?)?.toDouble() : null,
       scoreMax: scoreResult is Map ? (scoreResult['maxPossible'] as num?)?.toDouble() : null,
+      scoreAchievedExact: scoreResult is Map ? (scoreResult['achievedExact'] as num?)?.toDouble() : null,
+      scoreMaxExact: scoreResult is Map ? (scoreResult['maxPossibleExact'] as num?)?.toDouble() : null,
       auditorNames: (json['auditorIds'] as List? ?? [])
           .whereType<Map>()
           .map((e) => e['employeeName']?.toString() ?? '')

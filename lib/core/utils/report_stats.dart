@@ -1,5 +1,6 @@
 import '../../models/audit_model.dart';
 import 'audit_status.dart';
+import 'score_math.dart';
 
 /// The score of a set of audits worked out from the FINISHED ones only — the
 /// owner's rule (2026-09-30): only a Completed audit (or a Completed zone of a
@@ -7,15 +8,22 @@ import 'audit_status.dart';
 /// neither 0 nor 100 — it is left out, and a set with nothing finished has no
 /// score at all ([percentage] null, shown as "—"). Σ achieved / Σ possible,
 /// never an average of each audit's own percentage.
+///
+/// The sums add up each audit's EXACT totals ([AuditModel.exactScoreAchieved]) and
+/// only the final percentage is rounded: three audits that are each exactly
+/// 3.5 / 4 (stored "4 of 4") are 87.5%, not 12/12 = 100% (see score_math.dart).
+/// [achieved] / [maxPossible] are the whole numbers to SHOW.
 class FinishedScore {
-  final double achieved;
-  final double maxPossible;
+  final double achievedExact;
+  final double maxPossibleExact;
 
-  const FinishedScore({this.achieved = 0, this.maxPossible = 0});
+  const FinishedScore({this.achievedExact = 0, this.maxPossibleExact = 0});
+
+  double get achieved => achievedExact.roundToDouble();
+  double get maxPossible => maxPossibleExact.roundToDouble();
 
   /// Whole percent, null while nothing finished has a score.
-  int? get percentage =>
-      maxPossible > 0 ? (achieved / maxPossible * 100).round() : null;
+  int? get percentage => percentFrom(achievedExact, maxPossibleExact);
 }
 
 /// [FinishedScore] over the Completed members of [audits] (each audit is judged
@@ -26,10 +34,10 @@ FinishedScore finishedScoreOf(Iterable<AuditModel> audits) {
   var max = 0.0;
   for (final a in audits) {
     if (a.status != AuditStatus.completed) continue;
-    achieved += a.scoreAchieved ?? 0;
-    max += a.scoreMax ?? 0;
+    achieved += a.exactScoreAchieved;
+    max += a.exactScoreMax;
   }
-  return FinishedScore(achieved: achieved, maxPossible: max);
+  return FinishedScore(achievedExact: achieved, maxPossibleExact: max);
 }
 
 /// One place's line in the Final Report's location-wise view — the SERVER's
@@ -48,6 +56,11 @@ class ReportLocationStats {
   final int count;
   final double achieved;
   final double maxPossible;
+
+  /// The exact totals [achieved] / [maxPossible] were rounded from (server: `achievedExact` /
+  /// `maxPossibleExact`); null from an older server. Never shown — only added up.
+  final double? achievedExact;
+  final double? maxPossibleExact;
   final int? percentage;
   final List<String> locationIds;
   final List<String> departmentIds;
@@ -61,6 +74,8 @@ class ReportLocationStats {
     this.count = 0,
     this.achieved = 0,
     this.maxPossible = 0,
+    this.achievedExact,
+    this.maxPossibleExact,
     this.percentage,
     this.locationIds = const [],
     this.departmentIds = const [],
@@ -77,6 +92,8 @@ class ReportLocationStats {
       count: _int0(data['count']),
       achieved: _num0(data['achieved']),
       maxPossible: _num0(data['maxPossible']),
+      achievedExact: _numOrNull(data['achievedExact']),
+      maxPossibleExact: _numOrNull(data['maxPossibleExact']),
       percentage: pct is num ? pct.round() : null,
       locationIds: _strings(data['locationIds']),
       departmentIds: _strings(data['departmentIds']),
@@ -109,6 +126,7 @@ class ReportPlaceRows {
 }
 
 double _num0(dynamic v) => v is num ? v.toDouble() : double.tryParse('$v') ?? 0;
+double? _numOrNull(dynamic v) => v is num ? v.toDouble() : null;
 int _int0(dynamic v) => v is num ? v.toInt() : int.tryParse('$v') ?? 0;
 List<String> _strings(dynamic v) =>
     v is List ? [for (final e in v) e.toString()] : const <String>[];
@@ -137,6 +155,12 @@ class ReportStats {
   final int? percentage;
   final double achieved;
   final double maxPossible;
+
+  /// The exact totals [achieved] / [maxPossible] were rounded from (server: `achievedExact` /
+  /// `maxPossibleExact`; [ReportStats.fromAudits] adds up each audit's exact ones); null from an older
+  /// server. Never shown — only added up. [percentage] is always worked out from these, not the whole numbers.
+  final double? achievedExact;
+  final double? maxPossibleExact;
 
   /// Legacy: the server used to say the score included open audits' progress.
   /// It always sends false now and the tile never draws a "*" — kept only so an
@@ -188,6 +212,8 @@ class ReportStats {
     this.percentage,
     this.achieved = 0,
     this.maxPossible = 0,
+    this.achievedExact,
+    this.maxPossibleExact,
     this.isPartial = false,
     this.totalAudits = 0,
     this.inProgress = 0,
@@ -271,6 +297,8 @@ class ReportStats {
     percentage: percentage,
     achieved: achieved,
     maxPossible: maxPossible,
+    achievedExact: achievedExact,
+    maxPossibleExact: maxPossibleExact,
     isPartial: isPartial,
     totalAudits: totalAudits,
     inProgress: inProgress,
@@ -305,6 +333,8 @@ class ReportStats {
       percentage: pct is num ? pct.round() : null,
       achieved: _num0(data['achieved']),
       maxPossible: _num0(data['maxPossible']),
+      achievedExact: _numOrNull(data['achievedExact']),
+      maxPossibleExact: _numOrNull(data['maxPossibleExact']),
       isPartial: data['isPartial'] == true,
       totalAudits: _int0(data['totalAudits'] ?? data['total']),
       inProgress: _int0(data['inProgress']),
@@ -423,8 +453,8 @@ class ReportStats {
       }
       final ids = [for (final m in members) m.id];
       final score = finishedScoreOf(members);
-      achieved += score.achieved;
-      max += score.maxPossible;
+      achieved += score.achievedExact;
+      max += score.maxPossibleExact;
       completed++;
       completedIds.addAll(ids);
       final timeliness = auditGroupTimeliness(members) ??
@@ -447,9 +477,11 @@ class ReportStats {
     }
     final totalAudits = inProgress + overdue + notStarted + onTime + delayed + skipped + other;
     return ReportStats(
-      percentage: max > 0 ? (achieved / max * 100).round() : null,
-      achieved: achieved,
-      maxPossible: max,
+      percentage: percentFrom(achieved, max),
+      achieved: achieved.roundToDouble(),
+      maxPossible: max.roundToDouble(),
+      achievedExact: achieved,
+      maxPossibleExact: max,
       totalAudits: totalAudits,
       inProgress: inProgress,
       completed: completed,
