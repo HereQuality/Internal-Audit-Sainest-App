@@ -435,6 +435,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     AuditDetailModel audit,
     ParameterNode node,
   ) async {
+    FocusManager.instance.primaryFocus?.unfocus(); // see _NcDetailsSheet: a focused remark would pull the list back to it on close
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -499,6 +500,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   ) async {
     final provider = context.read<AuditsProvider>();
     final selected = {for (final l in audit.locationLabels) l.id};
+    FocusManager.instance.primaryFocus?.unfocus();
     final result = await showModalBottomSheet<Set<String>>(
       context: context,
       isScrollControlled: true,
@@ -767,6 +769,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // happens, not discovered afterwards.
   Future<bool> _confirmClaim(AuditDetailModel audit) async {
     final others = audit.auditorNames.where((n) => n.trim().isNotEmpty).toList();
+    FocusManager.instance.primaryFocus?.unfocus();
     final proceed = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
@@ -819,6 +822,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     // collects (audit.controller.js#completeAudit), just missing here
     // until now.
     final remarkController = TextEditingController();
+    FocusManager.instance.primaryFocus?.unfocus();
     final proceeded = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(

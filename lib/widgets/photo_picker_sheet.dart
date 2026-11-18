@@ -26,6 +26,9 @@ const double _kMaxPhotoSide = 1600;
 /// [recoveryKey] (the checkpoint's own id) lets a photo survive Android
 /// killing this app while the camera is open — see [recoverLostEvidencePhotos].
 Future<List<File>> pickEvidencePhotos(BuildContext context, {String? recoveryKey}) async {
+  // Same reason as showNcDetailsSheet: a remark box left focused behind this
+  // sheet gets focus back when it closes, and the list jumps to it.
+  FocusManager.instance.primaryFocus?.unfocus();
   final source = await showModalBottomSheet<_PhotoSource>(
     context: context,
     shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),

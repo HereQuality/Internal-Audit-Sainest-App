@@ -76,6 +76,12 @@ Future<NcDetailsResult?> showNcDetailsSheet(
   // (checkpoint_card.dart#_openNcDetailsPopup) keeps working verbatim.
   NcSheetMode mode = NcSheetMode.raise,
 }) {
+  // Drop whatever text field behind the sheet still holds focus (usually
+  // some checkpoint's remark box, often one typed into long ago). If it
+  // keeps focus, closing the sheet hands focus straight back to it and
+  // Flutter scrolls the checklist to bring that remark into view — the
+  // auditor loses their place and lands on an unrelated old remark.
+  FocusManager.instance.primaryFocus?.unfocus();
   return showModalBottomSheet<NcDetailsResult>(
     context: context,
     isScrollControlled: true,

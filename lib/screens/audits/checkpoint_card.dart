@@ -1025,6 +1025,8 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
       if (widget.node.ncId != null) '$_ncName raised on it will be withdrawn, unless the auditee has already responded to it.',
     ].join(' ');
     _naAsking = true;
+    // A focused remark box behind the dialog would get focus back on close and pull the list to it.
+    FocusManager.instance.primaryFocus?.unfocus();
     final bool? confirmed;
     try {
       confirmed = await showDialog<bool>(context: context, builder: (_) => _NotApplicableDialog(text: text));
@@ -1209,6 +1211,9 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
   }
 
   void _selectFinding(String ft) {
+    // Picking a finding means the auditor is done typing wherever they were — let go of that remark box so it can't
+    // later grab the scroll back (a popup closing, the keyboard showing/hiding) and jump the list to an old remark.
+    FocusManager.instance.primaryFocus?.unfocus();
     setState(() {
       _findingType = ft;
       _applyScoreDefaults(ft);
