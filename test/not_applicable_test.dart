@@ -60,9 +60,11 @@ void main() {
     String structure = 'per-location',
     Map<String, dynamic>? scoreResult,
     List<Map<String, dynamic>> departmentTrees = const [],
+    bool remarkOptional = false,
   }) => AuditDetailModel.fromJson({
     '_id': 'a1',
     'isInstant': instant,
+    'remarkOptionalForCompliance': remarkOptional,
     'status': instant ? 'Draft' : 'In Progress',
     'scoringSystem': 'normal',
     'structureMode': structure,
@@ -281,6 +283,33 @@ void main() {
       );
       expect((a.missingRemarkTotal, a.missingScoreTotal), (2, 0));
       expect(a.readyForFinalSubmit, isFalse);
+    });
+
+    test('audit type "remark optional": Strong Compliance / Compliance need no remark, OFI / NC still do', () {
+      for (final f in ['Strong Compliance', 'Compliance']) {
+        expect(n(f, score: 10).submitGapFor(remarkOptionalForCompliance: true), isNull, reason: f);
+        expect(n(f, score: 10).submitGapFor(), SubmitGap.remark, reason: '$f — setting off');
+      }
+      expect(n('OFI', score: 3).submitGapFor(remarkOptionalForCompliance: true), SubmitGap.remark);
+      expect(n('OFI').submitGapFor(remarkOptionalForCompliance: true), SubmitGap.score);
+      expect(n('NC', score: 0).submitGapFor(remarkOptionalForCompliance: true), SubmitGap.remark);
+
+      List<Map<String, dynamic>> tree() => [
+            leaf('a', finding: 'Strong Compliance', score: 10),
+            leaf('b', finding: 'Compliance', score: 10),
+          ];
+      final on = audit(tree(), scoreResult: full, remarkOptional: true);
+      expect(on.remarkOptionalForCompliance, isTrue);
+      expect(on.missingRemarkTotal, 0);
+      expect(on.readyForFinalSubmit, isTrue);
+
+      final off = audit(tree(), scoreResult: full);
+      expect(off.missingRemarkTotal, 2);
+      expect(off.readyForFinalSubmit, isFalse);
+
+      final onWithOfi = audit([leaf('a', finding: 'Compliance', score: 10), leaf('b', finding: 'OFI', score: 4)], scoreResult: full, remarkOptional: true);
+      expect(onWithOfi.missingRemarkTotal, 1);
+      expect(onWithOfi.readyForFinalSubmit, isFalse);
     });
   });
 

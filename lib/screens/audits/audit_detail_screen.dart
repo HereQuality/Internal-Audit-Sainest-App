@@ -134,6 +134,24 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
     final ok = await _flushAll();
     if (!ok && mounted) {
       final incomplete = _syncStates.values.any((s) => s == CheckpointSyncState.incomplete);
+      // A checkpoint with a finding picked but not savable yet (an OFI with no score, a new NC with no person / due
+      // date): take the auditor straight to it — tab, collapsed group and all — instead of leaving them to hunt for it.
+      final audit = context.read<AuditsProvider>().activeAudit;
+      if (incomplete && !_anyFailed && audit != null) {
+        _scrollToFirstIncomplete(
+          audit,
+          isTarget: (n) => _syncStates[n.id] == CheckpointSyncState.incomplete,
+          messageFor: (n) {
+            final hint = _keyFor(n.id).currentState?.missingFieldHint;
+            // "No one else is tagged to this audit's location." is a full sentence already; the others are "Pick …".
+            if (hint != null && hint.endsWith('.')) return hint;
+            return hint != null
+                ? '$hint, then submit again.'
+                : 'This checkpoint still needs a score or NC details before it can be saved. Complete it, then submit again.';
+          },
+        );
+        return ok;
+      }
       showErrorSnackBar(
         context,
         incomplete && !_anyFailed
@@ -580,13 +598,15 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // First checkpoint that still blocks Final Submit, depth-first: no finding yet, an OFI with no picked score, or no remark
   // (Not Applicable ones need nothing) — same helper (and same reasoning) as the web app's
   // AuditReportDetail.jsx#findFirstIncompleteLeaf.
-  ParameterNode? _findFirstIncompleteLeaf(List<ParameterNode> nodes) {
+  // Whether a remark counts as missing follows the audit type's "remark optional" setting (AuditDetailModel.submitGapOf).
+  // [isTarget] swaps in another test for "the checkpoint to jump to" (Submit's not-yet-savable card).
+  ParameterNode? _findFirstIncompleteLeaf(AuditDetailModel audit, List<ParameterNode> nodes, {bool Function(ParameterNode)? isTarget}) {
     for (final node in nodes) {
       if (node.isLeaf) {
-        if (node.submitGap != null) return node;
+        if (isTarget != null ? isTarget(node) : audit.submitGapOf(node) != null) return node;
         continue;
       }
-      final found = _findFirstIncompleteLeaf(node.children);
+      final found = _findFirstIncompleteLeaf(audit, node.children, isTarget: isTarget);
       if (found != null) return found;
     }
     return null;
@@ -617,13 +637,24 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
   // ancestor group it's nested under (see _GroupHeader below — a collapsed
   // group unmounts its children entirely, it doesn't just hide them), then
   // scrolls it into view.
-  void _scrollToFirstIncomplete(AuditDetailModel audit) {
+  //
+  // [isTarget] / [messageFor] reuse the same jump for Submit's "this checkpoint can't be saved yet" case (see
+  // _ensureSavedBeforeSubmit); there the location on screen is searched first, since that is where the card was edited.
+  void _scrollToFirstIncomplete(
+    AuditDetailModel audit, {
+    bool Function(ParameterNode)? isTarget,
+    String Function(ParameterNode)? messageFor,
+  }) {
     ParameterNode? target;
     String? targetLocationId;
     List<ParameterNode> targetTree = audit.parameters;
     if (audit.structureMode == 'per-location') {
-      for (final lp in audit.locationParameters) {
-        final found = _findFirstIncompleteLeaf(lp.parameters);
+      final locations = [
+        ...audit.locationParameters.where((lp) => isTarget != null && lp.locationId == _activeLocationId),
+        ...audit.locationParameters.where((lp) => !(isTarget != null && lp.locationId == _activeLocationId)),
+      ];
+      for (final lp in locations) {
+        final found = _findFirstIncompleteLeaf(audit, lp.parameters, isTarget: isTarget);
         if (found != null) {
           target = found;
           targetLocationId = lp.locationId;
@@ -632,12 +663,14 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
         }
       }
     } else {
-      target = _findFirstIncompleteLeaf(audit.parameters);
+      target = _findFirstIncompleteLeaf(audit, audit.parameters, isTarget: isTarget);
     }
     if (target == null) {
       showErrorSnackBar(
         context,
-        'Every checkpoint has its score and remark — pull to refresh and try again.',
+        isTarget != null
+            ? 'Some checkpoints still need a score or NC details before they can be saved. Complete them, then submit again.'
+            : 'Every checkpoint has its score and remark — pull to refresh and try again.',
       );
       return;
     }
@@ -670,7 +703,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
         curve: Curves.easeInOut,
         alignment: 0.3,
       );
-      showErrorSnackBar(context, submitGapMessage(target!.submitGap));
+      showErrorSnackBar(context, messageFor != null ? messageFor(target!) : submitGapMessage(audit.submitGapOf(target!)));
     }
 
     if (switchingLocation || ancestorGroups.isNotEmpty) {
@@ -1507,6 +1540,7 @@ class _AuditDetailScreenState extends State<AuditDetailScreen> {
                       node: node,
                       serial: serial,
                       readOnly: readOnly,
+                      remarkOptionalForCompliance: audit.remarkOptionalForCompliance,
                       onSyncStateChanged: (state) =>
                           _onCheckpointSyncChanged(node.id, state),
                       shouldFlushOnDispose: () => !_discardOnExit,

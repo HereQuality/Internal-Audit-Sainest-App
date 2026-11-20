@@ -11,6 +11,18 @@ const String notApplicableFinding = 'Not Applicable';
 /// score of an OFI ([score]), or the remark ([remark]). Mirrors server/utils/scoring.js#submitGaps, which the server enforces.
 enum SubmitGap { unscored, score, remark }
 
+/// Findings whose remark an audit type may make optional (its "remark optional" setting) — OFI and NC always need one.
+/// Mirrors server/utils/scoring.js#REMARK_OPTIONAL_FINDINGS.
+const remarkOptionalFindings = {'Strong Compliance', 'Compliance'};
+
+/// Does [findingType] need a remark before Final Submit? Every applicable finding does, unless the audit type has "remark
+/// optional" on — then Strong Compliance / Compliance do not. Mirrors server/utils/scoring.js#remarkRequiredFor.
+bool remarkRequiredFor(String? findingType, {bool remarkOptionalForCompliance = false}) {
+  if (findingType == null || findingType == notApplicableFinding) return false;
+  if (remarkOptionalForCompliance && remarkOptionalFindings.contains(findingType)) return false;
+  return true;
+}
+
 /// Full-detail audit — the scoring workspace's own model, separate from
 /// the lightweight AuditModel used by the My Audits list. Mirrors
 /// server/models/Audit.js#AuditNodeSchema and the audit document shape
@@ -55,14 +67,23 @@ class ParameterNode {
   /// applies needs a finding, a REMARK, and — for an OFI — the score the auditor picked. A Not Applicable one needs neither a
   /// score nor a remark; a group (not a checkpoint) needs nothing. Saving a checkpoint never needed the remark (the autosave
   /// stores what is there) — it is asked for here, at the end.
-  SubmitGap? get submitGap {
+  ///
+  /// [remarkOptionalForCompliance] is the audit type's "remark optional" setting ([AuditDetailModel.remarkOptionalForCompliance]):
+  /// when on, a Strong Compliance / Compliance checkpoint needs no remark (OFI and NC still do).
+  SubmitGap? submitGapFor({bool remarkOptionalForCompliance = false}) {
     if (!isLeaf) return null;
     if (findingType == null) return SubmitGap.unscored;
     if (isNotApplicable) return null;
     if (findingType == 'OFI' && score == null) return SubmitGap.score;
-    if ((remark ?? '').trim().isEmpty) return SubmitGap.remark;
+    if (remarkRequiredFor(findingType, remarkOptionalForCompliance: remarkOptionalForCompliance) &&
+        (remark ?? '').trim().isEmpty) {
+      return SubmitGap.remark;
+    }
     return null;
   }
+
+  /// [submitGapFor] with every remark mandatory (an audit type without "remark optional").
+  SubmitGap? get submitGap => submitGapFor();
 
   /// Round-trips a node back to the server's own shape — needed because
   /// PATCH /audits/:id/save-draft replaces the WHOLE `parameters` array
@@ -338,6 +359,9 @@ class AuditDetailModel {
   // web app's dedicated InstantAudit.jsx) need to know to treat Draft as
   // active for THIS one audit type. See audit.controller.js#getAuditDetails.
   final bool isInstant;
+  // The audit type's "remark optional" setting (server AuditType.remarkOptionalForCompliance, read live by
+  // getAuditDetails): when on, Strong Compliance / Compliance checkpoints need no remark; OFI / NC always do.
+  final bool remarkOptionalForCompliance;
   // Set via the mandatory "select representative auditee" step (see
   // AuditsProvider.setAuditRepresentative) — a default for who this
   // location's findings are raised against, not a hard restriction (the
@@ -413,6 +437,7 @@ class AuditDetailModel {
     this.scheduledInFuture = false,
     this.windowClosed = false,
     this.isInstant = false,
+    this.remarkOptionalForCompliance = false,
     this.auditeeId,
     this.auditeeName,
     this.auditeeIds = const [],
@@ -517,16 +542,19 @@ class AuditDetailModel {
     return isSelfAudit ? kSelfLabel : fallback;
   }
 
-  int get missingRemarkTotal => leaves.where((n) => n.submitGap == SubmitGap.remark).length;
+  int get missingRemarkTotal => leaves.where((n) => submitGapOf(n) == SubmitGap.remark).length;
+
+  /// [ParameterNode.submitGapFor] under this audit's own "remark optional" setting.
+  SubmitGap? submitGapOf(ParameterNode n) => n.submitGapFor(remarkOptionalForCompliance: remarkOptionalForCompliance);
 
   /// OFI checkpoints whose score was never picked.
-  int get missingScoreTotal => leaves.where((n) => n.submitGap == SubmitGap.score).length;
+  int get missingScoreTotal => leaves.where((n) => submitGapOf(n) == SubmitGap.score).length;
 
   /// Whether Final Submit can go ahead: every checkpoint has its finding, every OFI its score, every applicable checkpoint its
   /// remark, and at least one checkpoint applies. The same demands as the server's completeAudit, so the button never promises
   /// a submit the server would refuse.
   bool get readyForFinalSubmit =>
-      scoreResult.isFullyScored && !everyCheckpointNotApplicable && leaves.every((n) => n.submitGap == null);
+      scoreResult.isFullyScored && !everyCheckpointNotApplicable && leaves.every((n) => submitGapOf(n) == null);
 
   // Fast lookup for checkpoint_card.dart — every leaf's ncId (see
   // ParameterNode.ncId) maps 1:1 onto one of these full NC documents.
@@ -552,6 +580,7 @@ class AuditDetailModel {
       scheduledInFuture: json['scheduledInFuture'] as bool? ?? false,
       windowClosed: json['windowClosed'] as bool? ?? false,
       isInstant: json['isInstant'] as bool? ?? false,
+      remarkOptionalForCompliance: json['remarkOptionalForCompliance'] == true,
       auditeeId: idOf(json['auditeeId'])?.toString(),
       auditeeName: json['auditeeId'] is Map ? (json['auditeeId']['employeeName']?.toString()) : null,
       auditeeIds: (json['auditeeIds'] as List? ?? []).map((e) => idOf(e)?.toString() ?? '').toList(),

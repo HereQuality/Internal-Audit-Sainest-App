@@ -249,6 +249,9 @@ class CheckpointCard extends StatefulWidget {
   // nc.controller.js#updateNC's own check).
   final String? currentEmployeeId;
   final UpdateNc? onUpdateNc;
+  // The audit type's "remark optional" setting (AuditDetailModel.remarkOptionalForCompliance): when on, Strong
+  // Compliance / Compliance need no remark, so the "Required to submit" hint stays off for them.
+  final bool remarkOptionalForCompliance;
 
   const CheckpointCard({
     super.key,
@@ -267,6 +270,7 @@ class CheckpointCard extends StatefulWidget {
     this.linkedNc,
     this.currentEmployeeId,
     this.onUpdateNc,
+    this.remarkOptionalForCompliance = false,
   });
 
   @override
@@ -529,8 +533,16 @@ class CheckpointCardState extends State<CheckpointCard> with WidgetsBindingObser
 
   bool get _isComplete => _findingType != null && _missingFieldHint == null;
 
+  /// What this card still needs before it can save ("Pick a score to save", "Set a due date for this NC", ...), or null —
+  /// read by the screen's Submit when it jumps to an incomplete checkpoint, so its message names the missing field.
+  String? get missingFieldHint => _missingFieldHint;
+
   // A finding is picked (and it is not Not Applicable) but there is no remark yet: Final Submit will want one.
-  bool get _remarkRequiredHint => _findingType != null && !_notApplicable && _remarkController.text.trim().isEmpty;
+  // An audit type with "remark optional" on asks for none on Strong Compliance / Compliance (remarkRequiredFor).
+  bool get _remarkRequiredHint =>
+      !_notApplicable &&
+      remarkRequiredFor(_findingType, remarkOptionalForCompliance: widget.remarkOptionalForCompliance) &&
+      _remarkController.text.trim().isEmpty;
 
   // Whether a save can actually go out right now: either a real finding is
   // complete, or nothing's picked yet but there's a remark to save on its
